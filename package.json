@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "B站直播全自动切片系统 —— 决策层 + 编排层（基础设施复用 biliLive-tools HTTP API）",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=24.0.0"
