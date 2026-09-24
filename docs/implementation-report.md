@@ -1954,5 +1954,122 @@ if (d.deleteFullVideo && task.source.fullVideoPath && exists(task.source.fullVid
 > 也就是说：那个配置项与实际行为不一致是**已知且有意**的状态。
 > 若希望配置本身也如实表达「保留完整版」，把它改成 `false` 即可（本轮没动）。
 
+---
+
+## 18. 差点删掉 5.84 GB 的判定错误：盘符 ≠ 卷（2026-09-24）
+
+**一句话**：`sameVolume()` 只比路径字符串的盘符，把 junction 路径误判成"跨盘"，
+于是本该**移入回收站（可恢复）**的文件会走 `fs.rmSync`（**永久删除**）。
+
+### 18.1 现场
+
+用户在「实时监控 → 目录轮询」里看到 10 条「已导入过（任务已从台账删除）」，要求清理。
+排入待删清单后，界面每一条都显示 **「跨盘·删除不可恢复」** —— 而这 13 个文件
+（10 个 `.ts` 4.12 GB + 3 个 `-弹幕版.mp4` 1.72 GB = 5.84 GB）**物理上都和回收站同盘**：
+
+```
+C:\Users\demo\Downloads\Bilibili  → junction → D:\live_auto_media\Bilibili
+F:\deepseek\live_auto\data         → junction → D:\live_auto_media\data
+```
+
+两者真实卷都是 `D:`，`rename` 是瞬时的。**只要宽限期一到，这 13 个文件就会被永久删掉**，
+而且是"按设计执行"、日志里写得明明白白"跨盘不进回收站"的那种删法，事后无从恢复。
+发现时离到点还有约 28 分钟 —— 界面那句提示救了它。全部 13 条已取消（`取消成功 13/13`）。
+
+### 18.2 根因
+
+```ts
+// 旧实现：只比盘符字符串
+path.parse(path.resolve(target)).root === path.parse(path.resolve(trashRoot)).root
+//   C:\Users\…\Bilibili\xxx.ts      → "C:\"
+//   F:\deepseek\live_auto\data\trash → "F:\"     → 判定"跨盘" ❌
+```
+
+`path.resolve` **不解析** junction / 符号链接，它只做字符串规范化。
+而本项目**整套目录都是 junction**（这是用户为了把素材放 D 盘而特意做的，见 §13），
+所以这条判断在真实环境里几乎必然走错分支。
+
+### 18.3 修复（`src/pending-delete.ts`）
+
+新增 `volumeRoot(target)`：**逐级向上找到第一个真实存在的祖先**，对它做 `realpath`，再取卷根。
+必须逐级向上，因为待删目标可能已经不存在（目录、还没建的回收站目录），
+对整条路径直接 `realpath` 会抛错并退化成"跨盘"。
+
+```ts
+let probe = path.resolve(target);
+for (;;) {
+  try {
+    const real = realpath(probe).replace(/^\\\?\\UNC\\/i, '\\\\').replace(/^\\\?\\/, '');
+    return path.parse(real).root.toLowerCase();   // Windows 上 realpath 可能回设备路径，先去掉前缀
+  } catch { /* 不存在 → 上一层再试 */ }
+  const parent = path.dirname(probe);
+  if (parent === probe) return undefined;         // 到根还是解析不了
+  probe = parent;
+}
+```
+
+`sameVolume()` 改为比较两个 `volumeRoot`；两边都解析不出来时**退回**旧行为（不比以前更差）。
+
+### 18.4 同时修掉的两个"取消是假的"缺陷
+
+查这条路径时顺带发现，**「取消」在旧实现里并不牢靠**：
+
+| 缺陷 | 旧行为 | 现在 |
+|---|---|---|
+| 取消后又被自动排回 | 反查循环每 5 分钟调 `scheduleDelete`，按路径去重时**不看 `cancelledAt`** → 取消 5 分钟后条目又回来了（界面那一刻写着"已取消"） | 默认**保持取消**，并把它报进 `heldCancelled`；要重新排入必须显式 `reviveCancelled: true` |
+| 同 id 两条记录 | 重新排入是**追加**新记录，而 id 由路径派生（`pd-<hash>`）→ 清单里两条同 id；`cancelPendingDelete`/`deletePendingNow` 用 `find(e => e.id === id)` 命中的是**旧的已取消那条** → 「取消失败」「立即删除被跳过」，文件变成**界面上管不住、到点却会删** | 复活改为**原地**复用同一条（id 不变、不新增）；按 id 查找统一走 `findLiveEntry()`：先找活的，找不到再退回首条（好给出准确的跳过原因） |
+
+### 18.5 验证
+
+**新增回归测试**（`test/pending-delete.ts` §7b/§13，断言数 78 → 115）：
+§7b 用 `fs.symlinkSync(..., 'junction')` 造一个**真的跨盘 junction**
+（链接放系统盘 `C:`、目标放项目盘、回收站也在项目盘），跑完整删除流程并断言 `deletedBy === 'trash'`
+—— 老实现在这一条上就是 `rm`。删 junction 只用 `unlinkSync`：万一 recursive rm 跟进了目标，
+删掉的就是真目录（这个项目已经在 junction 上栽过一次，不再赌）。
+
+**全量**：`npm run verify` 36 个套件全绿。
+
+**真机**（重启服务加载新代码后，走真实 HTTP 接口）：
+
+```
+GET  /api/pending-delete        → 13 条 / 5.84 GB ；willTrash=true 的条数：13 / 13
+POST /api/pending-delete/delete { all: true }
+     → ok=true  deleted=13  failed=0  skipped=0  freedMB=5978
+     → 按删法分组：trash=13  rm=0          ← 修复前这里会是 rm=13
+     → 回收站条目 13 个（20260924-151442-auto-…），7 天内可恢复
+GET  /api/monitor               → watch.outcomes = 0 条（目录轮询面板已清空）
+```
+
+> **5.84 GB 是"移入回收站"，不是立即释放**：回收站与素材同卷（都在 `D:`），
+> `rename` 不复制字节也不释放空间。真正回收空间要等 `cleanup.trashDays = 7` 的自动清理
+> （或手动清空回收站）。D: 当前可用 382.7 GB，不紧张。
+
+### 18.6 为什么"删除"这件事值得这么多防线
+
+这是本项目**唯一会永久抹掉数据**的功能。这次的实际教训是：
+**最危险的不是判断逻辑写错，而是界面把后果说清楚了、而"说清楚"的那句话本身是错的** ——
+用户看到「跨盘·删除不可恢复」，只能选择"取消"来保命，却无法知道系统其实判错了。
+所以 §18.3 的修复必须落在 `sameVolume()` 这一个函数上（`willTrash` 与真正执行删除的
+`performDelete` 共用它），而不是在界面上打补丁。
+
+### 18.7 顺带修掉：`restart-service.ts` 会被启动器反过来杀掉自己
+
+重启服务时踩到：`tools/restart-service.ts` 杀掉旧 node 之后，
+`launcher.ps1`（桌面快捷方式 / 计划任务用的启动器）立刻进入它自己的 `finally`：
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+  Where-Object { $_.CommandLine -like "*$ROOT*" } | Stop-Process -Force
+```
+
+这条按命令行**子串**匹配，于是连"从项目目录里跑的 `node tools/restart-service.ts`"
+一起杀了 —— 表现是脚本中途消失（harness 侧报 `job runner exit 4294967295`）、
+旧服务已死、新进程根本没起来，看起来像"服务起不来"，很难查。
+
+修法：**先请启动器退场，再动服务**（顺序不能反）。启动器被 `taskkill` 掉时自己的
+`finally` 不会执行 —— 这正是我们要的，它也就不会去收它的 node 子进程，
+那个旧服务交给下一步正常杀。另外起新进程前再扫一眼（计划任务 `RestartCount=3`/每分钟
+会再拉一个起来），避免"两个服务抢 3000 端口"。
+
 
 

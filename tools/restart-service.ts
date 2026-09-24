@@ -69,6 +69,51 @@ async function busyCheck(): Promise<void> {
 }
 await busyCheck();
 
+/* ---- 0b) 先清场：launcher.ps1 会**杀掉我们自己** ----
+ *
+ * 实测（2026-09-24 15:1x）：直接杀旧 node 之后，launcher.ps1 立刻进入它的 finally：
+ *     Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+ *       Where-Object { $_.CommandLine -like "*$ROOT*" } | Stop-Process -Force
+ * 这条按命令行**子串**匹配，于是连"从项目目录里跑的 `node tools/restart-service.ts`"
+ * 一起杀了 —— 表现是脚本中途消失（job runner exit 4294967295），
+ * 服务被杀掉、新进程根本没起来。所以顺序必须是：**先请启动器退场，再动服务**。
+ *
+ * 启动器是被 taskkill 掉的，它自己的 finally 不会执行（这正是我们要的）。
+ * 因此它也不会去收它的 node 子进程 —— 那正是下面第 1 步要杀的旧服务。 */
+function launcherPids(): string[] {
+  try {
+    return execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'powershell.exe' -and $_.CommandLine -like '*launcher.ps1*' } | ForEach-Object { $_.ProcessId }",
+      ],
+      { encoding: 'utf8' },
+    )
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean);
+  } catch {
+    return []; // 查不到就当没有（不能因为查询失败把重启卡住）
+  }
+}
+const countLaunchers = (): number => launcherPids().length;
+function killLaunchers(): number {
+  const pids = launcherPids();
+  for (const pid of pids) {
+    try {
+      execFileSync('taskkill', ['/PID', pid, '/F'], { stdio: 'ignore' });
+    } catch {
+      /* 已经退了 */
+    }
+  }
+  return pids.length;
+}
+const killed = killLaunchers();
+if (killed > 0) line(`  先请 ${killed} 个 launcher.ps1 退场（否则它会在收尾时把我们和新服务一起杀掉）`);
+
 /* ---- 1) 找到占用端口的进程并结束 ---- */
 function findPidOnPort(p: number): number | undefined {
   try {
@@ -105,6 +150,25 @@ if (oldPid) {
   }
 } else {
   line(`  端口 ${port} 当前空闲`);
+}
+
+/* ---- 1b) 起新进程前再确认一次没有启动器（第 0b 步杀过，但计划任务每分钟会再拉一个起来） ----
+ *
+ * 计划任务「直播切片助手（live_auto）」有 RestartCount=3 / 每分钟重试，
+ * 我们用 taskkill 干掉启动器会被它当成"失败"，一分钟内可能再拉一个起来。
+ * 万一那个新启动器刚好赶上"服务还没 listen"的窗口，它就会再起一个 node 抢 3000 端口。
+ * 这里起新进程前扫一眼：还有启动器就先等它退（上限 6 秒），别把重启变成两个服务抢端口。 */
+if (oldPid) {
+  const n = countLaunchers();
+  if (n > 0) {
+    line(`  ⚠ 检测到 ${n} 个 launcher.ps1 又起来了 —— 等它退场再起服务（上限 6 秒）…`);
+    for (let i = 0; i < 15; i++) {
+      if (countLaunchers() === 0) break;
+      execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Milliseconds 400'], { stdio: 'ignore' });
+    }
+    const after = countLaunchers();
+    line(after === 0 ? '  ✓ 启动器已退场' : `  ⚠ 还有 ${after} 个（多半停在"按任意键关闭"上，没有 node 子进程，不影响）`);
+  }
 }
 
 /* ---- 2) 起新进程（detached，独立于本脚本存活） ---- */

@@ -12,11 +12,15 @@
  * 2. **本场全部切片都确认完了**才排源文件（用户的明确选择）：任何一条切片失败都还能从源重切。
  * 3. **进清单 ≠ 立刻删**：默认宽限 24 小时，期间界面上能一键取消。
  *
- * ## 删法（按盘符分流，因为跨盘"移动"等于复制）
+ * ## 删法（按**真实卷**分流，因为跨卷"移动"等于复制）
  *
- * - 成片在 `data/clips/`（本盘）→ 移入回收站：`rename` 是瞬时的，还能恢复 7 天；
- * - 源录播在 `C:`（异盘）→ 回收站也在 `F:`，跨盘"移入回收站"要复制 20 GB，不现实
- *   → 到点直接 `rmSync`，日志里写清楚删了什么、为什么可以删。
+ * - 与回收站**同一个真实卷**（本机上就是 `D:`，`data/` 和源录播目录都是指向它的 junction）
+ *   → 移入回收站：`rename` 是瞬时的，还能恢复 7 天；
+ * - 真的不同卷 → "移入回收站"要整份复制（20 GB 的源录播不现实）→ 到点直接 `rmSync`，
+ *   日志里写清楚删了什么、为什么可以删。**这是唯一不可逆的路径**。
+ *
+ * ⚠️ 判断"同一个卷"必须解析 junction/符号链接，见 `sameVolume()` ——
+ * 只比盘符会把 junction 路径误判成异盘，把可恢复的删除变成永久删除。
  *
  * 到点执行由 `runDueDeletions()` 完成，daemon 定时调用；也可以从界面手动触发一次。
  */
@@ -75,6 +79,17 @@ export interface ScheduleResult {
   added: PendingDeleteEntry[];
   /** 已经在清单里（同路径未取消/未删）而跳过的 */
   skipped: Array<{ path: string; existingId: string }>;
+  /**
+   * 这个路径**用户取消过** → 默认不再自动排回（`reviveCancelled: true` 才会复活）。
+   *
+   * 为什么要有这一栏：反查循环每 5 分钟对每个已完成场次调一次 `scheduleDelete`，
+   * 如果取消后又被自动排回去，用户点的「取消」就是假的 ——
+   * 头上悬着一把刀，5 分钟后重新架好，而界面那一刻显示的还是"已取消"。
+   * 所以"取消"必须真的生效，重新排入必须是**显式**动作。
+   */
+  heldCancelled: Array<{ path: string; existingId: string; cancelledAt: string }>;
+  /** 被原地复活的（只有 `reviveCancelled: true` 时才会有） */
+  revived: PendingDeleteEntry[];
 }
 
 function load(statePath: string): PendingDeleteState {
@@ -96,10 +111,55 @@ function entryId(target: string): string {
   return `pd-${fnv1a(target)}`;
 }
 
-/** 目标是否与回收站在同一个盘（同盘才能"移入回收站"而不复制字节） */
-export function sameVolume(target: string, trashRoot: string = TRASH_DIR): boolean {
+/**
+ * 把一个路径归约到它**物理上真正所在**的卷根。
+ *
+ * 为什么不能只取盘符：junction（目录联接）和符号链接会让"看起来在 C: 的路径"
+ * 实际落在 D: 上。本项目正好整套目录都是 junction：
+ *
+ *   C:\Users\demo\Downloads\Bilibili  → junction → D:\live_auto_media\Bilibili
+ *   F:\deepseek\live_auto\data          → junction → D:\live_auto_media\data
+ *
+ * 两者物理上都在 D:，`rename` 是瞬时的（进回收站可恢复）；但按路径字符串比盘符
+ * 会判成"跨盘"，于是本该进回收站的文件走了 `rmSync` —— **不可恢复地删掉**。
+ * 这不是理论风险：2026-09-24 排进清单的 13 个文件（5.84 GB）界面上显示的就是
+ * 「跨盘·删除不可恢复」，全靠用户及时叫停才没删。
+ *
+ * 所以先逐级向上找到**第一个真实存在的祖先**再 `realpath`：目标本身可能还不存在
+ * （待删目录、还没建的回收站），不能直接对整条路径求 realpath。
+ */
+export function volumeRoot(target: string, opts: { realpath?: (p: string) => string } = {}): string | undefined {
+  if (!target?.trim()) return undefined;
+  const realpath = opts.realpath ?? ((p: string) => fs.realpathSync.native(p));
+  let probe = path.resolve(target);
+  for (;;) {
+    try {
+      // realpath 在 Windows 上可能回 `\\?\D:\…` 这种设备路径，取盘符前先去掉前缀
+      const real = realpath(probe).replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '');
+      const root = path.parse(real).root;
+      return root ? root.toLowerCase() : undefined;
+    } catch {
+      /* 不存在 / 解析不了 → 换上一层再试 */
+    }
+    const parent = path.dirname(probe);
+    if (parent === probe) return undefined; // 已经到根（驱动器根 / UNC 根）还是解析不了
+    probe = parent;
+  }
+}
+
+/**
+ * 目标是否与回收站在同一个盘（同盘才能"移入回收站"而不复制字节）。
+ *
+ * **必须解析 junction/符号链接**，理由见 `volumeRoot` 的注释 —— 这里的判断结果
+ * 直接决定文件是"进回收站（可恢复）"还是"永久删除"。
+ */
+export function sameVolume(target: string, trashRoot: string = TRASH_DIR, opts: { realpath?: (p: string) => string } = {}): boolean {
   // 空路径无从判断：返回 false（调用方在删之前都会先确认文件存在，所以不会误用这个分支）
   if (!target?.trim() || !trashRoot?.trim()) return false;
+  const a = volumeRoot(target, opts);
+  const b = volumeRoot(trashRoot, opts);
+  if (a && b) return a === b;
+  // 两边都解析不出真实祖先（路径整条都不存在）→ 退回盘符比较，不比以前更差
   try {
     return path.parse(path.resolve(target)).root.toLowerCase() === path.parse(path.resolve(trashRoot)).root.toLowerCase();
   } catch {
@@ -115,7 +175,19 @@ export function sameVolume(target: string, trashRoot: string = TRASH_DIR): boole
  */
 export function scheduleDelete(
   inputs: ScheduleInput[],
-  opts: { graceHours: number; statePath?: string; now?: number; logger?: Logger },
+  opts: {
+    graceHours: number;
+    statePath?: string;
+    now?: number;
+    logger?: Logger;
+    /**
+     * 复活这条路径上**用户取消过**的条目（原地复用同一条记录）。
+     *
+     * 默认 `false`：取消必须是真的，自动循环不能把用户的「取消」抹掉，见 `heldCancelled`。
+     * 只有**显式的重新排期**（人工要求清理某批文件）才该传 `true`。
+     */
+    reviveCancelled?: boolean;
+  },
 ): ScheduleResult {
   const log = opts.logger ?? globalLog;
   const statePath = opts.statePath ?? STATE_PATH;
@@ -124,12 +196,38 @@ export function scheduleDelete(
   const dueAt = new Date(now + Math.max(0, opts.graceHours) * 3600_000).toISOString();
   const added: PendingDeleteEntry[] = [];
   const skipped: ScheduleResult['skipped'] = [];
+  const heldCancelled: ScheduleResult['heldCancelled'] = [];
+  const revived: PendingDeleteEntry[] = [];
 
   for (const input of inputs) {
     const target = path.resolve(input.path);
     const existing = state.entries.find((e) => e.path === target && !e.cancelledAt && !e.deletedAt);
     if (existing) {
       skipped.push({ path: target, existingId: existing.id });
+      continue;
+    }
+    /* 用户取消过的路径：默认**不**偷偷排回去。
+       而且复活是**原地**的 —— id 由路径派生（`pd-<hash>`），
+       追加一条同 id 的新记录会让 "取消 / 立即删除" 按 id 查到旧的那条（已取消）而拒绝生效，
+       文件就变成"界面点不掉、到点却会删"。 */
+    const cancelled = state.entries.find((e) => e.path === target && e.cancelledAt && !e.deletedAt);
+    if (cancelled) {
+      if (!opts.reviveCancelled) {
+        heldCancelled.push({ path: target, existingId: cancelled.id, cancelledAt: cancelled.cancelledAt ?? '' });
+        continue;
+      }
+      cancelled.cancelledAt = undefined;
+      cancelled.dueAt = dueAt;
+      cancelled.kind = input.kind;
+      cancelled.taskId = input.taskId;
+      cancelled.reason = input.reason;
+      cancelled.createdAt = nowIso();
+      cancelled.error = undefined;
+      cancelled.deletedAt = undefined;
+      cancelled.deletedBy = undefined;
+      cancelled.deletedManually = undefined;
+      if (input.sizeBytes) cancelled.sizeBytes = input.sizeBytes;
+      revived.push(cancelled);
       continue;
     }
     let sizeBytes = input.sizeBytes ?? 0;
@@ -155,16 +253,16 @@ export function scheduleDelete(
     added.push(entry);
   }
 
-  if (added.length > 0) {
+  if (added.length > 0 || revived.length > 0) {
     save(statePath, state);
-    const gb = added.reduce((a, e) => a + e.sizeBytes, 0) / 1024 ** 3;
-    log.info(
-      `已排入待删清单 ${added.length} 项（合计 ${gb.toFixed(2)} GB），` +
-        `${opts.graceHours} 小时后自动删除，期间可在界面上取消`,
-      { data: { entries: added.map((e) => ({ path: e.path, kind: e.kind, dueAt: e.dueAt })) } },
-    );
+    const fresh = [...added, ...revived];
+    const gb = fresh.reduce((a, e) => a + e.sizeBytes, 0) / 1024 ** 3;
+    const what = revived.length > 0 ? `新排 ${added.length} 项、重新排入（复活已取消）${revived.length} 项` : `已排入待删清单 ${added.length} 项`;
+    log.info(`${what}（合计 ${gb.toFixed(2)} GB），${opts.graceHours} 小时后自动删除，期间可在界面上取消`, {
+      data: { entries: fresh.map((e) => ({ path: e.path, kind: e.kind, dueAt: e.dueAt })) },
+    });
   }
-  return { added, skipped };
+  return { added, skipped, heldCancelled, revived };
 }
 
 function dirSize(dir: string): number {
@@ -212,7 +310,8 @@ export interface PendingDeleteView {
  * 清单里的一条 + 两个**算出来的**信息（不落盘）。
  *
  * 界面要在用户点「立即删除」**之前**就把后果说清楚：
- *   - `willTrash`：同盘 → 进回收站（可恢复）；异盘 → 直接删（**不可恢复**）。
+ *   - `willTrash`：与回收站**同一个真实卷**（已解析 junction）→ 进回收站（可恢复）；
+ *     真的不同卷 → 直接删（**不可恢复**）。
  *     这两句提示文案完全不同，不能让用户点下去才发现。
  *   - `existsNow`：文件已经不在了（自己删了/上次删了一半）→ 按钮改成"标记为已删除"。
  */
@@ -249,17 +348,32 @@ export function listPendingDelete(opts: { statePath?: string; now?: number; tras
   };
 }
 
-/** 取消一项待删（用户在 24 小时宽限期内反悔） */
+/**
+ * 按 id 找**当前有效**的那一条。
+ *
+ * id 由路径派生（`pd-<hash>`），同一条路径被"取消 → 重新排入"过就会有多条同 id 记录。
+ * 若直接 `find(e => e.id === id)`，命中的可能是**旧的已取消那条**，于是
+ * 「取消」永远返回 ok:false、「立即删除」永远被当作"已取消"跳过 —— 界面上按钮点了没反应，
+ * 而文件到点照样被自动删掉。所以统一先找活的，找不到再退回首条（好给出准确的跳过原因）。
+ */
+function findLiveEntry(state: PendingDeleteState, id: string): { live?: PendingDeleteEntry; any?: PendingDeleteEntry } {
+  const matches = state.entries.filter((e) => e.id === id);
+  const live = matches.find((e) => !e.cancelledAt && !e.deletedAt);
+  const any = matches[matches.length - 1];
+  return { ...(live ? { live } : {}), ...(any ? { any } : {}) };
+}
+
+/** 取消一项待删（用户在宽限期内反悔）。**必须是永久的**：自动循环不得把它排回来。 */
 export function cancelPendingDelete(id: string, opts: { statePath?: string; logger?: Logger } = {}): { ok: boolean; entry?: PendingDeleteEntry } {
   const log = opts.logger ?? globalLog;
   const statePath = opts.statePath ?? STATE_PATH;
   const state = load(statePath);
-  const entry = state.entries.find((e) => e.id === id);
-  if (!entry || entry.cancelledAt || entry.deletedAt) return { ok: false };
-  entry.cancelledAt = nowIso();
+  const { live } = findLiveEntry(state, id);
+  if (!live) return { ok: false };
+  live.cancelledAt = nowIso();
   save(statePath, state);
-  log.info(`已取消待删：${entry.path}（不会自动删除）`, { data: { id, taskId: entry.taskId } });
-  return { ok: true, entry };
+  log.info(`已取消待删：${live.path}（不会自动删除；自动清理循环不会把它重新排进来）`, { data: { id, taskId: live.taskId } });
+  return { ok: true, entry: live };
 }
 
 export interface RunDueResult {
@@ -309,13 +423,17 @@ function performDelete(entry: PendingDeleteEntry, opts: { trashRoot: string; log
       trashId: r.id,
     };
   }
-  /* 跨盘：回收站在别的盘，"移入回收站"要整份复制，20 GB 的源文件不现实 → 直接删。
+  /* 真的跨卷：回收站在别的卷，"移入回收站"要整份复制，20 GB 的源文件不现实 → 直接删。
      这是唯一不可逆的路径，所以它只在"宽限期已过 + 本场全部切片确认"之后、
-     或用户**明确点了「立即删除」并看过那句"无法恢复"的提醒**之后才会走到。 */
+     或用户**明确点了「立即删除」并看过那句"无法恢复"的提醒**之后才会走到。
+
+     ⚠️ 走到这里之前 `sameVolume()` 已经解析过 junction/符号链接：本机上
+     `C:\…\Downloads\Bilibili` 与 `data\trash` 都落在 D:，会走上面的回收站分支。
+     如果哪天这里被频繁命中，先怀疑"真实卷判断"又退化了，而不是"用户真的跨盘"。 */
   const size = entry.sizeBytes || (fs.statSync(entry.path).isDirectory() ? dirSize(entry.path) : fs.statSync(entry.path).size);
   fs.rmSync(entry.path, { recursive: true, force: true });
   if (fs.existsSync(entry.path)) throw new Error('删除后文件仍然存在');
-  return { by: 'rm', bytes: size, note: `${entry.path} 已永久删除（${(size / 1024 ** 2).toFixed(1)} MB，跨盘不进回收站）` };
+  return { by: 'rm', bytes: size, note: `${entry.path} 已永久删除（${(size / 1024 ** 2).toFixed(1)} MB，与回收站不同卷，不进回收站）` };
 }
 
 /**
@@ -408,19 +526,19 @@ export function deletePendingNow(
   for (const rawId of ids) {
     const id = String(rawId).trim();
     if (!id) continue;
-    const entry = state.entries.find((e) => e.id === id);
-    if (!entry) {
-      out.skipped.push({ id, reason: '清单里没有这个条目（可能已经被清理过）' });
+    const { live, any } = findLiveEntry(state, id);
+    if (!live) {
+      out.skipped.push({
+        id,
+        reason: !any
+          ? '清单里没有这个条目（可能已经被清理过）'
+          : any.cancelledAt
+            ? '这一条已取消删除，文件不会被删'
+            : '这一条已经删过了',
+      });
       continue;
     }
-    if (entry.cancelledAt) {
-      out.skipped.push({ id, reason: '这一条已取消删除，文件不会被删' });
-      continue;
-    }
-    if (entry.deletedAt) {
-      out.skipped.push({ id, reason: '这一条已经删过了' });
-      continue;
-    }
+    const entry = live;
     try {
       const outcome = performDelete(entry, { trashRoot, log });
       entry.deletedAt = nowIso();

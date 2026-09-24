@@ -2097,14 +2097,16 @@ export class Orchestrator {
     }
 
     if (inputs.length === 0) return { scheduled: 0, skipped: 0, reason: '没有需要删除的文件' };
+    /* `reviveCancelled` 故意不传（= false）：这一轮是**自动**循环，每 5 分钟跑一次。
+       用户取消过的路径必须保持取消，否则"取消"就是假的（见 pending-delete.ts 的 heldCancelled）。 */
     const r = scheduleDelete(inputs, { graceHours: d.graceHours, logger: this.logger });
     if (r.added.length > 0) {
       this.logger.info(`「用完即删」：本场排入待删 ${r.added.length} 项（宽限 ${d.graceHours} 小时，界面可取消）`, {
         taskId,
-        data: { added: r.added.length, skipped: r.skipped.length },
+        data: { added: r.added.length, skipped: r.skipped.length, heldCancelled: r.heldCancelled.length },
       });
     }
-    return { scheduled: r.added.length, skipped: r.skipped.length };
+    return { scheduled: r.added.length, skipped: r.skipped.length + r.heldCancelled.length };
   }
 
   /* ------------------------------------------------------------------------
