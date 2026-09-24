@@ -311,12 +311,32 @@ async function main(): Promise<void> {
   note(`预检：${pre.windows.length} 个单元，缓存命中 ${pre.cacheHits}，需付费 ${pre.toPay}，音频合计 ${fmtDuration(pre.audioSeconds)}，估算 ¥${pre.estimatedCost.toFixed(2)}`);
 
   const t0 = Date.now();
+  /* ⚠️ 两种 provider 的 dry-run **语义不同**，断言必须分开（实测 2026-09-24 切成
+     local-funasr 后旧断言直接红了 2 条）：
+       · 云端（bililive-tools）：无缓存 → 记 gaps、不产出字幕（付费保护，硬约束 #14）
+       · 本地（whisper / funasr）：**不产生费用**，dry-run 的付费闸门不该拦它 —— 照常转写
+     硬约束 #14 的真正约束是"**不花钱**"，不是"什么都不许产出"。
+     本地跑整场 50 分钟要 ~12 分钟，而这条用例验的是**契约**不是吞吐，
+     所以本地分支只转写前 300 秒（真音频、真引擎、真时间戳，成本依旧 ¥0）。 */
+  const localFree = cfg.asr.provider !== 'bililive-tools';
+  const LOCAL_CAP_SEC = 300;
+  const mediaForRun = localFree
+    ? {
+        ...adapter,
+        planCalls: (r: { start: number; end: number }) => adapter.planCalls({ start: r.start, end: Math.min(r.end, LOCAL_CAP_SEC) }),
+      }
+    : adapter;
   const tr = await orchTmp.transcriber.transcribe({
     taskId: taskRec.id,
-    media: adapter,
-    totalDuration: map.totalDuration,
+    media: mediaForRun,
+    totalDuration: localFree ? Math.min(map.totalDuration, LOCAL_CAP_SEC) : map.totalDuration,
     dryRun: !ALLOW_PAID,
     allowPaid: ALLOW_PAID,
+    /* ⚠️ 本地 dry-run 这一支必须**绕过缓存**：缓存命中在付费闸门**之前**就返回了，
+       于是"闸门有没有拦住本地引擎"这件事永远测不到 —— 实测第二次跑就命中缓存、
+       耗时 0.0s，断言照样全绿（假绿）。云端那支不能 force：它测的正是 dry-run 的
+       "无缓存 → 记 gaps"契约，而缓存分支另有断言。 */
+    force: localFree && !ALLOW_PAID,
   });
   const elapsed = Date.now() - t0;
 
@@ -329,6 +349,18 @@ async function main(): Promise<void> {
       for (const s of sample) note(`  [${fmtDuration(s.start)}] ${s.text.slice(0, 60)}`);
     }
     ok('转写时间戳落在视频时长内', tr.transcript.segments.every((s) => s.end <= map.totalDuration + 5), `最大 ${Math.max(0, ...tr.transcript.segments.map((s) => s.end)).toFixed(0)}s vs 总长 ${map.totalDuration.toFixed(0)}s`);
+  } else if (localFree) {
+    ok('dry-run + 本地引擎：**照常转写**（免费的东西不该被付费闸门拦住）', tr.transcript.segments.length > 0, `${tr.transcript.segments.length} 条`);
+    ok('dry-run + 本地引擎：确实重新推理了（不是缓存假绿）', tr.cacheHits === 0, `cacheHits=${tr.cacheHits}`);
+    ok('dry-run + 本地引擎：零付费调用（硬约束 #14 约束的是"不花钱"）', tr.paidCalls === 0, `${tr.paidCalls} 次`);
+    ok('dry-run + 本地引擎：成本计为 ¥0（本地不产生费用）', (tr.transcript.costEstimate ?? 0) === 0, String(tr.transcript.costEstimate));
+    ok(
+      'dry-run + 本地引擎：不留下"未授权付费"的假 gaps',
+      !tr.transcript.gaps.some((g) => /dry-run|付费/.test(g.reason ?? '')),
+      JSON.stringify(tr.transcript.gaps.slice(0, 2)),
+    );
+    ok('本地引擎产出字级时间戳（起点严格递增）', tr.transcript.segments.every((s, i, arr) => i === 0 || s.start >= arr[i - 1]!.start - 0.001));
+    note(`dry-run + 本地引擎（${cfg.asr.provider}）：${tr.transcript.segments.length} 条字幕，耗时 ${(elapsed / 1000).toFixed(1)}s，花费 ¥0.00`);
   } else {
     ok('dry-run 且无缓存时**没有产生任何付费调用**（硬约束 #14）', tr.paidCalls === 0, `${tr.paidCalls} 次`);
     if (pre.cacheHits === pre.windows.length && pre.windows.length > 0) {
@@ -419,7 +451,7 @@ async function main(): Promise<void> {
   console.log(`  素材    : ${path.basename(videoPath)}`);
   console.log(`  时长    : ${fmtDuration(map.totalDuration)}（${map.segments.length} 段）`);
   console.log(`  弹幕    : ${danmaPath ? `${signals.danmakuTotal} 条` : '无'}`);
-  console.log(`  转写    : ${ALLOW_PAID ? `${tr.transcript.segments.length} 条字幕，估算 ¥${(tr.transcript.costEstimate ?? 0).toFixed(2)}` : 'dry-run 跳过（未付费）'}`);
+  console.log(`  转写    : ${ALLOW_PAID ? `${tr.transcript.segments.length} 条字幕，估算 ¥${(tr.transcript.costEstimate ?? 0).toFixed(2)}` : localFree ? `${tr.transcript.segments.length} 条字幕（本地引擎，¥0，dry-run 不影响本地转写）` : 'dry-run 跳过（未付费）'}`);
   console.log(`  分析    : ${ALLOW_PAID ? `${an.decision.clips.length} 个候选` : 'dry-run 跳过（未付费）'}`);
   console.log(`  总耗时  : ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   for (const n of notes.filter((x) => x.startsWith('环境项'))) console.log(`  \x1b[33m${n}\x1b[0m`);

@@ -33,6 +33,10 @@
   .live-dot.bad{background:var(--red);box-shadow:0 0 0 3px rgba(217,74,74,.15)}
   .mode{display:flex;align-items:center;gap:8px;padding:5px 10px;border:1px solid var(--border);
     border-radius:999px;font-size:12.5px;color:var(--text-2);background:#fafbfc;white-space:nowrap}
+  /* 字幕开关的两个"组合态"：本地 ASR 下烧字幕是绿的（时间戳可信），
+     云端 ASR 下是琥珀色的（句级时间窗不可靠，会错位）——让这个已知坏组合在界面上看得见。 */
+  .mode.ok{border-color:var(--green);background:#f2fbf6;color:#1f7a4d}
+  .mode.warn{border-color:var(--amber);background:#fff8ec;color:#a96a00}
   .switch{position:relative;width:36px;height:20px;border-radius:999px;background:#d6d9dd;
     border:none;padding:0;transition:background .18s;flex:0 0 auto}
   .switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
@@ -352,6 +356,10 @@
       <span id="modeText">半自动 · 需确认后发布</span>
       <button class="switch" id="modeSwitch" title="切换全自动 / 半自动"></button>
     </div>
+    <div class="mode" id="subMode" title="切片是否把转写烧成字幕。字幕准不准取决于转写引擎：本地 Fun-ASR 有字级时间戳（实测偏差 ±0.2 秒）；云端 ASR 的句级时间窗不可靠（实测 15 个字的句子占了 0→30.9 秒），烧出来会与声音错位。">
+      <span id="subText">字幕：加载中…</span>
+      <button class="switch" id="subSwitch" title="开启 / 关闭字幕烧录（下一次切片生效）"></button>
+    </div>
     <button class="ghost" id="btnRepairStuck" title="进程被强杀后任务会停在「切片中」这类状态，点这里修回可操作状态">修复卡住</button>
     <button class="ghost" id="btnCheckNow">立即检查</button>
     <button class="ghost" id="btnImport">导入录播</button>
@@ -542,11 +550,34 @@ function inline(s) {
 /* ============================================================================
  * 数据加载
  * ========================================================================== */
+/* 顶栏的「字幕」开关（默认关，随时能切）。
+   为什么单独给它一个按钮、而不是只留在设置里：字幕曾经被**整体关掉**，原因是云端 ASR 的
+   句级时间窗不可靠 —— 实测「15 个字的句子占了 0→30.9 秒」，烧出来与声音整体错位。
+   换成本地 Fun-ASR 后字级时间戳是准的（实测偏差 ±0.2 秒），那时烧字幕才成立。
+   所以这个开关不只显示一个布尔值，它要顺带回答「现在这台机器上烧字幕值不值得」：
+   本地引擎 → 绿色；云端引擎 → 琥珀色警告。 */
+function renderSubtitleSwitch() {
+  const cfg = (state.bootstrap && state.bootstrap.config) || {};
+  const on = !!(cfg.clip && cfg.clip.burnSubtitles);
+  const provider = String((cfg.asr && cfg.asr.provider) || '');
+  const local = provider === 'local-funasr' || provider === 'whisper-cpp';
+  const sw = $('#subSwitch');
+  if (sw) sw.classList.toggle('on', on);
+  const box = $('#subMode');
+  if (box) {
+    box.classList.toggle('ok', on && local);
+    box.classList.toggle('warn', on && !local);
+  }
+  const t = $('#subText');
+  if (t) t.textContent = !on ? '字幕：关' : (local ? '字幕：开 · 本地 ASR' : '字幕：开 · 云端 ASR 可能错位');
+}
+
 async function loadBootstrap() {
   state.bootstrap = await api('/api/bootstrap');
   const b = state.bootstrap;
   $('#modeSwitch').classList.toggle('on', b.mode.autoPublish);
   $('#modeText').textContent = b.mode.autoPublish ? '全自动 · 免确认发布' : '半自动 · 需确认后发布';
+  renderSubtitleSwitch();
   $('#brandText').textContent = `房间 ${b.roomId} · v${b.version}` + (b.mode.isOnlySelf ? ' · 仅自己可见' : '') + (b.seasonConfigured ? '' : ' · 未配置合集');
 }
 
@@ -2476,8 +2507,10 @@ async function openCfg() {
     <div class="fields">
       <div class="field"><label>画面烧入字幕</label><div class="inline-switch">
         <button class="switch sm ${c.clip.burnSubtitles ? 'on' : ''}" id="c_burnSubtitles"></button>
-        <span>${c.clip.burnSubtitles ? '开启（转写已经花过钱，不烧等于白花）' : '关闭（画面只有弹幕）'}</span></div>
-        <div class="hintline">字幕位置比弹幕更高、字号更大，两者不会叠在一起。</div></div>
+        <span>${c.clip.burnSubtitles ? '开启（字幕烧进画面）' : '关闭（画面只有弹幕）'}</span></div>
+        <div class="hintline">字幕位置比弹幕更高、字号更大，两者不会叠在一起。
+          <b>字幕准不准取决于转写引擎</b>：本地 Fun-ASR 有字级时间戳（实测偏差 ±0.2 秒）；云端 ASR 的句级时间窗不可靠（实测 15 个字的句子占了 0→30.9 秒），烧出来会与声音错位。
+          顶栏那个「字幕」开关可以随时切，不用进这里。</div></div>
       <div class="field"><label>字幕字号（0 = 自动）</label><input class="inp num" id="c_subtitleFontSize" value="${c.clip.subtitle.fontSize}"></div>
       <div class="field"><label>每行最多几个字</label><input class="inp num" id="c_subtitleMaxChars" value="${c.clip.subtitle.maxCharsPerLine}"></div>
       <div class="field"><label>单条最短显示（秒）</label><input class="inp num" id="c_subtitleMinDur" value="${c.clip.subtitle.minDurationSec}"></div>
@@ -2821,7 +2854,7 @@ function bindCfg() {
 
   const tgl = (id, cb) => { const el = $(id); if (el) el.onclick = () => { const on = el.classList.toggle('on'); cb(on, el); }; };
   tgl('#c_burnDanmaku', (on, el) => el.nextElementSibling.textContent = on ? '开启（原生弹幕，无错字风险）' : '关闭（切片画面无弹幕）');
-  tgl('#c_burnSubtitles', (on, el) => el.nextElementSibling.textContent = on ? '开启（转写已经花过钱，不烧等于白花）' : '关闭（画面只有弹幕）');
+  tgl('#c_burnSubtitles', (on, el) => el.nextElementSibling.textContent = on ? '开启（字幕烧进画面）' : '关闭（画面只有弹幕）');
   /* 热词开关：文案要跟着状态变 —— 关掉时用户唯一能看到的反馈就是这行字，
      否则"点了没反应"会被当成按钮坏了（这个坑本项目在其它开关上踩过）。 */
   tgl('#c_funasrHotwords', (on, el) => el.nextElementSibling.textContent = on ? '开启（推荐）' : '关闭');
@@ -3566,6 +3599,33 @@ $('#modeSwitch').onclick = async () => {
     toast(on ? '已切换为全自动：分析完成后直接排期发布' : '已切换为半自动：需你确认后才发布');
     await loadBootstrap();
   } catch (e) { toast('切换失败：' + e.message); }
+};
+/* 顶栏字幕开关：切 clip.burnSubtitles。
+   云端 ASR 下开启会先弹确认 —— 这不是"多问一句"，而是因为那个组合必然错位（有实测数据），
+   而且用户当初就是因为它错位才整体关掉字幕的，不该让人一键踩回同一个坑。 */
+$('#subSwitch').onclick = async () => {
+  const cfg = (state.bootstrap && state.bootstrap.config) || {};
+  const next = !(cfg.clip && cfg.clip.burnSubtitles);
+  const provider = String((cfg.asr && cfg.asr.provider) || '未知');
+  const local = provider === 'local-funasr' || provider === 'whisper-cpp';
+  if (next && !local) {
+    if (!confirm(
+      `现在转写走的是云端 ASR（asr.provider=${provider}）。\n\n` +
+      '它的句级时间窗不可靠 —— 实测「15 个字的句子占了 0→30.9 秒」，烧出来的字幕会与声音整体错位。' +
+      '这正是之前把字幕整体关掉的原因。\n\n' +
+      '建议先把「设置 → 转写引擎」换成本地 Fun-ASR（字级时间戳，实测偏差 ±0.2 秒）再开字幕。\n\n仍要现在开启？',
+    )) return;
+  }
+  try {
+    await api('/api/config', { method: 'POST', body: { patch: { clip: { burnSubtitles: next } } } });
+    toast(
+      next
+        ? '已开启字幕烧录：只对之后新切的片子生效（已切好的不会重切）'
+        : '已关闭字幕烧录：之后新切的片子画面只留弹幕',
+      5000,
+    );
+    await loadBootstrap();
+  } catch (e) { toast('切换字幕失败：' + e.message); }
 };
 $('#infoCopy').onclick = async () => {
   const text = state.lastCopy || $('#infoBody').innerText;

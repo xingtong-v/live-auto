@@ -51,6 +51,7 @@
     "multipart-routing-test": "node test/multipart-routing.ts",
     "ui-e2e": "node tools/ui-e2e.ts",
     "tombstone-ui": "node --experimental-strip-types tools/verify-tombstone-ui.ts",
+    "subtitle-switch-ui": "node --experimental-strip-types tools/verify-subtitle-switch.ts",
     "monitor-ui": "node --experimental-strip-types tools/verify-monitor-ui.ts",
     "mcp-e2e": "node tools/mcp-e2e.ts",
     "provider-e2e": "node tools/local-asr/provider-e2e.ts",

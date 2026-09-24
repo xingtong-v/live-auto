@@ -1036,8 +1036,14 @@ export class Transcriber {
             return { window: w, fromCache: true, segments: cached.segments, audioSeconds, paid: false };
           }
 
-          // ---- dry-run 且无缓存：不得自动付费（硬约束 #14）----
-          if (dryRun && !allowPaid) {
+          /* ---- dry-run 且无缓存：不得自动付费（硬约束 #14）----
+           *
+           * ★ 但**本地引擎不产生任何费用**，不该被这道闸拦住。
+           *   实测（2026-09-24，切成 local-funasr 后第一次 dry-run）：闸门先于 provider 分叉执行，
+           *   于是本地转写**永远失败**，而且失败原因写成「未授权付费」—— 明明是免费的，
+           *   用户会以为"要先用 --allow-paid 才能试本地识别"，dry-run 也就再也验不了本地链路
+           *   （耗时 1ms、失败 1 段，报错还指着付费）。 */
+          if (dryRun && !allowPaid && !useLocalAsr) {
             done++;
             opts.onProgress?.({ current: done, total: effectiveWindows.length, label: `转写中 ${done}/${effectiveWindows.length}（dry-run 跳过）` });
             return {

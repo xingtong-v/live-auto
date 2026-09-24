@@ -12,10 +12,12 @@
  *
  * 用法：node test/local-funasr-provider.ts
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { asrCacheKey, buildLocalAsrSpec, mergeWindowsPerFile, parseLocalAsrOutput } from '../src/asr.ts';
 import type { WindowCall } from '../src/asr.ts';
 import { hotWordList } from '../src/glossary.ts';
-import { hashKey } from '../src/util.ts';
+import { ROOT_DIR, hashKey } from '../src/util.ts';
 
 let pass = 0;
 let fail = 0;
@@ -185,6 +187,23 @@ section('1c. 热词与 ASR 缓存键');
     '热词不同 → 键不同（改了词表会重新转写）',
   );
   ok(asrCacheKey({ ...parts, hotwords: '' }) === legacy, '空指纹等价于没热词（不留空槽位）');
+}
+
+section('1d. dry-run 的付费闸门不能拦本地引擎（免费的东西不该要求 --allow-paid）');
+{
+  /* 实测事故（2026-09-24 切成 local-funasr 后第一次 dry-run）：闸门先于 provider 分叉执行，
+     本地转写**永远失败**，原因还写成"未授权付费" —— dry-run 从此验不了本地链路。 */
+  const src = fs.readFileSync(path.join(ROOT_DIR, 'src', 'asr.ts'), 'utf8');
+  ok(
+    /if \(dryRun && !allowPaid && !useLocalAsr\)/.test(src),
+    '闸门条件里排除了本地引擎',
+    '本地引擎在 dry-run 下被"未授权付费"拦住 → 免费的东西也要求 --allow-paid',
+  );
+  ok(/dryRun && !allowPaid/.test(src), '闸门仍在（云端该拦的照样拦）');
+  ok(
+    /const useLocalAsr = this\.provider === 'whisper-cpp' \|\| this\.provider === 'local-funasr'/.test(src),
+    'whisper 与 funasr 都算"不产生费用"',
+  );
 }
 
 /* ================= 2. 输出解析 ================= */
