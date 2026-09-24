@@ -839,6 +839,78 @@ export function reportPathOf(reportId: string): string {
   return path.join(getErrorReportDir(), `${safe}.json`);
 }
 
+/**
+ * 从错误事件流里找一条事件（reportId 精确匹配）。
+ *
+ * 有了它，「按 reportId 取报告」这件事才能有个**兜底**：报告文件可能被清理掉、
+ * 也可能当初就没写成功（磁盘满、被 kill），而事件行是同步追加的、几乎不会丢。
+ */
+export function findErrorEvent(reportId: string): ErrorEvent | undefined {
+  const id = String(reportId);
+  return readErrorEvents({}).find((e) => e && e.reportId === id);
+}
+
+/**
+ * 用事件行**合成**一份最小可读的报告（原始报告文件已不存在时用）。
+ *
+ * 为什么不做成 404：用户点「报告」是为了知道"到底出了什么事"。
+ * 只回一句"找不到报告"等于把门关上 —— 而事件行里其实已经有时间、阶段、类型、
+ * 消息、重试次数，足以回答"哪一场、在哪一步、为什么挂了"。
+ * 缺的只是细节（请求上下文、对方侧日志、堆栈），所以用 `reportFileMissing`
+ * 如实标注，并在时间线里写清"原始报告本应位于哪里"，而不是假装这是原始报告。
+ */
+export function reportFromEvent(ev: ErrorEvent): ErrorReport {
+  const stage = ev.stage && ev.stage.trim() ? ev.stage.trim() : 'unknown';
+  const where: string[] = [`错误类型 ${ev.type}`, `阶段 ${stage}`, `重试 ${ev.retries ?? 0} 次`];
+  if (ev.endpoint) where.push(`接口 ${ev.endpoint}${typeof ev.httpStatus === 'number' ? ` → HTTP ${ev.httpStatus}` : ''}`);
+  const reportPath = ev.reportPath || reportPathOf(ev.reportId);
+
+  const report: ErrorReport = {
+    reportId: ev.reportId,
+    stage,
+    at: ev.at,
+    appVersion: resolveAppVersion(),
+    error: { type: isErrorType(ev.type) ? ev.type : 'internal', message: ev.message },
+    retries: [],
+    env: {
+      nodeVersion: process.version,
+      platform: `${process.platform} ${process.arch}`,
+      cwd: process.cwd(),
+      appVersion: resolveAppVersion(),
+      stage,
+    },
+    timeline: [
+      {
+        at: ev.at,
+        step: '只保留了错误事件记录（原始报告文件已不存在）',
+        ok: false,
+        detail: `${where.join('；')}。原始报告本应位于：${reportPath}`,
+      },
+    ],
+    reportFileMissing: true,
+  };
+  const disk = diskInfo();
+  if (disk) {
+    report.env.diskFreeBytes = disk.freeBytes;
+    report.env.diskFreeGB = Number((disk.freeBytes / 1024 ** 3).toFixed(2));
+    report.env.diskTotalGB = Number((disk.totalBytes / 1024 ** 3).toFixed(2));
+  }
+  if (ev.taskId) report.taskId = ev.taskId;
+  return report;
+}
+
+/**
+ * 取报告：优先读原始报告文件；文件没了就用事件行合成一份（见 `reportFromEvent`）。
+ * 两者都没有才返回 undefined（调用方据此回 404 / 提示"这条事件已不在错误流里"）。
+ */
+export function loadErrorReportOrEvent(reportId: string): { report: ErrorReport; synthesized: boolean } | undefined {
+  const real = loadErrorReport(reportId);
+  if (real) return { report: real, synthesized: false };
+  const ev = findErrorEvent(reportId);
+  if (ev) return { report: reportFromEvent(ev), synthesized: true };
+  return undefined;
+}
+
 /** 载入某任务的完整报告（CLI --inspect 与 UI「查看日志」用） */
 export function loadErrorReport(reportId: string): ErrorReport | undefined {
   try {

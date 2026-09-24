@@ -21,7 +21,7 @@ import { URL } from 'node:url';
 import type { Orchestrator } from './daemon.ts';
 import { APP_VERSION, retentionNote, summarizeTask } from './daemon.ts';
 import type { ClipRecord, Stage, TaskRecord } from './types.ts';
-import { loadErrorReport, readErrorEvents, renderErrorTimeline, listErrorReports } from './errors.ts';
+import { loadErrorReport, loadErrorReportOrEvent, readErrorEvents, renderErrorTimeline, listErrorReports } from './errors.ts';
 import { resolveCover, validateDtime, describeDtimePlan, parseUserDtime } from './publish.ts';
 import { sanitizeTitle, sanitizeDesc, sanitizeTags, mapCategoryToTid, transcriptPreview } from './analyze.ts';
 import { PromptStore } from './analyze.ts';
@@ -1237,22 +1237,33 @@ export class UiServer {
       return;
     }
 
-    /* ---------------- GET /api/error-report/:id ---------------- */
+    /* ---------------- GET /api/error-report/:id ----------------
+     *
+     * ★ 这里**不能只认报告文件**。报告文件会被清理、也可能当初就没写成功（磁盘满/被 kill），
+     *   而 `errors.jsonl` 的事件行是同步追加的、几乎不会丢。以前文件不在就回 404，
+     *   界面只能弹一个转瞬即逝的 toast —— 实测 86 条事件里 74 条点下去是"没有任何效果"。
+     *   现在：文件在 → 原始报告；文件不在但事件在 → 用事件合成一份（带 `reportFileMissing`）；
+     *   两者都没有才 404。 */
     const reportMatch = /^\/api\/error-report\/([^/]+)$/.exec(p);
     if (reportMatch && method === 'GET') {
       const reportId = decodeURIComponent(reportMatch[1]!);
-      const report = loadErrorReport(reportId);
-      if (!report) {
+      const found = loadErrorReportOrEvent(reportId);
+      if (!found) {
         this.sendJson(res, 404, { error: `找不到错误报告：${reportId}`, available: listErrorReports().slice(-20) });
         return;
       }
+      const { report, synthesized } = found;
       const asText = url.searchParams.get('format') === 'text';
       if (asText) {
         // 「一键复制」用的渲染后时间线
         this.sendText(res, 200, renderErrorTimeline(report));
         return;
       }
-      this.sendJson(res, 200, { report, timeline: renderErrorTimeline(report) });
+      this.sendJson(res, 200, {
+        report,
+        timeline: renderErrorTimeline(report),
+        reportFileMissing: synthesized || report.reportFileMissing === true,
+      });
       return;
     }
 

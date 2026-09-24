@@ -207,6 +207,11 @@
   .tomb-meta code{background:#fff;border:1px solid #e3dbf3;border-radius:4px;padding:0 4px}
   .linkbtn.danger{color:#b3261e}
   .linkbtn.danger:hover{color:#8c1d18}
+  /* 错误报告降级提示：报告文件没了、内容由事件行合成时必须说清，
+     否则用户会以为"细节本来就没有"。用琥珀色 —— 是"信息不完整"，不是"又出错了"。 */
+  .warnbox{font-size:12px;line-height:1.6;color:#7a4a06;background:#fff8e6;border:1px solid #f0dca8;
+    border-radius:8px;padding:8px 11px;margin-bottom:10px}
+  .warnbox code{background:#fff;border:1px solid #f0dca8;border-radius:4px;padding:0 4px;word-break:break-all}
   .tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px}
   .tags span{font-size:11.5px;padding:1.5px 8px;border-radius:5px;background:#f4f5f7;color:#5c6169}
   .why{font-size:12.6px;color:var(--text-2);margin:0 0 10px;padding-left:10px;border-left:2px solid var(--border)}
@@ -1353,7 +1358,8 @@ function bindDetail() {
   if (reportBtn) reportBtn.onclick = async () => {
     try {
       const r = await api('/api/error-report/' + encodeURIComponent(reportBtn.dataset.report));
-      openInfo('错误报告 · ' + reportBtn.dataset.report, `<div class="timeline">${(r.report.timeline || []).map((t) =>
+      const nt = reportNote(r);
+      openInfo('错误报告 · ' + reportBtn.dataset.report, nt.note + `<div class="timeline">${(r.report.timeline || []).map((t) =>
         `<div class="row ${t.ok ? '' : 'bad'}"><span class="t">${esc(fmtTime(Date.parse(t.at)))}</span>
          <span class="s"><b>${esc(t.step)}</b>${t.model ? ` <span class="tag-mini">${esc(t.model)}</span>` : ''}${t.detail ? '<br>' + esc(t.detail) : ''}${t.elapsedMs ? ` <span style="color:var(--text-3)">${t.elapsedMs}ms</span>` : ''}</span></div>`).join('')}</div>
         <h3 style="font-size:13px;margin:16px 0 8px">错误本体</h3>
@@ -1363,7 +1369,7 @@ function bindDetail() {
         ${r.report.request ? `<h3 style="font-size:13px;margin:16px 0 8px">请求上下文（已脱敏）</h3><pre class="raw">${esc(JSON.stringify(r.report.request, null, 2))}</pre>` : ''}
         ${r.report.env && r.report.env.biliLiveToolsLogTail ? `<h3 style="font-size:13px;margin:16px 0 8px">biliLive-tools 侧日志片段</h3><pre class="raw">${esc(String(r.report.env.biliLiveToolsLogTail).slice(-3000))}</pre>` : ''}
         <h3 style="font-size:13px;margin:16px 0 8px">完整报告 JSON</h3><pre class="raw">${esc(JSON.stringify(r.report, null, 2))}</pre>`,
-        '报告已脱敏，可直接复制给开发者');
+        nt.tip);
       state.lastCopy = r.timeline;
     } catch (e) { toast('读取报告失败：' + e.message); }
   };
@@ -1899,9 +1905,10 @@ async function renderHealth(box) {
   $$('[data-act="openreport"]').forEach((b) => b.onclick = async () => {
     try {
       const r = await api('/api/error-report/' + encodeURIComponent(b.dataset.report));
-      openInfo('错误报告 · ' + b.dataset.report, `<pre class="raw">${esc(r.timeline)}</pre>`, '已脱敏，可一键复制');
+      const nt = reportNote(r);
+      openInfo('错误报告 · ' + b.dataset.report, nt.note + `<pre class="raw">${esc(r.timeline)}</pre>`, nt.tip);
       state.lastCopy = r.timeline;
-    } catch (e) { toast(e.message); }
+    } catch (e) { toast('读取报告失败：' + e.message); }
   });
   /* 解除墓碑：这是「允许同一内容再投一次」的唯一开关，必须二次确认，
      且确认文案要把不可逆的后果讲清楚（本地解除不会让旧稿件消失）。 */
@@ -2305,9 +2312,10 @@ function renderMonitor(box) {
   $$('[data-act="openreport"]').forEach((b) => b.onclick = async () => {
     try {
       const r = await api('/api/error-report/' + encodeURIComponent(b.dataset.report));
-      openInfo('错误报告 · ' + b.dataset.report, `<pre class="raw">${esc(r.timeline)}</pre>`, '已脱敏，可一键复制');
+      const nt = reportNote(r);
+      openInfo('错误报告 · ' + b.dataset.report, nt.note + `<pre class="raw">${esc(r.timeline)}</pre>`, nt.tip);
       state.lastCopy = r.timeline;
-    } catch (e) { toast(e.message); }
+    } catch (e) { toast('读取报告失败：' + e.message); }
   });
 }
 
@@ -3268,6 +3276,25 @@ function openInfo(title, html, tip) {
   $('#infoMask').classList.add('show');
 }
 function closeInfo() { $('#infoMask').classList.remove('show'); }
+
+/* 「报告文件已不存在」的提示条。
+ *
+ * 为什么要有它：`data/error-report/*.json` 会被清理，也可能当初就没写成功（磁盘满/被 kill），
+ * 而 `errors.jsonl` 的事件行（同步追加）还在。服务端现在会**用事件行合成**一份最小报告
+ * （`reportFileMissing: true`）。合成件缺的是请求上下文 / biliLive-tools 日志 / 堆栈 ——
+ * 必须在弹窗里如实说明，否则用户会把"细节没了"当成"这个错本来就这么点信息"。
+ * 三个页签（任务详情 / 健康 / 实时监控）共用这一份，避免以后改一处漏两处。 */
+function reportNote(r) {
+  const missing = !!(r && r.reportFileMissing);
+  return {
+    note: missing
+      ? `<div class="warnbox">⚠ 原始报告文件已不存在（可能已被清理，或当初写盘失败）。以下内容由
+         <code>errors.jsonl</code> 的事件行合成：时间、阶段、类型、消息、重试次数是真的，
+         请求上下文 / biliLive-tools 侧日志 / 堆栈已不可得。</div>`
+      : '',
+    tip: missing ? '降级内容（仅事件记录）—— 已脱敏，可一键复制' : '报告已脱敏，可直接复制给开发者',
+  };
+}
 window.closeInfo = closeInfo;
 
 /* ============================================================================

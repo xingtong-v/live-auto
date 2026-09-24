@@ -18,6 +18,7 @@ import type {
   ArchiveItem,
   BiliUser,
   ClipRecord,
+  ErrorType,
   FfmpegPreset,
   TaskRecord,
   Transcript,
@@ -49,6 +50,7 @@ import {
   writeJsonAtomic,
 } from './util.ts';
 import { log as globalLog, type Logger } from './logger.ts';
+import { writeErrorReport } from './errors.ts';
 
 /* ============================================================================
  * 工具：路径、预设、封面、dtime
@@ -1053,6 +1055,57 @@ export class Publisher {
     this.logger = (deps.logger ?? globalLog).child({ mod: 'publish' });
   }
 
+  /**
+   * 片段级失败**也要进错误报告**。
+   *
+   * 为什么必须补这一步（实测，2026-09-24）：以前这些分支只做 `log.error` + 台账写 `failReason`。
+   * 界面上能看到"这个片段失败了"，但 `data/errors.jsonl` 与 `data/error-report/` 里**一条都没有** ——
+   * 于是「错误报告」这个功能对真实故障完全无效：用户点进去只看到一堆测试噪音，
+   * "近 24h 错误"也永远不反映真正挂掉的那次切片。
+   *
+   * 报告写失败不影响主流程：`writeErrorReport` 内部对写盘失败只降级（只留 errors.jsonl 那行），
+   * 且这里的整段又包了一层 try —— 诊断能力再重要，也不能反过来把投稿搞挂。
+   */
+  private reportClipFailure(input: {
+    taskId: string;
+    taskTitle?: string;
+    clipIndex: number;
+    stage: string;
+    error: unknown;
+    type: ErrorType;
+    cutOutput?: string;
+  }): void {
+    try {
+      const failReason =
+        input.error instanceof Error ? input.error.message : typeof input.error === 'string' ? input.error : '（见日志）';
+      writeErrorReport({
+        taskId: input.taskId,
+        ...(input.taskTitle ? { taskTitle: input.taskTitle } : {}),
+        stage: input.stage,
+        // 包一层：报告标题/时间线里要一眼看出是**第几个片段**，否则"切片失败"无从定位
+        error: new Error(`片段 #${input.clipIndex} ${input.stage} 失败：${failReason}`),
+        type: input.type,
+        client: this.client,
+        ledgerEntries: {
+          clipIndex: input.clipIndex,
+          stage: input.stage,
+          failReason,
+          ...(input.cutOutput ? { cutOutput: input.cutOutput } : {}),
+        },
+        taskStatus: this.ledger.getTask(input.taskId)?.status,
+        extraEnv: {
+          clipIndex: input.clipIndex,
+          failReason,
+          ...(input.cutOutput ? { cutOutput: input.cutOutput } : {}),
+        },
+      });
+    } catch (e) {
+      this.logger.warn(`片段级错误报告写入失败（不影响投稿）：${(e as Error).message}`, {
+        data: { taskId: input.taskId, clipIndex: input.clipIndex },
+      });
+    }
+  }
+
   update(cfg: AppConfig): void {
     this.cfg = cfg;
   }
@@ -1319,6 +1372,14 @@ export class Publisher {
       const msg = `找不到可用于切片的源文件。source.rawFiles 与 fullVideoPath 都不可用，无法切片`;
       log.error(msg);
       this.ledger.setClipStatus(task.id, clipIndex, 'FAILED', { failReason: msg });
+      this.reportClipFailure({
+        taskId: task.id,
+        taskTitle: task.title,
+        clipIndex,
+        stage: 'CLIPPED',
+        error: new Error(msg),
+        type: 'file-missing',
+      });
       return { clipIndex, ok: false, error: { type: 'file-missing', message: msg }, warnings };
     }
 
@@ -1480,6 +1541,14 @@ export class Publisher {
       const type = e instanceof ApiError ? e.type : 'internal';
       log.error(`切片任务提交失败（片段 #${clipIndex}）`, e);
       this.ledger.setClipStatus(task.id, clipIndex, 'FAILED', { failReason: `切片提交失败：${msg}` });
+      this.reportClipFailure({
+        taskId: task.id,
+        taskTitle: task.title,
+        clipIndex,
+        stage: 'CLIPPED',
+        error: e,
+        type,
+      });
       return { clipIndex, ok: false, error: { type, message: msg }, warnings };
     }
 
@@ -1514,6 +1583,14 @@ export class Publisher {
       const msg = e instanceof Error ? e.message : String(e);
       log.error(`切片任务失败（片段 #${clipIndex}，taskId=${cutTaskId}）`, e);
       this.ledger.setClipStatus(task.id, clipIndex, 'FAILED', { failReason: `切片失败：${msg}` });
+      this.reportClipFailure({
+        taskId: task.id,
+        taskTitle: task.title,
+        clipIndex,
+        stage: 'CLIPPED',
+        error: e,
+        type: 'internal',
+      });
       return { clipIndex, ok: false, cutTaskId, error: { type: 'internal', message: msg }, warnings };
     }
 
@@ -1626,6 +1703,15 @@ export class Publisher {
           cutOutput: taskOutput,
         });
         this.ledger.logPublish({ taskId: task.id, clipIndex, action: 'fail', error: msg, title: clip.title });
+        this.reportClipFailure({
+          taskId: task.id,
+          taskTitle: task.title,
+          clipIndex,
+          stage: 'PUBLISHED',
+          error: new Error(msg),
+          type: 'upload-failed',
+          cutOutput: taskOutput,
+        });
         return { clipIndex, ok: false, cutTaskId, output: taskOutput, uploadTaskId: res.taskId, error: { type: 'upload-failed', message: msg }, warnings };
       }
       log.debug(`上传任务 ${res.taskId} 已完成（${uploadOutcome.status}），bvid 待 /bili/archives 反查确认`);
@@ -1636,6 +1722,15 @@ export class Publisher {
       log.error(`投稿失败（片段 #${clipIndex}）—— 切片产物已保留，可单独重投`, e);
       this.ledger.setClipStatus(task.id, clipIndex, 'FAILED', { failReason: `投稿失败：${msg}`, cutOutput: taskOutput });
       this.ledger.logPublish({ taskId: task.id, clipIndex, action: 'fail', error: msg, title: clip.title });
+      this.reportClipFailure({
+        taskId: task.id,
+        taskTitle: task.title,
+        clipIndex,
+        stage: 'PUBLISHED',
+        error: e,
+        type: e instanceof ApiError ? e.type : 'upload-failed',
+        cutOutput: taskOutput,
+      });
       return { clipIndex, ok: false, cutTaskId, output: taskOutput, error: { type: 'upload-failed', message: msg }, warnings };
     }
   }
@@ -2419,6 +2514,17 @@ export class Publisher {
       for (const p of titled) {
         if (p.kind === 'clip' && p.clipIndex !== undefined) {
           this.ledger.setClipStatus(task.id, p.clipIndex, 'FAILED', { failReason: `多分P投稿失败：${msg}` });
+          /* 多分P是**整批一个请求**：一个片段失败等于整批都没投出去，
+             所以每个切片各写一份报告（带各自的片段号与标题），而不是只写一条含糊的"整批失败"。
+             这样界面上点开任何一条失败切片，看到的都是"它自己那一P 为什么没上去"。 */
+          this.reportClipFailure({
+            taskId: task.id,
+            taskTitle: task.title,
+            clipIndex: p.clipIndex,
+            stage: 'PUBLISHED',
+            error: e,
+            type: e instanceof ApiError ? e.type : 'upload-failed',
+          });
         }
       }
       return { ok: false, mainTitle, parts: titled, dtime, error: msg, warnings };

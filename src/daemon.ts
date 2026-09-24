@@ -26,7 +26,7 @@ import { Alerter as DefaultAlerter } from './alert.ts';
 import { Analyzer, persistAnalysis, PromptStore } from './analyze.ts';
 import { AsrCache, Transcriber, isDryRunPaymentRejection, type AsrMediaAdapter } from './asr.ts';
 import { Cleaner, checkAfterUploadDelete, judgeDeletability, rotateLogs } from './cleanup.ts';
-import { writeErrorReport, setErrorReportDir, type ErrorReportInput } from './errors.ts';
+import { writeErrorReport, setErrorReportDir, setErrorsPath, type ErrorReportInput } from './errors.ts';
 import { LlmClient } from './llm.ts';
 import {
   Publisher,
@@ -196,13 +196,34 @@ export class Orchestrator {
     if (opts.roomId) cfg.room.roomId = opts.roomId;
 
     const level = cfg.runtime.logLevel;
-    this.logger = new Logger({ level, file: true, color: true });
+    /* 日志目录也跟随 dataDir 覆盖：测试与真实服务**共用同一个日志文件**时，
+       真实日志会被 mock 任务的几万行冲掉（实测 2026-09-24：当天日志 2 MB 里
+       绝大部分是 `mp-test-*` / `*-rec-mock` 这类测试场次），出错时翻日志根本翻不出东西。 */
+    this.logger = new Logger({
+      level,
+      file: true,
+      color: true,
+      ...(opts.dataDirOverride ? { dir: path.join(opts.dataDirOverride, 'logs') } : {}),
+    });
+    /* 模块级单例 `log` 也要跟着走：ledger / publish / trash 这些模块直接用它，
+       不经过上面这个 logger。不改的话测试仍会把行写进真实 `data/logs`。 */
+    if (opts.dataDirOverride) globalLog.setDir(path.join(opts.dataDirOverride, 'logs'));
     globalLog.setLevel(level);
 
     this.ledger = opts.ledger ?? defaultLedger;
     this.dataDir = opts.dataDirOverride ?? DATA_DIR;
-    // 错误报告目录跟随 dataDir 覆盖 —— 否则端到端测试会把报告写进真实 data/
-    if (opts.dataDirOverride) setErrorReportDir(path.join(opts.dataDirOverride, 'error-report'));
+    /* 错误报告目录**与错误事件流**都要跟随 dataDir 覆盖。
+     *
+     * 为什么两个都要：它们原本是模块级常量，`dataDirOverride` 管不到 ——
+     * 于是测试产生的错误被写进**真实**的 `data/errors.jsonl`，把健康面板的
+     * 「近 24h 错误」冲成噪音（实测 2026-09-24：86 条里 74 条来自 mock 测试，
+     * 而且那 74 条的**报告文件根本不在**，界面上点「报告」全是 404）。
+     * 之前只改了报告目录，事件流靠各测试自己 `setErrorsPath()` —— 谁忘了谁污染，
+     * 这个坑不该由每个测试各自记得绕。 */
+    if (opts.dataDirOverride) {
+      setErrorReportDir(path.join(opts.dataDirOverride, 'error-report'));
+      setErrorsPath(path.join(opts.dataDirOverride, 'errors.jsonl'));
+    }
     this.client = BiliLiveClient.fromConfig(cfg, this.logger);
     this.llm = LlmClient.fromConfig(cfg, this.logger);
     this.prompts = new PromptStore();

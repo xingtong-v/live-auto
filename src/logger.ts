@@ -63,6 +63,8 @@ export class Logger {
   /** 当前写入的文件日期，跨天自动换文件 */
   private currentDate = '';
   private stream: fs.WriteStream | null = null;
+  /** 上次"日志写盘失败"告警时刻（用于抑制刷屏） */
+  private lastStreamErrorAt = 0;
 
   constructor(opts: LoggerOptions = {}) {
     this.level = opts.level ?? 'info';
@@ -79,6 +81,21 @@ export class Logger {
 
   setLevel(level: LogLevel): void {
     this.level = level;
+  }
+
+  /**
+   * 换日志目录（**必须在还没写过文件之前调**，或接受"换目录前那几行留在旧文件里"）。
+   *
+   * 为什么需要它：`log` 是模块级单例，很多模块（ledger / publish / trash…）直接用它，
+   * 不经过 Orchestrator 自己的 logger。端到端测试虽然把 dataDir 换到临时目录，
+   * 单例的目录仍指向真实的 `data/logs` —— 于是测试的几万行把真实日志冲掉，
+   * 出错时翻日志翻不出东西（实测：当天 2 MB 日志绝大部分是 mock 测试场次）。
+   */
+  setDir(dir: string): void {
+    if (dir === this.dir) return;
+    this.dir = dir;
+    this.stream = null; // 让下一次写入按新目录重新建流
+    this.currentDate = '';
   }
 
   setConsole(enabled: boolean): void {
@@ -116,7 +133,14 @@ export class Logger {
         this.stream = null;
       }
       ensureDir(this.dir);
-      this.stream = fs.createWriteStream(today, { flags: 'a' });
+      const stream = fs.createWriteStream(today, { flags: 'a' });
+      /* ★ 必须挂 error 处理器。没有它时，异步写失败（目录被删掉、磁盘满、权限变化）
+         会以**未捕获的 'error' 事件**形式抛出来，直接带走整个进程 ——
+         而抛出者居然是"日志"。实测踩过两次：端到端测试删掉临时目录后（ENOENT），
+         以及日志目录被当成临时目录清理时。日志写不进去是小事，因为写日志把
+         正在投稿的服务干掉是大事。 */
+      stream.on('error', (e: Error) => this.onStreamError(e));
+      this.stream = stream;
       this.currentDate = today;
       this.pruneOld();
       return this.stream;
@@ -124,6 +148,32 @@ export class Logger {
       // 磁盘满 / IO 拥塞时不得让日志把业务拖死
       this.useFile = false;
       return null;
+    }
+  }
+
+  /**
+   * 文件写入流报错：关掉它、退化成"只输出到控制台"，并**每个窗口只提示一次**。
+   *
+   * 不直接把 `useFile` 永久关掉：目录可能只是临时不可用（比如被挪走又挪回来），
+   * 下一轮写入会重新尝试打开。但也不能每写一行就重试一次 —— 那会在坏盘上打转。
+   */
+  private onStreamError(e: Error): void {
+    try {
+      this.stream?.end();
+    } catch {
+      /* ignore */
+    }
+    this.stream = null;
+    this.currentDate = '';
+    const now = Date.now();
+    if (now - this.lastStreamErrorAt > 60_000) {
+      this.lastStreamErrorAt = now;
+      // 用 stderr 直写：自己就是坏掉的那条路，不能再走自己
+      try {
+        process.stderr.write(`[logger] 日志文件写入失败，已临时降级为仅控制台输出：${e.message}\n`);
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -229,6 +279,7 @@ export class Logger {
       error: { value: (m: string, e?: unknown, f?: Fields) => parent.error(m, e, merge(f)) },
       log: { value: (l: LogLevel, m: string, f?: Fields) => parent.log(l, m, merge(f)) },
       setLevel: { value: (l: LogLevel) => parent.setLevel(l) },
+      setDir: { value: (d: string) => parent.setDir(d) },
       close: { value: () => parent.close() },
     });
     return sub;

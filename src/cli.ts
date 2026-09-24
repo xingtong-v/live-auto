@@ -24,7 +24,15 @@
 import path from 'node:path';
 import { Orchestrator, APP_VERSION } from './daemon.ts';
 import { UiServer } from './server.ts';
-import { listErrorReports, loadErrorReport, readErrorEvents, renderErrorTimeline, errorCountLastHours } from './errors.ts';
+import {
+  listErrorReports,
+  loadErrorReport,
+  loadErrorReportOrEvent,
+  readErrorEvents,
+  renderErrorTimeline,
+  errorCountLastHours,
+  reportPathOf,
+} from './errors.ts';
 import { loadConfig } from './config.ts';
 import { fmtBytes, fmtDuration, fmtLocal } from './util.ts';
 
@@ -365,8 +373,8 @@ async function cmdInspect(args: ParsedArgs): Promise<void> {
     return;
   }
 
-  // 先按 reportId 找；找不到再按 taskId 找最近一份
-  let report = loadErrorReport(id);
+  // 先按 reportId 找；找不到再按 taskId 找最近一份；报告文件没了就退回到事件行合成
+  let report = loadErrorReportOrEvent(id)?.report;
   if (!report) {
     const reports = listErrorReports(id);
     if (reports.length) report = loadErrorReport(path.basename(reports[reports.length - 1]!, '.json'));
@@ -379,6 +387,12 @@ async function cmdInspect(args: ParsedArgs): Promise<void> {
   }
 
   title(`错误报告 ${report.reportId}`);
+  if (report.reportFileMissing) {
+    console.log(
+      `${C.yellow}⚠ 原始报告文件已不存在，以下内容由 errors.jsonl 里的事件行合成（细节缺失）${C.reset}`,
+    );
+    console.log(`${C.dim}  原始报告本应位于：${reportPathOf(report.reportId)}${C.reset}`);
+  }
   console.log(`${C.bold}上下文${C.reset}`);
   console.log(`  任务      : ${report.taskId ?? '(全局)'}${report.taskTitle ? ` · ${report.taskTitle}` : ''}`);
   console.log(`  失败阶段  : ${report.stage}`);
