@@ -1,0 +1,22 @@
+# 本项目对文件字节形态有硬要求（`npm run text-test` 会逐文件校验）：
+#   - `.cmd` / `.bat` 必须**纯 ASCII + CRLF**（cmd.exe 解析中文会乱码、LF 会报错）
+#   - `.ps1` 必须 **UTF-8 + BOM + CRLF**（PS 5.1 不带 BOM 会把中文读成乱码）
+#   - 其它文本一律 UTF-8 **不带 BOM**
+# 所以这里显式声明，避免 git 在 checkout 时把行尾改掉（Windows 上默认可能转成 CRLF）。
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制：不要做任何文本处理
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.mp4 binary
+*.flv binary
+*.mp3 binary
+*.wav binary
+*.gguf binary
+*.onnx binary

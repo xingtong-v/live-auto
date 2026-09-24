@@ -1,0 +1,67 @@
+{
+  "endpoint": "/preset/danmu",
+  "method": "GET",
+  "ref": "§4.5",
+  "capturedAt": "2026-09-22T10:10:31.341Z",
+  "data": [
+    {
+      "id": "default",
+      "name": "默认配置",
+      "config": {
+        "resolution": [
+          1920,
+          1080
+        ],
+        "scrolltime": 12,
+        "fixtime": 5,
+        "density": 0,
+        "customDensity": 50,
+        "fontname": "Microsoft YaHei",
+        "fontsize": 40,
+        "opacity100": 100,
+        "outline": 1,
+        "outline-blur": 0,
+        "outline-opacity-percentage": 100,
+        "shadow": 0,
+        "displayarea": 1,
+        "scrollarea": 0.7,
+        "bold": false,
+        "showusernames": false,
+        "saveblocked": true,
+        "showmsgbox": false,
+        "msgboxsize": [
+          500,
+          1080
+        ],
+        "msgboxpos": [
+          20,
+          0
+        ],
+        "msgboxfontsize": 38,
+        "msgboxduration": 10,
+        "giftminprice": 10,
+        "blockmode": [],
+        "statmode": [],
+        "resolutionResponsive": false,
+        "blacklist": "",
+        "filterFunction": "",
+        "blacklist-regex": false,
+        "line-spacing": 0,
+        "top-margin": 0,
+        "bottom-margin": 0,
+        "timeshift": 0,
+        "fontSizeResponsiveParams": [
+          [
+            1080,
+            40
+          ],
+          [
+            1620,
+            56
+          ]
+        ],
+        "fontSizeResponsive": false
+      }
+    }
+  ]
+}

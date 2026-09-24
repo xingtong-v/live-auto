@@ -1,0 +1,9 @@
+{
+  "endpoint": "/common/version",
+  "method": "GET",
+  "ref": "§4.6",
+  "capturedAt": "2026-09-22T10:10:31.337Z",
+  "data": {
+    "version": "3.21.0"
+  }
+}

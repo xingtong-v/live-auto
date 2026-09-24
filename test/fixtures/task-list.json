@@ -1,0 +1,11 @@
+{
+  "endpoint": "/task/?page&pageSize",
+  "method": "GET",
+  "ref": "§4.6 / §8 WP5 步骤 6",
+  "capturedAt": "2026-09-22T10:10:31.341Z",
+  "data": {
+    "runningTaskNum": 0,
+    "listLen": 0,
+    "sample": []
+  }
+}

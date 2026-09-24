@@ -1,0 +1,14 @@
+{
+  "endpoint": "/user/list",
+  "method": "GET",
+  "ref": "§4.6",
+  "capturedAt": "2026-09-22T10:10:31.338Z",
+  "data": [
+    {
+      "uid": 1000000000000000,
+      "name": "星者如曈捏",
+      "expires": 1802328461000,
+      "hasFace": true
+    }
+  ]
+}

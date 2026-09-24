@@ -1,0 +1,85 @@
+{
+  "endpoint": "/preset/video",
+  "method": "GET",
+  "ref": "§4.5",
+  "capturedAt": "2026-09-22T10:10:31.339Z",
+  "data": [
+    {
+      "id": "default",
+      "name": "默认配置",
+      "config": {
+        "title": "{{user}}{{title}}{{now}}",
+        "desc": "{{title}}{{user}}",
+        "dolby": 0,
+        "hires": 0,
+        "copyright": 3,
+        "tag": [
+          "biliLive-tools",
+          "乙主播",
+          "虚拟主播",
+          "2d",
+          "3D",
+          "直播"
+        ],
+        "tid": 138,
+        "human_type2": 1005,
+        "source": "",
+        "dynamic": "",
+        "cover": "",
+        "noReprint": 0,
+        "watermark": 0,
+        "openElec": 0,
+        "closeDanmu": 0,
+        "closeReply": 0,
+        "selectiionReply": 0,
+        "recreate": 1,
+        "no_disturbance": 0,
+        "autoComment": true,
+        "commentTop": true,
+        "comment": "测试 测试 希望关注一下",
+        "topic_name": null,
+        "is_only_self": 0,
+        "space_hidden": 2,
+        "partTitleTemplate": "{{user}}{{title}}{{hasDanmaStr}}{{index}}",
+        "creationStatement": 1,
+        "uid": 1000000000000000
+      }
+    },
+    {
+      "id": "xcz9r0pf7t",
+      "name": "甲主播",
+      "config": {
+        "title": "{{title}}{{user}}{{now}}",
+        "desc": "{{title}}{{user}}",
+        "dolby": 0,
+        "hires": 0,
+        "copyright": 3,
+        "tag": [
+          "biliLive-tools"
+        ],
+        "tid": 138,
+        "human_type2": 1005,
+        "source": "",
+        "dynamic": "",
+        "cover": "",
+        "noReprint": 0,
+        "watermark": 0,
+        "openElec": 0,
+        "closeDanmu": 0,
+        "closeReply": 0,
+        "selectiionReply": 0,
+        "recreate": 1,
+        "no_disturbance": 0,
+        "autoComment": true,
+        "commentTop": true,
+        "comment": "测试 测试  ",
+        "topic_name": null,
+        "is_only_self": 0,
+        "space_hidden": 2,
+        "partTitleTemplate": "{{title}}{{user}}{{filename}}{{hasDanmaStr}}",
+        "creationStatement": 1,
+        "uid": 1000000000000000
+      }
+    }
+  ]
+}

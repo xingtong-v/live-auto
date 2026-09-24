@@ -1,0 +1,43 @@
+# === 凭据与运行期数据：禁止提交 ===
+config.json
+config.local.json
+data/
+logs/
+ledger.json
+ledger.json.tmp
+decisions.jsonl
+errors.jsonl
+performance.jsonl
+error-report/
+cache/
+transcripts/
+tasks/
+*.llc
+
+# === 依赖与构建 ===
+node_modules/
+dist/
+*.tsbuildinfo
+
+# === 本地 ASR / 模型（12 GB 级，绝不入库）===
+.venv*/
+.venv-asr/
+.venv-funasr/
+.funasr/
+__pycache__/
+*.pyc
+*.gguf
+*.onnx
+
+# === 脱敏工具的备份目录 ===
+.sanitize-backup/
+
+# === 脱敏映射表（左边那列就是真名本身，绝不提交；模板见 tools/sanitize-map.example.json）===
+.sanitize-map.json
+
+# === 编辑器 / 系统 ===
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.log

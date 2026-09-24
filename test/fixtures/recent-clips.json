@@ -1,0 +1,7 @@
+{
+  "endpoint": "/record-history/recent-clips?room_id&platform=Bilibili",
+  "method": "GET",
+  "ref": "§4.1",
+  "capturedAt": "2026-09-22T10:10:31.338Z",
+  "data": []
+}

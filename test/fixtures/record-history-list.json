@@ -1,0 +1,66 @@
+{
+  "endpoint": "/record-history/list?room_id&platform=Bilibili&page&pageSize",
+  "method": "GET",
+  "ref": "§4.1、§8 WP2 步骤 2",
+  "capturedAt": "2026-09-22T10:10:31.339Z",
+  "data": {
+    "pagination": {
+      "total": 74,
+      "page": 1,
+      "pageSize": 50
+    },
+    "data": [
+      {
+        "id": 123,
+        "created_at": 1790009236,
+        "streamer_id": 2,
+        "live_id": "81e738238ba0c53cf3a8a25416190f02",
+        "live_start_time": 1789995002000,
+        "record_start_time": 1790009236030,
+        "record_end_time": 1790010369046,
+        "title": "【2D】跟塔菲lulu一起猴子拆弹！",
+        "video_file": "C:\\Users\\demo\\Downloads\\Bilibili\\乙主播\\2026-09-22 00-47-15-280 【2D】跟塔菲lulu一起猴子拆弹！.flv",
+        "video_filename": "2026-09-22 00-47-15-280 【2D】跟塔菲lulu一起猴子拆弹！",
+        "video_duration": 1138,
+        "danma_num": 1334,
+        "interact_num": 330,
+        "quick_hash": "67bc094422e13045cc861f9a3b6c390e7a0eb5c0438a409b5d93e6a584da0b06",
+        "danma_density": 1.17
+      },
+      {
+        "id": 121,
+        "created_at": 1790005693,
+        "streamer_id": 2,
+        "live_id": "81e738238ba0c53cf3a8a25416190f02",
+        "live_start_time": 1789995002000,
+        "record_start_time": 1790005693312,
+        "record_end_time": 1790009235207,
+        "title": "【2D】跟塔菲lulu一起猴子拆弹！",
+        "video_file": "C:\\Users\\demo\\Downloads\\Bilibili\\乙主播\\2026-09-21 23-48-13-069 【2D】跟塔菲lulu一起猴子拆弹！.flv",
+        "video_filename": "2026-09-21 23-48-13-069 【2D】跟塔菲lulu一起猴子拆弹！",
+        "video_duration": 3541,
+        "danma_num": 4043,
+        "interact_num": 618,
+        "quick_hash": "ad968bd532541bab4a0a20c2d723607caf23352abad43f3c655f8594e5c6173f",
+        "danma_density": 1.14
+      },
+      {
+        "id": 117,
+        "created_at": 1790002149,
+        "streamer_id": 2,
+        "live_id": "81e738238ba0c53cf3a8a25416190f02",
+        "live_start_time": 1789995002000,
+        "record_start_time": 1790002149291,
+        "record_end_time": 1790005693000,
+        "title": "【2D】跟塔菲lulu一起猴子拆弹！",
+        "video_file": "C:\\Users\\demo\\Downloads\\Bilibili\\乙主播\\2026-09-21 22-49-09-078 【2D】跟塔菲lulu一起猴子拆弹！.flv",
+        "video_filename": "2026-09-21 22-49-09-078 【2D】跟塔菲lulu一起猴子拆弹！",
+        "video_duration": 3544,
+        "danma_num": 3459,
+        "interact_num": 587,
+        "quick_hash": "ea417cabfb01ea6eafdb7c246f339f6720b85088415f806674965dcd1c70f547",
+        "danma_density": 0.98
+      }
+    ]
+  }
+}

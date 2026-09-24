@@ -1,0 +1,38 @@
+{
+  "endpoint": "/preset/ffmpeg",
+  "method": "GET",
+  "ref": "§4.5",
+  "capturedAt": "2026-09-22T10:10:31.339Z",
+  "data": [
+    {
+      "id": "default",
+      "name": "默认配置",
+      "config": {
+        "resetResolution": false,
+        "resolutionWidth": 2880,
+        "resolutionHeight": 1620,
+        "audioCodec": "copy",
+        "swsFlags": "auto",
+        "scaleMethod": "auto",
+        "forceOriginalAspectRatio": "auto",
+        "hardwareScaleFilter": false,
+        "addTimestamp": false,
+        "encoderThreads": -1,
+        "timestampX": 10,
+        "timestampY": 10,
+        "timestampFontSize": 24,
+        "timestampFontColor": "#ffffff",
+        "extraOptions": "",
+        "vf": "",
+        "timestampFollowDanmu": true,
+        "timestampExtra": "",
+        "timestampFormat": "%Y-%m-%d %T",
+        "pkOptimize": false,
+        "encoder": "libx264",
+        "bitrateControl": "CRF",
+        "crf": 23,
+        "preset": "fast"
+      }
+    }
+  ]
+}

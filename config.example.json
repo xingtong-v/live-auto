@@ -1,0 +1,275 @@
+{
+  "$comment": "复制本文件为 config.json 后填写。config.json 已在 .gitignore 中，切勿提交真实凭据（硬约束 #8）。",
+
+  "bililive": {
+    "baseUrl": "http://127.0.0.1:18010",
+    "passKey": "在此填写 biliLive-tools 的 PassKey（设置 → 服务 → PassKey）",
+    "versionExpected": "3.22.1",
+    "versionDriftWarn": true,
+    "timeoutMs": 30000,
+    "asrTimeoutMs": 1800000,
+    "retry": 3
+  },
+
+  "room": {
+    "roomId": "12345678",
+    "platform": "Bilibili",
+    "pollIntervalSec": 60,
+    "reconcileIntervalMin": 60,
+    "liveCheckIntervalSec": 60,
+    "offlineConfirmSec": 600,
+    "registerStreamerHint": true
+  },
+
+  "recorder": {
+    "type": "builtin",
+    "webhookTargets": [],
+    "forwardTo": "/webhook/custom",
+    "eventLogPath": "data/webhook-events.jsonl",
+    "recentClipsWindow": 5,
+    "recordHistoryPageSize": 50
+  },
+
+  "segmented": {
+    "autoProbe": true,
+    "maxSegments": 500
+  },
+
+  "danmaku": {
+    "densityWindowSec": 10,
+    "peakTopN": 20,
+    "peakMinIntensity": 0.35,
+    "keywordTopN": 40,
+    "noiseWords": [
+      "哈哈哈哈", "哈哈", "呵呵", "前排", "来了", "打卡", "666", "233", "2333",
+      "awsl", "泪目", "笑死", "好家伙", "确实", "是的", "支持", "加油", "晚安",
+      "主播", "直播间", "关注", "点赞", "投币", "收藏", "弹幕", "1", "6", "啊",
+      "这", "了", "的", "是", "我", "你", "他", "她", "它", "在", "有", "不"
+    ],
+    "danmakuOffsetSec": "auto",
+    "offsetCalibrationSeconds": 0,
+    "factoryPath": "",
+    "fontSize": 0
+  },
+
+  "asr": {
+    "provider": "bililive-tools",
+    "segmentMinutes": 30,
+    "overlapSeconds": 8,
+    "concurrency": 1,
+    "maxRetries": 3,
+    "modelId": "",
+    "cacheDir": "data/asr-cache",
+    "unitPricePerHour": 2.0,
+    "inputSource": "raw",
+    "silenceTrim": {
+      "enabled": false,
+      "noiseDb": -32,
+      "minSilenceSec": 2.0,
+      "paddingSec": 0.4,
+      "ffmpegPath": ""
+    },
+    "whisperCpp": {
+      "binaryPath": "",
+      "modelPath": "",
+      "language": "zh",
+      "threads": 8,
+      "extraArgs": []
+    }
+  },
+
+  "llm": {
+    "preset": "deepseek",
+    "summary": {
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "在此填写 API Key",
+      "model": "deepseek-chat",
+      "maxTokens": 4096,
+      "temperature": 0.3,
+      "timeoutMs": 120000
+    },
+    "select": {
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "在此填写 API Key（可与 summary 相同）",
+      "model": "",
+      "maxTokens": 8192,
+      "temperature": 0.4,
+      "timeoutMs": 180000
+    },
+    "chunkMinutes": 12,
+    "chunkConcurrency": 2,
+    "consecutiveFailureThreshold": 3,
+    "pricing": {
+      "currency": "CNY",
+      "summary": { "inputPerMillion": 2.0, "outputPerMillion": 8.0, "cachedInputPerMillion": 0.2 },
+      "select": { "inputPerMillion": 2.0, "outputPerMillion": 8.0, "cachedInputPerMillion": 0.2 }
+    },
+    "recordRawResponses": false
+  },
+
+  "clip": {
+    "maxCandidates": 6,
+    "autoSelectScoreFloor": 7.0,
+    "minDurationSec": 30,
+    "maxDurationSec": 90,
+    "bufferSec": 1.5,
+    "$comment_boundarySnapAheadSec": "切片结尾向前吸附到自然断句点的上限（秒），0=关闭。选片 LLM 看不到转写原文，给的时间点只是近似值，会切在半句话/半句歌词上；系统会把结尾对齐到最近的句子边界。太小吸不到，太大等于硬拽结尾，建议 2-8。",
+    "boundarySnapAheadSec": 4,
+    "ffmpegPresetId": "default",
+    "burnDanmaku": true,
+    "burnSubtitles": true,
+    "subtitle": {
+      "fontSize": 0,
+      "marginV": 0,
+      "maxCharsPerLine": 18,
+      "minDurationSec": 0.8,
+      "readingCharsPerSec": 4,
+      "fontName": "Microsoft YaHei"
+    },
+    "ffmpegOptionsOverride": {
+      "c:v": "libx264",
+      "preset": "veryfast",
+      "crf": "21",
+      "c:a": "aac",
+      "b:a": "192k"
+    },
+    "fullVideoHasDanmaku": false,
+    "outputDir": "data/clips",
+    "cutTimeoutSec": 3600,
+    "avSyncRepair": true,
+    "avSyncToleranceSec": 0.15
+  },
+
+  "publish": {
+    "autoPublish": false,
+    "isOnlySelf": 1,
+    "submitGapSec": 7800,
+    "clipGapSec": 7500,
+    "jitterSec": 1800,
+    "firstPublishAt": "",
+    "dailyLimit": 5,
+    "minSubmitIntervalSec": 120,
+    "maxConcurrentUploads": 2,
+    "copyright": 1,
+    "creationStatement": -1,
+    "dynamic": "",
+    "noDisturbance": 0,
+    "defaultCover": "",
+    "coverSource": "preset",
+    "uploadPresetId": "default",
+    "seasonId": 0,
+    "sectionId": 0,
+    "defaultCategory": "游戏/单机游戏",
+    "tidWhitelist": {
+      "游戏/单机游戏": 17,
+      "游戏/网络游戏": 65,
+      "游戏/手机游戏": 181,
+      "游戏/电子竞技": 171,
+      "游戏/桌游棋牌": 172,
+      "游戏/单机游戏/其他": 17,
+      "生活/日常": 21,
+      "生活/搞笑": 138,
+      "生活/手工": 174,
+      "知识/科学科普": 201,
+      "知识/人文历史": 228,
+      "动画/综合": 27,
+      "动画/剪辑": 27,
+      "音乐/音乐现场": 130,
+      "舞蹈/宅舞": 129,
+      "影视/影视杂谈": 182,
+      "美食/美食制作": 76,
+      "娱乐/综艺": 71,
+      "娱乐/粉丝创作": 71,
+      "虚拟主播/虚拟主播": 145,
+      "生活": 21,
+      "综合": 21
+    },
+    "$comment_defaultTags": "只是**兜底**：仅在选片 LLM 一个可用标签都没给出时使用。正常情况每个切片的标签由 LLM 按内容生成，不会再把这几个词强行追加到所有稿件上（那会让所有切片标签雷同）。",
+    "defaultTags": ["直播切片", "名场面"],
+    "tagSensitiveWords": ["外挂", "代练", "私服", "博彩", "赌博"],
+    "defaultTitleSuffix": "",
+    "descTemplate": "本片段来自 {{date}} 的直播《{{liveTitle}}》\n原直播：{{roomUrl}}\n时间点：{{startText}} - {{endText}}\n\n{{desc}}",
+    "autoCutTimeoutSec": 1800,
+
+    "multiPart": false,
+    "fullPartTitle": "完整版",
+    "purePartTitle": "纯享版（无弹幕）",
+    "pureSource": "remux",
+    "$comment_resume": "续传到 biliLive-tools 已投的完整版稿件：biliLive-tools 投 P1 弹幕完整版 + P2 纯享版，切片助手只把切片追加进同一个稿件（它的 /bili/upload 带 vid 时走 editMedia 追加分P，不带则新建稿件）。resumeAid 显式指定稿件 aid（最可靠）；留空则用 resumeTitleTemplate 渲染标题去 /bili/archives 精确匹配。resumeClipIndexBase 是目标稿件已有的分P数，用于让切片标题序号接在后面。",
+    "resumeAid": "",
+    "resumeTitleTemplate": "{anchor}{liveTitle}{date}",
+    "resumeClipIndexBase": 2,
+    "partTitleWithIndex": true,
+    "immediatePublish": false
+  },
+
+  "import": {
+    "scanDirs": [],
+    "maxDepth": 3,
+    "minSizeMB": 5,
+    "watch": {
+      "enabled": true,
+      "dirs": ["~/Downloads/Bilibili"],
+      "intervalSec": 60,
+      "stableSec": 30,
+      "requireDanmaku": false,
+      "importExisting": false,
+      "maxDepth": 3,
+      "minSizeMB": 5
+    }
+  },
+
+  "cleanup": {
+    "retentionDays": 7,
+    "diskFloorGB": 50,
+    "deleteRawAfterTranscribe": true,
+    "trashDays": 7,
+    "checkIntervalMin": 30,
+    "keepFullVideoOnFailure": true,
+    "deleteAfterUpload": {
+      "enabled": false,
+      "graceHours": 24,
+      "deleteClips": true,
+      "deleteRaw": true,
+      "deleteFullVideo": true
+    }
+  },
+
+  "alert": {
+    "enabled": true,
+    "channels": [],
+    "events": {
+      "recordingDone": true,
+      "analysisDone": true,
+      "publishSuccess": true,
+      "failure": true,
+      "accountExpiring": true,
+      "diskLow": true,
+      "versionDrift": true
+    },
+    "dedupeWindowSec": 900,
+    "accountExpireWarnDays": 7,
+    "serverchan": { "sendKey": "" },
+    "dingtalk": { "webhook": "", "secret": "" },
+    "telegram": { "botToken": "", "chatId": "" },
+    "webhook": { "url": "" }
+  },
+
+  "ui": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 3000,
+    "openBrowser": false
+  },
+
+  "runtime": {
+    "dataDir": "data",
+    "timezone": "Asia/Shanghai",
+    "logLevel": "info",
+    "logKeepDays": 14,
+    "recordDecisions": true,
+    "allowPaid": false,
+    "maxParallelTasks": 1,
+    "stageTimeoutSec": 7200
+  }
+}

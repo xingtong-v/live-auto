@@ -1,0 +1,249 @@
+{
+  "findings": {
+    "whisper": {
+      "hasWhisper": true,
+      "ffmpeg": "ffmpeg",
+      "note": "✓ ffmpeg（ffmpeg version 8.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers）**带 whisper 滤镜** —— §5.2 本地方案可用（另有更可控的 whisper.cpp 独立程序路径）"
+    },
+    "version": {
+      "actual": "3.21.0",
+      "expected": "3.22.1",
+      "drift": true,
+      "note": "biliLive-tools 版本 3.21.0 与任务书核实的 3.22.1 主次版本不同，接口字段可能已变动，请跑 probe.ts 复核"
+    },
+    "account": {
+      "uid": 1000000000000000,
+      "name": "星者如曈捏",
+      "expires": 1802328461000,
+      "count": 1
+    },
+    "segmentation": {
+      "sampledRecords": 50,
+      "sampleRecordStart": 1790009236030,
+      "sampleRecordEnd": 1790010369046,
+      "durationSec": 1133,
+      "note": "单条 record 的时长 > 录制器 segment 配置值时，说明合并后仍是单条记录"
+    },
+    "ffmpegPreset": {
+      "id": "default",
+      "configKeys": [
+        "resetResolution",
+        "resolutionWidth",
+        "resolutionHeight",
+        "audioCodec",
+        "swsFlags",
+        "scaleMethod",
+        "forceOriginalAspectRatio",
+        "hardwareScaleFilter",
+        "addTimestamp",
+        "encoderThreads",
+        "timestampX",
+        "timestampY",
+        "timestampFontSize",
+        "timestampFontColor",
+        "extraOptions",
+        "vf",
+        "timestampFollowDanmu",
+        "timestampExtra",
+        "timestampFormat",
+        "pkOptimize",
+        "encoder",
+        "bitrateControl",
+        "crf",
+        "preset"
+      ]
+    },
+    "bililiveConfig": {
+      "ffmpegPath": "…/bin/ffmpeg.exe",
+      "ffprobePath": "…/bin/ffprobe.exe",
+      "danmuFactoryPath": "…/bin/DanmakuFactory.exe",
+      "webhook.rooms.34567890.autoPartMerge": true,
+      "webhook.rooms.34567890.afterUploadDeletAction": "deleteAfterCheck",
+      "webhook.autoPartMerge": true,
+      "webhook.afterUploadDeletAction": "deleteAfterCheck",
+      "cacheFolder": "",
+      "tool.home.removeOrigin": false,
+      "tool.home.removeOriginAfterUploadCheck": true,
+      "tool.upload.removeOriginAfterUploadCheck": true,
+      "tool.fileSync.removeOrigin": false,
+      "tool.danmu.removeOrigin": false,
+      "tool.video2mp4.removeOrigin": false,
+      "tool.videoMerge.removeOrigin": false,
+      "recorder.segment": "59",
+      "recorder.recorderType": "bililive"
+    },
+    "confirmedAt": "2026-09-22T10:10:31.335Z",
+    "roomId": "12345678"
+  },
+  "results": [
+    {
+      "id": "env-whisper",
+      "ref": "§5.2 / WP1 步骤 4",
+      "status": "ok",
+      "facts": [
+        "✓ ffmpeg（ffmpeg version 8.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers）**带 whisper 滤镜** —— §5.2 本地方案可用（另有更可控的 whisper.cpp 独立程序路径）"
+      ],
+      "deviations": []
+    },
+    {
+      "id": "version",
+      "ref": "§4.6",
+      "endpoint": "/common/version",
+      "status": "ok",
+      "ms": 28,
+      "facts": [
+        "biliLive-tools 版本 = 3.21.0",
+        "biliLive-tools 版本 3.21.0 与任务书核实的 3.22.1 主次版本不同，接口字段可能已变动，请跑 probe.ts 复核"
+      ],
+      "deviations": [
+        "版本 3.21.0 ≠ 任务书核实的 3.22.1（主次版本不同）—— 字段可能已变动，本文件所有实测结果优先"
+      ],
+      "shape": "string"
+    },
+    {
+      "id": "user-list",
+      "ref": "§4.6",
+      "endpoint": "/user/list",
+      "status": "ok",
+      "ms": 80,
+      "facts": [
+        "共 1 个账号；主账号 uid=1000000000000000 name=星者如曈捏",
+        "cookie 有效期 expires = 1802328461000 → 2027/2/11 14:47:41（还剩 142 天）",
+        "⚠️ 依 §4.6，/user/export 会输出含 cookie 的原始数据，本次探测**未调用**，服务也不会调用"
+      ],
+      "deviations": [
+        "实测 /user/list 可能返回**单个对象**而非文档所述的数组；api.ts 已对两种形态做兼容"
+      ],
+      "shape": "[{ uid: number, name: string, face: string, expires: number } ×1]"
+    },
+    {
+      "id": "recent-clips",
+      "ref": "§4.1",
+      "endpoint": "/record-history/recent-clips?room_id&platform=Bilibili",
+      "status": "empty",
+      "ms": 7,
+      "facts": [
+        "返回 0 条（接口最多返回 5 条）",
+        "空数组有两种已知原因（都不会报错）：① platform 传错（必须 \"Bilibili\"）；② 该直播间在 streamer 表中没有记录（陷阱 #1、#2）",
+        "本次传的是 platform=\"Bilibili\"，若该直播间从未录制过，空数组是正常的"
+      ],
+      "deviations": [],
+      "shape": "[]"
+    },
+    {
+      "id": "record-history-list",
+      "ref": "§4.1、§8 WP2 步骤 2",
+      "endpoint": "/record-history/list?room_id&platform=Bilibili&page&pageSize",
+      "status": "ok",
+      "ms": 8,
+      "facts": [
+        "total=74，本页 50 条（pageSize=50）",
+        "字段（下划线）: id, created_at, streamer_id, live_id, live_start_time, record_start_time, record_end_time, title, video_file, video_filename, video_duration, danma_num, interact_num, quick_hash, danma_density",
+        "实测额外字段：created_at, streamer_id, live_id, video_filename, quick_hash",
+        "时间戳单位核对：live_start_time=1789995002000（毫秒） / record_start_time=1790009236030（毫秒）",
+        "可计算时长的记录数：50"
+      ],
+      "deviations": [
+        "实测确认：本接口字段为下划线风格，与 recent-clips 的驼峰风格不同（陷阱 #10 已复现并规避）",
+        "实测 live_start_time 是**毫秒**，与任务书 §4.1「live_start_time 是秒级」不一致 —— 以实测为准，util.toSec 已做自适应"
+      ],
+      "shape": "[{ id: number, created_at: number, streamer_id: number, live_id: string, live_start_time: number, record_start_time: number, record_end_time: number, title: string, video_file: string, video_filename: string, video_duration: number, danma_num: number, interact_num: number, quick_hash: string, danma_density: number } ×50]"
+    },
+    {
+      "id": "danma-file",
+      "ref": "§4.1",
+      "endpoint": "/record-history/danma-file",
+      "status": "skipped",
+      "facts": [
+        "没有可用的录制记录，跳过（该接口需要视频绝对路径）"
+      ],
+      "deviations": []
+    },
+    {
+      "id": "preset-ffmpeg",
+      "ref": "§4.5",
+      "endpoint": "/preset/ffmpeg",
+      "status": "ok",
+      "ms": 13,
+      "facts": [
+        "共 1 条：default(默认配置)",
+        "配置的 clip.ffmpegPresetId=\"default\" 存在 ✓",
+        "预设 \"default\" 的编码器 = (未声明)"
+      ],
+      "deviations": [],
+      "shape": "[{ id: string, name: string, config: {…} } ×1]"
+    },
+    {
+      "id": "preset-video",
+      "ref": "§4.5",
+      "endpoint": "/preset/video",
+      "status": "ok",
+      "ms": 16,
+      "facts": [
+        "共 2 条：default(默认配置), xcz9r0pf7t(甲主播)"
+      ],
+      "deviations": [],
+      "shape": "[{ id: string, name: string, config: {…} } ×2]"
+    },
+    {
+      "id": "preset-danmu",
+      "ref": "§4.5",
+      "endpoint": "/preset/danmu",
+      "status": "ok",
+      "ms": 6,
+      "facts": [
+        "共 1 条：default(默认配置)"
+      ],
+      "deviations": [],
+      "shape": "[{ id: string, name: string, config: {…} } ×1]"
+    },
+    {
+      "id": "task-list",
+      "ref": "§4.6 / §8 WP5 步骤 6",
+      "endpoint": "/task/?page&pageSize",
+      "status": "ok",
+      "ms": 10,
+      "facts": [
+        "runningTaskNum = 0（用于并发控制）",
+        "列表返回 0 条任务"
+      ],
+      "deviations": [],
+      "shape": "{ list: [], runningTaskNum: number, pagination: { total: number, page: number, pageSize: number } }"
+    },
+    {
+      "id": "config",
+      "ref": "§8 WP1 步骤 4",
+      "endpoint": "/config",
+      "status": "ok",
+      "ms": 15,
+      "facts": [
+        "命中字段：ffmpegPath, ffprobePath, danmuFactoryPath, webhook.rooms.34567890.autoPartMerge, webhook.rooms.34567890.afterUploadDeletAction, webhook.autoPartMerge, webhook.afterUploadDeletAction, cacheFolder, tool.home.removeOrigin, tool.home.removeOriginAfterUploadCheck, tool.upload.removeOriginAfterUploadCheck, tool.fileSync.removeOrigin, tool.danmu.removeOrigin, tool.video2mp4.removeOrigin, tool.videoMerge.removeOrigin, recorder.segment, recorder.recorderType",
+        "ffmpeg 二进制 = …/bin/ffmpeg.exe（存在=false）—— 二期封面抽帧可用"
+      ],
+      "deviations": [],
+      "shape": "{ ffmpegPath: string, ffprobePath: string, danmuFactoryPath: string, mesioPath: string, bililiveRecorderPath: string, audiowaveformPath: string, logLevel: string, uploadCrashReport: boolean, autoUpdate: boolean, autoLaunch: boolean, trash: boolean, saveConfig: boolean, minimizeToTray: boolean, closeToTray: boolean, theme: string, menuBarVisible: boolean, port: number, host: string, passKey: string, https: boolean, externalWebhook: string, webhook: { open: boolean, recoderFolder: string, minSize: number, title: string, blacklist: string, danmu: boolean, rooms: {…}, afterConvertAction: [], autoPartMerge: boolean, partMergeMinute: number, hotProgress: boolean, useLiveCover: boolean, partTitleTemplate: string, hotProgressSample: number, hotProgressHeight: number, hotProgressColor: string, hotProgressFillColor: string, convert2Mp4: boolean, flvRepair: boolean, uploadHandleTime: [string ×2], limitUploadTime: boolean, uploadNoDanmu: boolean, uploadToSameMedia: boolean, limitVideoConvertTime: boolean, videoHandleTime: [string ×2], afterUploadDeletAction: string, uid: number, uploadPresetId: string, danmuPreset: string, ffmpegPreset: string }, losslessCutPath: string, cacheFolder: string, customExecPath: boolean, requestInfoForRecord: boolean, biliUploadFileNameType: string, cutPageInNewWindow: boolean, bilibiliUser: { 1000000000000000: string }, tool: { home: {…}, upload: {…}, fileSync: {…}, danmu: {…}, video2mp4: {…}, videoMerge: {…}, flvRepair: {…}, download: {…}, translate: {…}, videoCut: {…} }, task: { maxNum: number, ffmpegMaxNum: number, douyuDownloadMaxNum: number, biliUploadMaxNum: number, biliDownloadMaxNum: number, syncMaxNum: number }, videoCut: { autoSave: boolean, cacheWaveform: boolean }, notification: { task: {…}, setting: {…}, taskNotificationType: {…} }, sync: { baiduPCS: {…}, aliyunpan: {…}, alist: {…}, pan123: {…}, syncConfigs: [] }, llmPresets: [], ai: { vendors: [{…} ×1], models: [{…} ×3], songRecognizeAsr: {…}, songRecognizeLlm: {…}, songLyricOptimize: {…}, subtitleRecognize: {…} }, biliUpload: { line: string, concurrency: number, limitRate: number, retryTimes: number, retryDelay: number, checkInterval: number, minUploadInterval: number, accountAutoCheck: boolean, useBCutAPI: boolean, useUploadPartPersistence: boolean }, recorder: { savePath: string, nameRule: string, autoRecord: boolean, quality: string, checkInterval: number, maxThreadCount: number, waitTime: number, disableProvideCommentsWhenRecording: boolean, segment: string, saveGiftDanma: boolean, saveSCDanma: boolean, saveCover: boolean, debugMode: boolean, debugLevel: string, qualityRetry: number, videoFormat: string, recorderType: string, useServerTimestamp: boolean, recordRetryImmediately: boolean, bilibili: {…}, douyu: {…}, huya: {…}, douyin: {…}, xhs: {…}, tiktok: {…}, saveDanma2DB: boolean }, video: { subCheckInterval: number, subSavePath: string }, recorders: [{…} ×2] }"
+    },
+    {
+      "id": "asr-offset",
+      "ref": "§4.2 / §8 WP1 步骤 2、WP3 步骤 2",
+      "endpoint": "/ai/subtitle",
+      "status": "skipped",
+      "facts": [
+        "未传 --allow-paid：**未调用付费 ASR**（硬约束 #14）",
+        "要实测 offset 语义，请运行：node src/probe.ts --allow-paid（建议先把 asr.segmentMinutes 调小做一次短片段）"
+      ],
+      "deviations": []
+    },
+    {
+      "id": "get-log-content",
+      "ref": "§4.6 / §8 WP6 步骤 10",
+      "endpoint": "/common/getLogContent",
+      "status": "ok",
+      "ms": 16,
+      "facts": [
+        "读取到 8192 字符 —— 错误报告会附带其末尾片段用于定位 ffmpeg 报错"
+      ],
+      "deviations": []
+    }
+  ]
+}
