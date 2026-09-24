@@ -268,6 +268,14 @@ export interface AsrCacheEntry {
      * "这条缓存是带热词跑出来的还是不带热词跑出来的"。
      */
     hotwords?: string;
+    /**
+     * 本地引擎实际用的设备与推理引擎（cuda/cpu、pytorch/vllm）。**不进缓存键**，纯审计。
+     *
+     * 为什么要记（实测 2026-09-25 凌晨）：同一段素材有的 15 分钟跑完、有的 121 分钟，
+     * 而日志只打了配置值"设备 auto"，事后无法回答"那次到底是 GPU 还是 CPU"。
+     */
+    device?: string;
+    engine?: string;
   };
   srt: string;
   segments: TranscriptSegment[];

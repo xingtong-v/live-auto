@@ -50,9 +50,21 @@ interface LocalAsrResult {
   segments?: Array<{ start: number; end: number; text: string }>;
   language?: string;
   duration?: number;
+  /** 实例上实际用的设备（cuda / cpu）——**必须记录下来**，见 runLocalAsr 的说明 */
   device?: string;
   compute_type?: string;
+  /** 执行器自己报的耗时（毫秒），含模型加载 */
   elapsed_ms?: number;
+  /** 实际用的推理引擎（pytorch / vllm） */
+  engine?: string;
+  /**
+   * 执行器 stderr 的尾部片段（含它自己的 INFO：模型加载多久、VAD 多久、推理多久）。
+   *
+   * 为什么要留下来（实测 2026-09-25 凌晨）：同一段 59 分钟素材，有的场次转写 15 分钟、
+   * 有的 121 分钟，而日志里只有"设备 auto"（配置值）—— **实际设备/耗时/各阶段耗时全无**，
+   * 事后完全无法归因。执行器明明把这些打在 stderr 上，我们却在成功时把它丢掉了。
+   */
+  stderrTail?: string;
 }
 
 /** 本地 ASR 的执行参数（由配置组装） */
@@ -122,7 +134,12 @@ function runLocalAsr(args: {
           return;
         }
         try {
-          resolve(parseLocalAsrOutput(String(stdout)));
+          const parsed = parseLocalAsrOutput(String(stdout));
+          /* ★ 成功时**也**要把 stderr 尾巴带上（原来直接丢掉）。
+             执行器把它自己的阶段耗时（模型加载 / VAD / 推理）与真实设备都打在这里，
+             而"转写为什么花了 121 分钟"这类问题只能从这里找答案。 */
+          parsed.stderrTail = String(stderr).slice(-4000);
+          resolve(parsed);
         } catch (e) {
           reject(new Error(`${(e as Error).message}；stderr 尾部：${String(stderr).slice(-300)}`));
         }
@@ -1015,6 +1032,10 @@ export class Transcriber {
       audioSeconds: number;
       paid: boolean;
       failed?: { type: ErrorType; message: string; attempts: RetryAttempt[]; request?: RequestContext };
+      /** 本地引擎实际用的设备（写进缓存条目，便于事后审计"这条缓存是 CPU 还是 GPU 跑出来的"） */
+      device?: string;
+      /** 本地引擎实际用的推理引擎（pytorch / vllm） */
+      engine?: string;
     }
 
     let done = 0;
@@ -1077,6 +1098,9 @@ export class Transcriber {
               //   （全局时间戳），所以缓存、分段映射、下游分析完全不用改。
               let segments: TranscriptSegment[];
               let cacheSrt = '';
+              /** 本地引擎本轮实际用的设备/引擎（写进缓存条目做审计） */
+              let localDevice: string | undefined;
+              let localEngine: string | undefined;
               if (useLocalAsr) {
                 const local = await runLocalAsr({
                   opts: localOpts!,
@@ -1089,10 +1113,36 @@ export class Transcriber {
                 // 本地执行器已经加过 offset（= 该单元的全局起点），无需再加
                 segments = (local.segments ?? []).map((s) => ({ start: s.start, end: s.end, text: s.text }));
                 cacheSrt = JSON.stringify(local.segments ?? []);
-                log.debug(
-                  `${purpose} 本地转写完成：${segments.length} 条（设备 ${local.device}/${local.compute_type}，` +
-                    `${((local.elapsed_ms ?? 0) / 1000).toFixed(1)}s）`,
+                /* ★ 本地转写的"体检行"：设备 / 引擎 / 耗时 / RTF 一律记 **info**。
+                 *
+                 * 为什么必须是 info（实测 2026-09-25 凌晨）：同一段 59 分钟素材，
+                 * 有的场次 15 分钟跑完、有的 121 分钟（8 倍），而日志里只有配置值
+                 * "设备 auto" —— 实际设备、实际引擎、各阶段耗时全都没有，事后无法归因。
+                 * 这台机器上"同样 10 秒窗口、两次实测差 4.8 倍（521s vs 110s）"都复现过，
+                 * 所以这行是下一次排查的唯一入口。 */
+                const usedSec = (local.elapsed_ms ?? 0) / 1000;
+                const rtf = audioSeconds > 0 ? usedSec / audioSeconds : 0;
+                localDevice = local.device;
+                localEngine = local.engine;
+                log.info(
+                  `${purpose} 本地转写完成：${segments.length} 条（设备 ${local.device ?? '?'}/${local.compute_type ?? '?'}，` +
+                    `引擎 ${local.engine ?? '?'}，耗时 ${usedSec.toFixed(1)}s，RTF ${rtf.toFixed(3)}）`,
                 );
+                /* 明显偏慢（GPU 正常约 0.24–0.35；>0.6 说明要么退化成 CPU，要么 GPU 被别的进程抢了）
+                   → 单独 warn 并把执行器 stderr 的阶段耗时带出来，便于当场定位。 */
+                if (rtf > 0.6) {
+                  const stages = String(local.stderrTail ?? '')
+                    .split(/\r?\n/)
+                    // ⚠️ 正则里的 `/` 必须转义：`it/s` 写进字面量会把正则提前结束（编译期就报错）
+                    .filter((l) => /加载|load|VAD|推理|infer|elapsed|it\/s|s\/it/i.test(l))
+                    .slice(-6)
+                    .map((l) => l.replace(/\s+/g, ' ').trim().slice(0, 140));
+                  log.warn(
+                    `${purpose} 本地转写明显偏慢：RTF ${rtf.toFixed(3)}（设备 ${local.device ?? '?'}、引擎 ${local.engine ?? '?'}）。` +
+                      `正常应 ≈0.24–0.35；若设备是 cpu 说明 CUDA 没起来，否则多半是 GPU 被其它进程占用`,
+                    { data: { rtf: Number(rtf.toFixed(3)), device: local.device, engine: local.engine, stages } },
+                  );
+                }
               } else {
                 const srt = await this.client.subtitle({
                   file: w.file,
@@ -1126,6 +1176,9 @@ export class Transcriber {
                   offset: w.offset,
                   // 留痕：这条缓存是带热词跑出来的（键里也有它，见 asrCacheKey）
                   ...(hwFingerprint ? { hotwords: hwFingerprint } : {}),
+                  // 留痕：这条缓存是哪个设备/引擎跑出来的（不进缓存键，纯审计）
+                  ...(localDevice ? { device: localDevice } : {}),
+                  ...(localEngine ? { engine: localEngine } : {}),
                 },
                 srt: cacheSrt,
                 segments,
@@ -1138,7 +1191,7 @@ export class Transcriber {
               /* ⚠️ `paid` 决定"实际计费音频"的累计口径（→ 台账 ASR 费用、界面"预计花费"）。
                  本地 provider（whisper / local-funasr）是**零成本**的，写成 true 会让
                  本地跑的场次在成本统计里凭空多出 ¥8.5/场 —— 实测就是被这条 e2e 抓到的。 */
-              return { window: w, fromCache: false, segments, audioSeconds, paid: !useLocalAsr };
+              return { window: w, fromCache: false, segments, audioSeconds, paid: !useLocalAsr, ...(localDevice ? { device: localDevice } : {}) };
             } catch (e) {
               const type: ErrorType = e instanceof ApiError ? e.type : 'internal';
               const message = e instanceof Error ? e.message : String(e);

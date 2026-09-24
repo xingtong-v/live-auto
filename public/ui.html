@@ -331,6 +331,18 @@
   .timeline .row .t{color:var(--text-3);min-width:78px;font-family:ui-monospace,Consolas,monospace;font-size:12px}
   .timeline .row .s{flex:1;min-width:0}
   .timeline .row.bad .s{color:#c33}
+  /* 录制清单的分组折叠。为什么要有：录播目录动辄几十上百场，平铺的清单会把
+     **真正在录的那几条**淹掉；而「已录制完成」和「已导入过」属于回顾性内容，
+     需要时才展开。所以只有「正在录制」常显，另外两组默认收起。 */
+  .impgroup{display:flex;align-items:center;gap:8px;padding:6px 8px;margin:6px 0 2px;
+    border-radius:8px;background:#f5f7fa;color:var(--text-2);font-size:12.5px;user-select:none}
+  .impgroup[data-g]{cursor:pointer}
+  .impgroup[data-g]:hover{background:#eef1f5}
+  .impgroup .caret{width:10px;color:var(--text-3);display:inline-block;transition:transform .15s}
+  .impgroup.open .caret{transform:rotate(90deg)}
+  .impgroup .cnt{margin-left:auto;color:var(--text-3)}
+  .impgroup.live{background:#fff6e8;color:#a96a00}
+  .impgroup.none{background:transparent;padding-left:2px;color:var(--text-3)}
   pre.raw{background:#fafbfc;border:1px solid var(--border);border-radius:8px;padding:11px;
     font-size:12px;overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-all}
   .kv{display:grid;grid-template-columns:110px 1fr;gap:4px 10px;font-size:12.6px}
@@ -3450,6 +3462,80 @@ $('#btnImport').onclick = () => {
     }));
   };
 
+  /* 清单的两级结构：先按「正在录制 / 已录制完成 / 已导入过」分桶，再渲染。
+     分桶与渲染分开，是为了让折叠只重画 DOM，不必重新请求 /api/recordings。 */
+  let lastList = null;
+  let lastBuckets = null;
+
+  const rowHtml = (i) => {
+    const c = lastList.candidates[i];
+    const flags = [];
+    /* 在「自动导入目录」里的文件要标出来：两条路（轮询自动捡 / 你手动点）会分别记成
+       「自动导入」和「手动导入」，用户需要事先知道这件事，而不是事后奇怪为什么标手动 */
+    const w = state.watch;
+    if (w && w.enabled && (w.dirs || []).some((d) => c.videoPath.toLowerCase().startsWith(String(d).toLowerCase()))) {
+      flags.push('<span style="color:var(--blue,#00aeec)">在自动导入目录</span>');
+    }
+    if (c.possiblyRecording) flags.push('<span style="color:#c8811a">可能仍在录制</span>');
+    if (c.importedBy) flags.push('<span style="color:#c8811a">已导入</span>');
+    if (c.hasDanmakuInPicture) flags.push('<span style="color:#c8811a">画面已烧弹幕</span>');
+    if (!c.usable) flags.push('<span style="color:#c33">文件不可用</span>');
+    if (c.asr && c.asr.cacheHits >= c.asr.windows && c.asr.windows > 0) flags.push('<span style="color:var(--green)">ASR 已缓存</span>');
+    return `<div class="row" data-imp="${i}" style="cursor:pointer">
+      <span class="t">${esc(c.group)}</span>
+      <span class="s"><b>${esc(c.title)}</b> ${flags.join(' ')}<br>
+        <span style="color:var(--text-3)">${esc(c.summary)}${c.asr ? ` · 预估 ASR ¥${c.asr.estCost.toFixed(2)}（${c.asr.cacheHits}/${c.asr.windows} 段已缓存）` : ''}</span><br>
+        <span class="mono-sm" style="color:var(--text-3);word-break:break-all">${esc(c.videoPath)}</span></span>
+    </div>`;
+  };
+
+  /** 可折叠分组的表头（点一下展开/收起）。展开状态记在 state.impOpen 上 —— 点「刷新清单」
+      或缓存过期重扫时，不会把用户刚展开的那组又收回去。 */
+  const groupHtml = (key, label) => {
+    const open = !!state.impOpen[key];
+    const rows = open ? lastBuckets[key].map(rowHtml).join('') : '';
+    return `<div class="impgroup${open ? ' open' : ''}" data-g="${key}" title="${open ? '收起' : '展开'}这 ${lastBuckets[key].length} 场">
+      <span class="caret">▸</span><span>${label}</span><span class="cnt">${lastBuckets[key].length} 场</span>
+    </div>${rows}`;
+  };
+
+  const bindList = () => {
+    /* 点分组表头 → 只重画清单（不重新扫描） */
+    $$('#impList .impgroup[data-g]').forEach((el) => (el.onclick = () => {
+      state.impOpen[el.dataset.g] = !state.impOpen[el.dataset.g];
+      renderList();
+    }));
+    // 点一行 → 填进表单并预览
+    $$('#impList .row[data-imp]').forEach((el) => (el.onclick = () => {
+      const c = lastList.candidates[Number(el.dataset.imp)];
+      if (!c) return;
+      $$('#impList .row[data-imp]').forEach((x) => (x.style.background = ''));
+      el.style.background = 'var(--bg-2,#f5f7fa)';
+      $('#impVideo').value = c.videoPath;
+      $('#impDanma').value = c.danmaPath || '';
+      $('#impTitle').value = c.title || '';
+      showPreview(c.videoPath);
+    }));
+  };
+
+  const renderList = () => {
+    const box = $('#impList');
+    const b = lastBuckets;
+    const parts = [];
+    if (b.live.length) {
+      /* 「正在录制」永远展开、不可折叠 —— 这正是用户打开这个对话框要看的东西 */
+      parts.push(`<div class="impgroup live"><span>● 正在录制</span><span class="cnt">${b.live.length} 场</span></div>`);
+      parts.push(b.live.map(rowHtml).join(''));
+    } else {
+      /* 没有在录的场次时给一句明确的话，否则用户只看到两个收起的表头会以为清单坏了 */
+      parts.push('<div class="impgroup none"><span>● 当前没有正在录制的场次</span></div>');
+    }
+    if (b.idle.length) parts.push(groupHtml('idle', '已录制完成 · 未导入'));
+    if (b.imported.length) parts.push(groupHtml('imported', '已导入过'));
+    box.innerHTML = parts.join('');
+    bindList();
+  };
+
   /** 载入清单；refresh=1 时绕过服务端 20 秒缓存 */
   const loadList = async (refresh) => {
     const box = $('#impList');
@@ -3462,37 +3548,19 @@ $('#btnImport').onclick = () => {
         box.innerHTML = '<div class="row"><span class="s" style="color:var(--text-3)">没有找到可导入的录播。可在「设置」里加扫描目录，或直接在下面粘贴绝对路径。</span></div>';
         return;
       }
-      box.innerHTML = r.candidates.map((c, i) => {
-        const flags = [];
-        /* 在「自动导入目录」里的文件要标出来：两条路（轮询自动捡 / 你手动点）会分别记成
-           「自动导入」和「手动导入」，用户需要事先知道这件事，而不是事后奇怪为什么标手动 */
-        const w = state.watch;
-        if (w && w.enabled && (w.dirs || []).some((d) => c.videoPath.toLowerCase().startsWith(String(d).toLowerCase()))) {
-          flags.push('<span style="color:var(--blue,#00aeec)">在自动导入目录</span>');
-        }
-        if (c.possiblyRecording) flags.push('<span style="color:#c8811a">可能仍在录制</span>');
-        if (c.importedBy) flags.push('<span style="color:#c8811a">已导入</span>');
-        if (c.hasDanmakuInPicture) flags.push('<span style="color:#c8811a">画面已烧弹幕</span>');
-        if (!c.usable) flags.push('<span style="color:#c33">文件不可用</span>');
-        if (c.asr && c.asr.cacheHits >= c.asr.windows && c.asr.windows > 0) flags.push('<span style="color:var(--green)">ASR 已缓存</span>');
-        return `<div class="row" data-imp="${i}" style="cursor:pointer">
-          <span class="t">${esc(c.group)}</span>
-          <span class="s"><b>${esc(c.title)}</b> ${flags.join(' ')}<br>
-            <span style="color:var(--text-3)">${esc(c.summary)}${c.asr ? ` · 预估 ASR ¥${c.asr.estCost.toFixed(2)}（${c.asr.cacheHits}/${c.asr.windows} 段已缓存）` : ''}</span><br>
-            <span class="mono-sm" style="color:var(--text-3);word-break:break-all">${esc(c.videoPath)}</span></span>
-        </div>`;
-      }).join('');
-      // 点一行 → 填进表单并预览
-      $$('#impList .row[data-imp]').forEach((el) => (el.onclick = () => {
-        const c = r.candidates[Number(el.dataset.imp)];
-        if (!c) return;
-        $$('#impList .row[data-imp]').forEach((x) => (x.style.background = ''));
-        el.style.background = 'var(--bg-2,#f5f7fa)';
-        $('#impVideo').value = c.videoPath;
-        $('#impDanma').value = c.danmaPath || '';
-        $('#impTitle').value = c.title || '';
-        showPreview(c.videoPath);
-      }));
+      /* 分桶：正在录制 / 已录制完成未导入 / 已导入过。
+         判定顺序很重要 —— "已导入过但这会儿还在录"的文件要归到「正在录制」，
+         因为它属于"当前正在发生、需要你注意"的那一类。 */
+      const buckets = { live: [], idle: [], imported: [] };
+      r.candidates.forEach((c, i) => {
+        if (c.possiblyRecording) buckets.live.push(i);
+        else if (c.importedBy) buckets.imported.push(i);
+        else buckets.idle.push(i);
+      });
+      state.impOpen ??= { idle: false, imported: false };
+      lastList = r;
+      lastBuckets = buckets;
+      renderList();
     } catch (e) {
       box.innerHTML = `<div class="row bad"><span class="s">扫描失败：${esc(e.message)}</span></div>`;
     }

@@ -206,6 +206,43 @@ section('1d. dry-run 的付费闸门不能拦本地引擎（免费的东西不�
   );
 }
 
+section('1e. 本地转写必须留下"体检信息"（否则"为什么这次慢了 8 倍"永远查不出来）');
+{
+  /* 实测（2026-09-25 凌晨）：同一段 59 分钟素材，有的场次 15 分钟跑完、有的 121 分钟；
+     同一 10 秒窗口两次实测差 4.8 倍（521s vs 110s），两次其实都用 cuda。
+     而日志里只有配置值"设备 auto" —— 实际设备/引擎/耗时全无，事后无法归因。 */
+  const src = fs.readFileSync(path.join(ROOT_DIR, 'src', 'asr.ts'), 'utf8');
+  ok(/本地转写完成：\$\{segments\.length\} 条（设备/.test(src), '完成行里带上实际设备');
+  ok(/引擎 \$\{local\.engine \?\? '\?'\}，耗时/.test(src), '完成行里带上实际引擎与耗时');
+  ok(/RTF \$\{rtf\.toFixed\(3\)\}/.test(src), '完成行里带上 RTF（可比指标）');
+  ok(/if \(rtf > 0\.6\)/.test(src), '明显偏慢时单独告警（>0.6；GPU 正常约 0.24–0.35）');
+  ok(/parsed\.stderrTail = String\(stderr\)\.slice\(-4000\)/.test(src), '成功时也保留执行器 stderr 尾巴（阶段耗时在里面）');
+  ok(/stderrTail\?: string/.test(src), '结果类型里声明了 stderrTail');
+
+  /* 执行器返回的元信息必须被解析出来（否则上面那些日志全是 '?'） */
+  const parsed = parseLocalAsrOutput(
+    '{"ok":true,"engine":"pytorch","device":"cuda","compute_type":"float16","elapsed_ms":1234,"segments":[{"start":0,"end":1,"text":"好"}]}',
+  );
+  eq('解析出实际设备', parsed.device, 'cuda');
+  eq('解析出实际引擎', parsed.engine, 'pytorch');
+  eq('解析出执行器耗时', parsed.elapsed_ms, 1234);
+}
+{
+  /* 实测事故（2026-09-24 切成 local-funasr 后第一次 dry-run）：闸门先于 provider 分叉执行，
+     本地转写**永远失败**，原因还写成"未授权付费" —— dry-run 从此验不了本地链路。 */
+  const src = fs.readFileSync(path.join(ROOT_DIR, 'src', 'asr.ts'), 'utf8');
+  ok(
+    /if \(dryRun && !allowPaid && !useLocalAsr\)/.test(src),
+    '闸门条件里排除了本地引擎',
+    '本地引擎在 dry-run 下被"未授权付费"拦住 → 免费的东西也要求 --allow-paid',
+  );
+  ok(/dryRun && !allowPaid/.test(src), '闸门仍在（云端该拦的照样拦）');
+  ok(
+    /const useLocalAsr = this\.provider === 'whisper-cpp' \|\| this\.provider === 'local-funasr'/.test(src),
+    'whisper 与 funasr 都算"不产生费用"',
+  );
+}
+
 /* ================= 2. 输出解析 ================= */
 section('2. 输出解析（第三方库会往 stdout 打杂音）');
 {
