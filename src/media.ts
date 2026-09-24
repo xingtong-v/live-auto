@@ -915,7 +915,10 @@ interface SegmentPattern {
  * 这类名字天然带 `-数字` 尾缀。激进的前缀剥离会把同一天不同场次的录像合并成一场，
  * 时间轴全错且很难发现；而漏合并的代价只是回到单文件处理（上层仍能用 live_id 聚合）。
  */
-export function discoverSegments(samplePath: string): string[] {
+export function discoverSegments(
+  samplePath: string,
+  opts: { skipFreshWithinSec?: number; now?: number } = {},
+): string[] {
   if (!samplePath || typeof samplePath !== 'string') return [];
   const dir = path.dirname(samplePath);
   const base = path.basename(samplePath);
@@ -958,9 +961,36 @@ export function discoverSegments(samplePath: string): string[] {
   // 样本自己必须在组里：否则说明前缀推断跑偏了（例如同名不同扩展名），此时不应合并
   if (matched.length < 2 || !matched.some((m) => path.basename(m.file) === base)) return [samplePath];
 
+  /* ★ 排除「仍在写入」的分段（只有在调用方给了时间窗时才做）。
+   *
+   * 为什么必须有这一步（实测事故，2026-09-24，用户问「录播为什么没有导入」）：
+   *   一场直播被录成多段时，**已闭合**的第 1 段叫 `18-00-41-946 X.ts`，
+   *   而**正在录**的第 2 段叫 `18-00-41-946 X-PART001.ts` —— 同一个归并键。
+   *   第 0 段补位（上面那段）会把这两个文件拼成"一场"，
+   *   于是导入已闭合的第 1 段时，那个**还在长的文件也被当成第 2 段**：
+   *   时长、切点、全局时间轴全建立在半场数据上，转写也只会得到残缺结果。
+   *   目录轮询侧靠"整组仍在录制就跳过"躲开了这个坑，代价是**已闭合的整小时素材一直进不来**；
+   *   两边的正确做法是各管一段：轮询允许导入已闭合的部分（见 recordings.ts），
+   *   分段发现则**拒绝把还在写的文件算进去**（就是这里）。
+   *
+   * 样本自己不受过滤：调用方明确要求处理它（手动导入时用户可能就是想试当前这一段）。 */
+  const windowSec = Math.max(0, opts.skipFreshWithinSec ?? 0);
+  const keep =
+    windowSec > 0
+      ? matched.filter((m) => {
+          if (path.basename(m.file) === base) return true;
+          try {
+            return (opts.now ?? Date.now()) - fs.statSync(m.file).mtimeMs >= windowSec * 1000;
+          } catch {
+            return true; // stat 不到就别拦（宁可多带一段，也不要因为读不到 mtime 丢掉素材）
+          }
+        })
+      : matched;
+  if (keep.length < 2) return [samplePath];
+
   // 必须按尾缀**数值**排序：字符串排序会把 name-10 排到 name-2 前面，时间轴顺序就反了
-  matched.sort((a, b) => a.num - b.num || a.file.localeCompare(b.file));
-  return matched.map((m) => m.file);
+  keep.sort((a, b) => a.num - b.num || a.file.localeCompare(b.file));
+  return keep.map((m) => m.file);
 }
 
 /** 从样本文件名推断分段编号规则；推断不出返回 undefined */

@@ -42,6 +42,16 @@ import { listSegmentDanmaku } from './danmaku-merge.ts';
 import { exists, fileSize, fmtBytes, fmtDuration } from './util.ts';
 import { log as globalLog, type Logger } from './logger.ts';
 
+/**
+ * 「可能仍在录制」的写入时间窗（秒）。
+ *
+ * 三处必须用同一个值，否则会出现"列表说写完了、导入却说还在写"这种自相矛盾：
+ *   · 本文件的清单（判断某场是否还在录 / 哪些分段已经写完）
+ *   · `discoverSegments` 的 `skipFreshWithinSec`（拒绝把还在写的分段算进一场）
+ *   · `daemon.importLocal` 导入时的分段发现
+ */
+export const RECORDING_WINDOW_SEC = 120;
+
 /* ============================================================================
  * 文件名解析
  * ========================================================================== */
@@ -276,6 +286,14 @@ export interface RecordingCandidate {
   variants: RecordingVariant[];
   /** 可能仍在录制（文件刚被写入过）——导入它会拿到半场素材 */
   possiblyRecording: boolean;
+  /**
+   * 本场还有几个分段**仍在录制**（已闭合的部分不受影响）。
+   *
+   * 为什么单独报出来：「一场录制分多段」时，已闭合的那一段现在就能导入，
+   * 但用户看到"只导入了第 1 段"会以为漏了 —— 有这个数字界面上才能说清
+   * "还有 1 段在录，录完会自动进来"。`possiblyRecording=false` 且它 > 0 就是这种状态。
+   */
+  pendingParts?: number;
 }
 
 /**
@@ -647,7 +665,7 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
 
   const out: RecordingCandidate[] = [];
   const now = Date.now();
-  const recWindowMs = (opts.recordingWindowSec ?? 120) * 1000;
+  const recWindowMs = (opts.recordingWindowSec ?? RECORDING_WINDOW_SEC) * 1000;
   const doProbe = opts.probe !== false;
 
   /* ---- 4a. 先按「场」归并文件 ---- */
@@ -702,7 +720,24 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
   };
 
   for (const g of groups.values()) {
-    const preferred = pickPreferred(g.files);
+    /* ★ 按**单个文件**的写入时间判断"还在录"，而不是整组一刀切。
+     *
+     * 实测事故（2026-09-24，用户问「录播为什么没有导入」）：甲主播那场是「一场录制分多段」的
+     * 命名 —— 第 1 段闭合后叫 `18-00-41-946 …！.ts`（2.7 GB，18:59 写完），
+     * 而正在录的第 2 段叫 `18-00-41-946 …！-PART001.ts`（**同一个归并键**，还在长）。
+     * 旧实现取「组内最晚 mtime」→ 整组判为"仍在录制" → 目录轮询**整场跳过**，
+     * 已闭合的第 1 段（整整一小时素材）一直进不来，要等整场直播结束才有机会。
+     *
+     * 现在的规则：组内**只要有一个文件已经写完**，就用写完的那些组成候选，
+     * 把还在写的分段排除在外，并用 `pendingParts` 报出还有几段在录；
+     * 整组都还在写时才保持原来的"仍在录制"判定。 */
+    const isFresh = (f: { mtimeMs: number }): boolean => f.mtimeMs > 0 && now - f.mtimeMs < recWindowMs;
+    const settled = g.files.filter((f) => !isFresh(f));
+    const freshFiles = g.files.filter(isFresh);
+    const usableFiles = settled.length > 0 ? settled : g.files;
+    const possiblyRecording = settled.length === 0;
+
+    const preferred = pickPreferred(usableFiles);
     const video = preferred.videoPath;
     const parsed = parseRecordingFileName(preferred.fileName);
     const sibling = findSiblingDanmaku(video);
@@ -710,7 +745,9 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
 
     const probe = doProbe ? probeMedia(video) : { exists: true, duration: 0, error: undefined } as { exists: boolean; duration: number; error?: string; width?: number; height?: number; videoCodec?: string; audioCodec?: string };
     const usable = doProbe ? probe.exists && probe.duration > 0 : true;
-    const segs = usable && doProbe ? discoverSegments(video) : [video];
+    /* 列表阶段即使 ffprobe 也不能把"还在写的分段"算进来 —— 与导入时的规则保持一致，
+       否则清单上写的分段数会比真正导入的多一段。 */
+    const segs = usable && doProbe ? discoverSegments(video, { skipFreshWithinSec: Math.round(recWindowMs / 1000), now }) : [video];
 
     const danmaPath0 = historyDanma ?? sibling?.path;
     /* ★ 多分段录播：弹幕文件是按「**该段自己的开始时刻**」命名的，与视频分段的前缀对不上，
@@ -735,10 +772,6 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
     const importedHit = g.files.find((f) => importedBy.has(f.videoPath.toLowerCase()));
     const importedRec =
       importedBy.get(video.toLowerCase()) ?? (importedHit ? importedBy.get(importedHit.videoPath.toLowerCase())! : importedGroups.get(g.key));
-
-    // 该组里最晚被写入的时间 → 判断是否可能还在录
-    const latestMtime = Math.max(...g.files.map((f) => f.mtimeMs));
-    const possiblyRecording = latestMtime > 0 && now - latestMtime < recWindowMs;
 
     out.push({
       videoPath: video,
@@ -767,8 +800,11 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
       ...(importedRec ? { importedBy: importedRec } : {}),
       segmentCount: segs.length,
       source: g.fromHistory ? 'record-history' : 'scan',
-      variants: [...g.files].sort((a, b) => (a.partIndex ?? -1) - (b.partIndex ?? -1)),
+      /* variants 只给**已经写完**的文件：目录轮询用它们做稳定性/基线判断，
+         把还在写的分段混进去会让整场继续被跳过（就是本次修的那个 bug）。 */
+      variants: [...usableFiles].sort((a, b) => (a.partIndex ?? -1) - (b.partIndex ?? -1)),
       possiblyRecording,
+      ...(freshFiles.length > 0 && settled.length > 0 ? { pendingParts: freshFiles.length } : {}),
     });
   }
 
@@ -973,7 +1009,7 @@ export async function previewRecording(
   }
 
   const latestMtime = Math.max(0, ...variants.map((v) => v.mtimeMs));
-  const possiblyRecording = latestMtime > 0 && Date.now() - latestMtime < 120_000;
+  const possiblyRecording = latestMtime > 0 && Date.now() - latestMtime < RECORDING_WINDOW_SEC * 1000;
 
   /* 变体级判重：如果**同一场的另一个文件**已经导入过，这一场就已经有任务了 ——
      再导一次会新建一场、重新花 ASR 钱，而且会投出重复稿件。

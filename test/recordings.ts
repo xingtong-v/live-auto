@@ -19,6 +19,7 @@ import {
   recorderFolderFromConfig,
   recorderFoldersFromConfig,
   recordingGroupKey,
+  RECORDING_WINDOW_SEC,
   roomIdsFromConfig,
 } from '../src/recordings.ts';
 import { loadConfig } from '../src/config.ts';
@@ -322,6 +323,61 @@ section('4d. 防覆盖 UUID 产物不另算一场（回归：重复导入 + 重�
   eq('源文件被清理后只剩弹幕版，仍认得出这一场已导入', survived.candidates[0]?.importedBy?.taskId, 'auto-20260924004858-x8zd');
 
   fs.rmSync(root, { recursive: true, force: true });
+}
+
+/* ====== 4g. 「已闭合的分段」不能被「正在录的分段」拖住（回归：整场不导入） ======
+ *
+ * 实测事故（2026-09-24 晚，用户问「录播为什么没有导入」）：
+ * 甲主播那场是「一场录制分多段」的命名 —— 第 1 段闭合后叫 `18-00-41-946 X.ts`（2.7 GB），
+ * 而正在录的第 2 段叫 `18-00-41-946 X-PART001.ts` —— **同一个归并键**（`-PART001` 会被剥掉）。
+ * 旧实现取「组内最晚 mtime」判断是否仍在录制，于是整组被判为"还在录" →
+ * 目录轮询**整场跳过**，已经写完的整整一小时素材一直进不来，要等整场直播结束。
+ * 正确行为：已闭合的部分立即可以导入，正在写的分段排除在外并如实报出还有几段。 */
+section('4g. 已闭合的分段不被「正在录」的分段拖住（回归：整场不导入）');
+{
+  const cfg = loadConfig().config;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'live-auto-pending-part-'));
+  const closed = path.join(root, '2026-09-24 18-00-41-946 我来了.ts');
+  const writing = path.join(root, '2026-09-24 18-00-41-946 我来了-PART001.ts');
+  fs.writeFileSync(closed, 'x');
+  fs.writeFileSync(writing, 'x');
+  // 已闭合的那个：把 mtime 拨回 1 小时前；正在录的那个保持"现在"（默认就是现在）
+  const old = new Date(Date.now() - 3600_000);
+  fs.utimesSync(closed, old, old);
+
+  const res = await listRecordingsDetailed(
+    { ...cfg, import: { ...cfg.import, scanDirs: [root], minSizeMB: 0, maxDepth: 2 } },
+    { includeFallbackDirs: false, limit: 50, probe: false },
+  );
+  eq('同一场仍然只列一场', res.candidates.length, 1);
+  const c = res.candidates[0]!;
+  eq('首选文件是**已闭合**的那一段', path.basename(c.videoPath), path.basename(closed));
+  eq('不再被判成"仍在录制"（否则轮询整场跳过）', c.possiblyRecording, false);
+  eq('如实报出还有 1 段在录', c.pendingParts, 1);
+  eq('还在写的分段不进 variants（否则轮询继续跳过）', c.variants.length, 1);
+  eq('variants 里就是已闭合的那段', path.basename(c.variants[0]!.videoPath), path.basename(closed));
+
+  /* 分段发现也必须拒绝"还在写"的文件：否则导入已闭合那段时会把半场素材当成第 2 段，
+     总时长/切点/全局时间轴全建立在残缺数据上。 */
+  const all = discoverSegments(closed);
+  eq('不带时间窗时仍能认出两段（说明第 0 段补位确实会合并它们）', all.length, 2);
+  const filtered = discoverSegments(closed, { skipFreshWithinSec: RECORDING_WINDOW_SEC });
+  eq('带时间窗后只剩已闭合的那段', filtered.length, 1);
+  eq('留下的正是样本自己', path.basename(filtered[0]!), path.basename(closed));
+
+  /* 反向保护：整组都还在写时，必须维持原来的"仍在录制"判定（不能反过来漏掉） */
+  const root2 = fs.mkdtempSync(path.join(os.tmpdir(), 'live-auto-all-fresh-'));
+  fs.writeFileSync(path.join(root2, '2026-09-24 19-00-00-000 全在录.ts'), 'x');
+  fs.writeFileSync(path.join(root2, '2026-09-24 19-00-00-000 全在录-PART001.ts'), 'x');
+  const fresh = await listRecordingsDetailed(
+    { ...cfg, import: { ...cfg.import, scanDirs: [root2], minSizeMB: 0, maxDepth: 2 } },
+    { includeFallbackDirs: false, limit: 50, probe: false },
+  );
+  eq('整组都在写时仍判为"仍在录制"', fresh.candidates[0]?.possiblyRecording, true);
+  eq('这种时候不报 pendingParts（整场都还不能导）', fresh.candidates[0]?.pendingParts, undefined);
+
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(root2, { recursive: true, force: true });
 }
 
 /* ================= 4e. 多分段必须真的被合并（回归：匹配器漏了分隔符） ================= */

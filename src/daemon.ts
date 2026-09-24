@@ -55,7 +55,7 @@ import {
 } from './media.ts';
 import { analyzeDanmaku } from './danmaku.ts';
 import { mergeDanmakuXmlFiles, pairSegmentDanmaku, chooseDanmaku } from './danmaku-merge.ts';
-import { findSiblingDanmaku } from './recordings.ts';
+import { findSiblingDanmaku, RECORDING_WINDOW_SEC } from './recordings.ts';
 import { GlossaryStore, correctTranscript, hotWordList } from './glossary.ts';
 import { TRASH_DIR, listTrash, moveToTrash, purgeTrash, restoreFromTrash, trashStats } from './trash.ts';
 import type {
@@ -2717,7 +2717,18 @@ export class Orchestrator {
     const { title, id } = ident;
 
     // 手动导入的视频可能是一个目录里的多个分段
-    const segs = discoverSegments(input.videoPath);
+    /* ⚠️ 必须排除**仍在写入**的分段：`discoverSegments` 的第 0 段补位会把
+       `X.ts`（已闭合的第 1 段）与 `X-PART001.ts`（**正在录**的第 2 段）拼成一场，
+       于是任务的总时长、切点、全局时间轴全建立在半场数据上。
+       时间窗与目录轮询的"可能仍在录制"判定用同一个常量。 */
+    const segs = discoverSegments(input.videoPath, { skipFreshWithinSec: RECORDING_WINDOW_SEC });
+    const freshSkipped = discoverSegments(input.videoPath).length - segs.length;
+    if (freshSkipped > 0) {
+      this.logger.info(
+        `导入时跳过了 ${freshSkipped} 个仍在写入的分段（它们录完会作为独立的场次自动进来）`,
+        { taskId: id, data: { videoPath: input.videoPath } },
+      );
+    }
     const ffprobe = findFfprobe();
     const map = buildSegmentMap(segs, {
       ...(ffprobe ? { ffprobePath: ffprobe } : {}),
