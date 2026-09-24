@@ -40,6 +40,7 @@
     "error-report-ui": "node --experimental-strip-types tools/verify-error-report-ui.ts",
     "errors-archive-mock": "node tools/archive-mock-errors.ts",
     "hotwords-ab": "node --experimental-strip-types tools/local-asr/hotwords-ab.ts",
+    "asr-timing": "node --experimental-strip-types tools/local-asr/timing.ts",
     "streamer-test": "node test/streamer.ts",
     "mcp-test": "node test/mcp.ts",
     "select-slot-test": "node --experimental-strip-types tools/local-asr/verify-select-slot.ts",
