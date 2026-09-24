@@ -313,6 +313,112 @@ section('④c 端到端：源文件缺失这一分支真跑一遍（不需要任
   eq('台账里切片被标为失败', ledger2.getClip(ID, 0)?.status, 'FAILED');
 }
 
+section('⑤ 转写失败必须带上「那次 HTTP 调用」的现场（用户贴回的报告里写的是"无请求上下文"）');
+{
+  /* 真实场景：ASR 失败的表象是"没有字幕"，真因在那次 HTTP 调用里。
+     这里用一个抛 ApiError 的桩 client 走一遍 transcribe()，断言请求上下文被留了下来。 */
+  const { Transcriber } = await import('../src/asr.ts');
+  const { ApiError } = await import('../src/api.ts');
+  const mediaFile = path.join(tmp, 'asr-window.mp4');
+  fs.writeFileSync(mediaFile, Buffer.alloc(1024, 7));
+  const request = {
+    method: 'POST',
+    url: '/ai/subtitle',
+    status: 500,
+    responseBody: '{"error":"Request failed with status code 400"}',
+  };
+  const client = new Proxy(
+    {
+      subtitle: async () => {
+        throw new ApiError('biliLive-tools 内部错误（HTTP 500） —— {"error":"Request failed with status code 400"}', {
+          type: 'http-status',
+          request,
+        });
+      },
+    },
+    { get: (t, k) => (k in t ? (t as Record<string, unknown>)[k as string] : async () => { throw new Error(`桩 client 未实现 ${String(k)}`); }) },
+  ) as unknown as BiliLiveClient;
+
+  const realCfg = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'config.json'), 'utf8')) as AppConfig;
+  realCfg.asr.provider = 'bililive-tools';
+  realCfg.asr.maxRetries = 0; // 只跑一次，测试别等退避
+  realCfg.asr.cacheDir = path.join(tmp, 'asr-cache');
+  const tr = new Transcriber({ client, config: realCfg, cache: undefined });
+  const res = await tr.transcribe({
+    taskId: 'errrep-asr',
+    media: {
+      planCalls: () => [
+        { file: mediaFile, inFileStart: 0, inFileEnd: 60, offset: 0, globalStart: 0, globalEnd: 60, windowIndex: 0 },
+      ],
+      fileStat: () => ({ size: 1024, updatedAt: 1 }),
+    },
+    totalDuration: 60,
+  });
+  eq('转写结果没有字幕（失败）', res.transcript.segments.length, 0);
+  eq('gaps 记下了失败区间', res.transcript.gaps.length, 1);
+  ok('gaps 里带上了底层原因', /HTTP 500/.test(res.transcript.gaps[0]!.reason ?? ''), res.transcript.gaps[0]!.reason);
+  ok('**lastFailure 留住了请求上下文**（这是本次修复的核心）', res.transcript.lastFailure?.request !== undefined, JSON.stringify(res.transcript.lastFailure));
+  eq('请求上下文里的接口地址对', res.transcript.lastFailure?.request?.url, '/ai/subtitle');
+  eq('请求上下文里的状态码对', res.transcript.lastFailure?.request?.status, 500);
+  ok('响应体也在（能直接看到上游 400 那句话）', /status code 400/.test(res.transcript.lastFailure?.request?.responseBody ?? ''), res.transcript.lastFailure?.request?.responseBody);
+  eq('失败类型来自 ApiError', res.transcript.lastFailure?.type, 'http-status');
+}
+
+section('⑤b 编排层：阶段与错误类型不能丢成 UNKNOWN / internal');
+{
+  const { StageError } = await import('../src/daemon.ts');
+  const { classifyError } = await import('../src/errors.ts');
+
+  /* 类型回退：不是 StageError 时按消息判定（老实现硬写 internal） */
+  const asrMsg = new Error('语音识别没有产出任何字幕（失败区间覆盖 19.9/19.9 分钟）：http-status: biliLive-tools 内部错误（HTTP 500）');
+  eq('ASR 失败消息被判成 asr-failed（不再是 internal）', classifyError(asrMsg, 'internal'), 'asr-failed');
+
+  /* StageError 现在能带现场 */
+  const se = new StageError('TRANSCRIBED', 'x', 'asr-failed', {
+    request: { method: 'POST', url: '/ai/subtitle', status: 500 },
+    extraEnv: { bililiveAsrModel: 'qwen-audio-3.0-asr-flash' },
+  });
+  eq('阶段是 TRANSCRIBED（不再是 UNKNOWN）', se.stage, 'TRANSCRIBED');
+  eq('类型是 asr-failed', se.type, 'asr-failed');
+  eq('带上请求上下文', se.context?.request?.url, '/ai/subtitle');
+  eq('带上当时的 ASR 模型名', se.context?.extraEnv?.bililiveAsrModel, 'qwen-audio-3.0-asr-flash');
+
+  /* 报告侧：把这两样写进去之后，渲染出来的时间线里应当出现请求上下文那一行 */
+  const out = writeErrorReport({
+    taskId: 'errrep-stage',
+    taskTitle: '阶段上下文测试场',
+    stage: se.stage,
+    error: se,
+    type: se.type,
+    request: se.context!.request,
+    extraEnv: se.context!.extraEnv,
+  });
+  ok('报告文件已落盘', fs.existsSync(out.reportPath));
+  const loaded = loadErrorReportOrEvent(out.brief.reportId)?.report;
+  eq('报告里记下了 ASR 模型名', loaded?.env.bililiveAsrModel, 'qwen-audio-3.0-asr-flash');
+  eq('报告里记下了请求 URL', loaded?.request?.url, '/ai/subtitle');
+  const text = renderErrorTimeline(loaded!);
+  ok('渲染结果里有请求上下文那一行（不再是"失败不发生在 HTTP 调用上"）', /POST \/ai\/subtitle → HTTP 500/.test(text), text.slice(0, 200));
+  const ev = findErrorEvent(out.brief.reportId);
+  eq('事件行里的阶段也是 TRANSCRIBED', ev?.stage, 'TRANSCRIBED');
+  eq('事件行里的类型也是 asr-failed', ev?.type, 'asr-failed');
+}
+
+section('⑤c 源码接线核对（防止以后又退回 UNKNOWN / internal）');
+{
+  const daemon = fs.readFileSync(path.join(ROOT_DIR, 'src', 'daemon.ts'), 'utf8');
+  ok('空转写抛的是 StageError 且阶段是 TRANSCRIBED', /throw new StageError\(\s*'TRANSCRIBED'/.test(daemon));
+  ok('空转写抛的类型是 asr-failed', /'TRANSCRIBED',[\s\S]{0,1600}?'asr-failed',/.test(daemon));
+  ok('catch 里不再硬写 UNKNOWN', !/const stage = e instanceof StageError \? e\.stage : 'UNKNOWN'/.test(daemon));
+  ok('catch 里用任务台账回退阶段', /e instanceof StageError \? e\.stage : \(taskNow\?\.stage \?\? taskNow\?\.status \?\? 'UNKNOWN'\)/.test(daemon));
+  ok('catch 里用 classifyError 回退类型', /e instanceof StageError \? e\.type : classifyError\(e, 'internal'\)/.test(daemon));
+  ok('catch 里把请求上下文转发给报告', /ctx\?\.request \? \{ request: ctx\.request \}/.test(daemon));
+  ok('报告会带上当时的 ASR 模型名', /bililiveAsrModel: asrModel\.modelName/.test(daemon));
+  const asr = fs.readFileSync(path.join(ROOT_DIR, 'src', 'asr.ts'), 'utf8');
+  ok('asr 层从 ApiError 取请求上下文', /e instanceof ApiError \? e\.request : undefined/.test(asr));
+  ok('asr 层把 lastFailure 写进 transcript', /transcript\.lastFailure = \{/.test(asr));
+}
+
 ui.stop();
 orch.stop();
 /* ⚠️ 先关日志再删临时目录：本测试把模块级 `log` 的目录也换到了 tmp 里（见上面的隔离说明），

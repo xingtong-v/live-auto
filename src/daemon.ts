@@ -26,7 +26,7 @@ import { Alerter as DefaultAlerter } from './alert.ts';
 import { Analyzer, persistAnalysis, PromptStore } from './analyze.ts';
 import { AsrCache, Transcriber, isDryRunPaymentRejection, type AsrMediaAdapter } from './asr.ts';
 import { Cleaner, checkAfterUploadDelete, judgeDeletability, rotateLogs } from './cleanup.ts';
-import { writeErrorReport, setErrorReportDir, setErrorsPath, type ErrorReportInput } from './errors.ts';
+import { writeErrorReport, setErrorReportDir, setErrorsPath, classifyError, type ErrorReportInput } from './errors.ts';
 import { LlmClient } from './llm.ts';
 import {
   Publisher,
@@ -61,7 +61,9 @@ import { TRASH_DIR, listTrash, moveToTrash, purgeTrash, restoreFromTrash, trashS
 import type {
   ArchiveItem,
   ClipRecord,
+  EnvSnapshot,
   ErrorType,
+  RequestContext,
   Signals,
   SourceSegment,
   Stage,
@@ -172,6 +174,8 @@ export class Orchestrator {
   private dataDir: string;
   /** 各任务的进度（供 UI 读取细粒度进度，如「转写中 12/24」） */
   readonly progress = new Map<string, { label: string; current: number; total: number }>();
+  /** biliLive-tools 当前「字幕识别」模型的缓存（见 `bililiveAsrModel()`） */
+  private asrModelCache?: { at: number; value: { modelId?: string; modelName?: string } };
   /** 正在处理的任务（场次级串行） */
   private busy = false;
   private queue: Array<{ taskId: string; fromStage?: Stage }> = [];
@@ -800,6 +804,32 @@ export class Orchestrator {
   }
 
   /**
+   * 读出 biliLive-tools 当前配的「字幕识别」模型名（只读它的 `/config`）。
+   *
+   * 为什么值得专门去查：转写失败的头号原因就是**模型选错**（选了个不支持"录音文件转写"
+   * 的对话模型，上游直接 400 —— 实测报告里请求体写的是 `qwen-audio-3.0-asr-flash`）。
+   * 报告里直接写上模型名，用户看一眼就能确认，不用去翻对方日志。
+   *
+   * 任何失败都返回空对象：**绝对不能因为查模型名而让报告写不出来**。
+   */
+  private async bililiveAsrModel(): Promise<{ modelId?: string; modelName?: string }> {
+    const now = Date.now();
+    if (this.asrModelCache && now - this.asrModelCache.at < 300_000) return this.asrModelCache.value;
+    try {
+      const raw = (await this.client.getConfig()) as {
+        ai?: { subtitleRecognize?: { modelId?: string }; models?: Array<{ modelId?: string; modelName?: string }> };
+      };
+      const modelId = raw?.ai?.subtitleRecognize?.modelId;
+      const name = modelId ? raw?.ai?.models?.find((m) => m.modelId === modelId)?.modelName : undefined;
+      const value = { ...(modelId ? { modelId } : {}), ...(name ? { modelName: name } : {}) };
+      this.asrModelCache = { at: now, value };
+      return value;
+    } catch {
+      return {}; // 查不到就留空，报告照写
+    }
+  }
+
+  /**
    * 推进一场直播的流水线。
    *
    * `fromStage` 语义：**从该阶段开始执行**（之前的阶段视为已完成，不重复付费）。
@@ -899,14 +929,35 @@ export class Orchestrator {
         }
 
         if (!cfg.asr.allowEmptyTranscriptFallback) {
-          throw new Error(
+          /* ★ 这里必须抛 **StageError**，不能抛普通 Error（实测教训）。
+             抛普通 Error 时编排层的 catch 只能写成「失败阶段 UNKNOWN / 类型 internal」——
+             用户贴回来的那份报告正是如此：明明是一次转写失败，
+             阶段却显示 UNKNOWN、类型显示 internal，等于把最有用的两条线索丢了。
+             另外把两样现场带上：① 那次 HTTP 调用的请求上下文（asr 层留的 lastFailure.request）；
+             ② 失败当时 biliLive-tools 配的字幕识别模型 —— 这类失败的头号原因就是模型选错。 */
+          const asrModel = await this.bililiveAsrModel();
+          throw new StageError(
+            'TRANSCRIBED',
             `语音识别没有产出任何字幕${covered > 0 && total > 0 ? `（失败区间覆盖 ${(covered / 60).toFixed(1)}/${(total / 60).toFixed(1)} 分钟）` : ''}：${detail}\n` +
               `这不是"识别出来是空的"，而是转写请求失败了。常见原因：\n` +
               `  ① biliLive-tools 里选的语音识别模型不支持"录音文件转写"（例如选成了 Qwen Omni 之类的对话模型）；\n` +
               `  ② 阿里云 DashScope 的 Key 失效/欠费，或该模型没有开通；\n` +
               `  ③ 音频本身异常（本次已确认源文件有正常音轨，可排除）。\n` +
               `处理：去 biliLive-tools 的「设置 → 语音识别」把模型换回可用的录音文件识别模型，` +
-              `然后在本任务上「从某阶段重跑 → TRANSCRIBED」（失败的那次没有计费，重跑不会重复花钱）。`,
+              `然后在本任务上「从某阶段重跑 → TRANSCRIBED」（失败的那次没有计费，重跑不会重复花钱）。` +
+              (asrModel.modelName ? `\n【当前 biliLive-tools 字幕识别模型：${asrModel.modelName}】若这个名字不是录音文件转写模型，这就是根因。` : ''),
+            'asr-failed',
+            {
+              ...(transcript.lastFailure?.request ? { request: transcript.lastFailure.request } : {}),
+              ...(asrModel.modelName || asrModel.modelId
+                ? {
+                    extraEnv: {
+                      ...(asrModel.modelName ? { bililiveAsrModel: asrModel.modelName } : {}),
+                      ...(asrModel.modelId ? { bililiveAsrModelId: asrModel.modelId } : {}),
+                    },
+                  }
+                : {}),
+            },
           );
         }
         log.warn(
@@ -1136,15 +1187,25 @@ export class Orchestrator {
       return await this.publishStage(taskId, log);
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e));
-      const stage = e instanceof StageError ? e.stage : 'UNKNOWN';
-      const type: ErrorType = e instanceof StageError ? e.type : 'internal';
+      /* 不是 StageError 时**不能**一律写 UNKNOWN / internal —— 那等于把报告里最有用的
+         两条线索丢掉。实测：转写失败抛的是普通 Error，报告写成「失败阶段 UNKNOWN（状态机位置
+         TRANSCRIBED）/ 类型 internal」，用户拿着它根本判断不出是哪一步、哪一类问题。
+         回退规则：
+           · 阶段 → 任务台账里的 stage / status（那里至少记着它跑到哪了）；
+           · 类型 → `classifyError()` 按消息内容判定（"语音识别…HTTP 500" 能判成 asr-failed）。 */
+      const taskNow = this.ledger.getTask(taskId);
+      const stage = e instanceof StageError ? e.stage : (taskNow?.stage ?? taskNow?.status ?? 'UNKNOWN');
+      const type: ErrorType = e instanceof StageError ? e.type : classifyError(e, 'internal');
+      const ctx = e instanceof StageError ? e.context : undefined;
       await this.reportError({
         taskId,
         taskTitle: task.title,
         stage,
         error: e,
         type,
-        taskStatus: this.ledger.getTask(taskId)?.status,
+        ...(ctx?.request ? { request: ctx.request } : {}),
+        ...(ctx?.extraEnv ? { extraEnv: ctx.extraEnv } : {}),
+        taskStatus: taskNow?.status,
       });
       this.ledger.setStatus(taskId, 'FAILED', {});
       this.clearProgress(taskId);
@@ -2982,10 +3043,25 @@ export class StageError extends Error {
   override readonly name = 'StageError';
   readonly stage: string;
   readonly type: ErrorType;
-  constructor(stage: string, message: string, type: ErrorType = 'internal') {
+  /**
+   * 可选：把"能解释这次失败的现场"一起带上去，供错误报告使用。
+   *
+   * - `request`：失败发生在 HTTP 调用上时的请求上下文（URL / 状态码 / 响应体）。
+   *   不带它的话报告只能写"失败不发生在 HTTP 调用上"——实测用户拿到的第一份报告就是这样，
+   *   而那次失败恰恰是 HTTP 500（biliLive-tools）套着上游 400（DashScope）。
+   * - `extraEnv`：环境补充（例如失败当时的 ASR 模型名），报告里一眼能看出"是不是模型选错了"。
+   */
+  readonly context?: { request?: RequestContext; extraEnv?: Partial<EnvSnapshot> };
+  constructor(
+    stage: string,
+    message: string,
+    type: ErrorType = 'internal',
+    context?: { request?: RequestContext; extraEnv?: Partial<EnvSnapshot> },
+  ) {
     super(message);
     this.stage = stage;
     this.type = type;
+    if (context) this.context = context;
   }
 }
 

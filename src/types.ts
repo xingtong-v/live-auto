@@ -287,6 +287,15 @@ export interface Transcript {
    * 只保留命中前 20 条，避免把 transcript.json 撑大。
    */
   glossaryCorrections?: Array<{ from: string; to: string; count: number }>;
+  /**
+   * 最后一次失败的细节（**含请求上下文**），供编排层写错误报告用。
+   *
+   * 为什么必须留着：ASR 失败的表现是"没有产出任何字幕"（`segments` 为空、`gaps` 有区间），
+   * 而真正的原因在**那次 HTTP 调用**里（状态码 + 响应体 + 对方日志）。
+   * 不留这一条，错误报告就只能写「无请求上下文：失败不发生在 HTTP 调用上」——
+   * 实测用户贴回来的第一份报告就是这样，而它恰恰是一次 HTTP 500 → 上游 400 的失败。
+   */
+  lastFailure?: { type: ErrorType; message: string; request?: RequestContext };
   audioSeconds?: number;
   costEstimate?: number;
   createdAt: string;
@@ -622,6 +631,14 @@ export interface EnvSnapshot {
   failReason?: string;
   /** 片段产物路径（便于直接去看那个文件还在不在） */
   cutOutput?: string;
+  /**
+   * 失败当时 biliLive-tools 里配的「字幕识别」模型。
+   *
+   * 这类失败的头号原因就是**模型选错**（选了个不支持"录音文件转写"的对话模型，
+   * 上游直接 400）。报告里写上模型名，看一眼就知道是不是它，不用再去翻对方日志。
+   */
+  bililiveAsrModel?: string;
+  bililiveAsrModelId?: string;
 }
 
 /** 完整错误报告 */

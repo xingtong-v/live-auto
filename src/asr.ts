@@ -17,7 +17,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import type { AsrCacheEntry, Transcript, TranscriptGap, TranscriptSegment } from './types.ts';
+import type { AsrCacheEntry, RequestContext, Transcript, TranscriptGap, TranscriptSegment } from './types.ts';
 import type { AppConfig } from './config.ts';
 import { BiliLiveClient, ApiError } from './api.ts';
 import type { ErrorType, RetryAttempt } from './types.ts';
@@ -939,7 +939,7 @@ export class Transcriber {
       segments: TranscriptSegment[];
       audioSeconds: number;
       paid: boolean;
-      failed?: { type: ErrorType; message: string; attempts: RetryAttempt[] };
+      failed?: { type: ErrorType; message: string; attempts: RetryAttempt[]; request?: RequestContext };
     }
 
     let done = 0;
@@ -1056,6 +1056,10 @@ export class Transcriber {
             } catch (e) {
               const type: ErrorType = e instanceof ApiError ? e.type : 'internal';
               const message = e instanceof Error ? e.message : String(e);
+              /* 把**请求上下文**一起留下来（ApiError 自带）：ASR 失败的表象是"没有字幕"，
+                 真因在那次 HTTP 调用里。不带上去，错误报告只能写"失败不发生在 HTTP 调用上"——
+                 实测用户贴回来的第一份报告就是这样，而它其实是一次 500 → 上游 400。 */
+              const request = e instanceof ApiError ? e.request : undefined;
               attempts.push({ attempt, at: nowIso(), type, message });
               // 一次都没成功过的尝试才算「付费」；这里保守地不重复计费，由 paidCalls 在成功时计
               if (attempt <= maxRetries) {
@@ -1073,7 +1077,7 @@ export class Transcriber {
                 segments: [],
                 audioSeconds,
                 paid: false,
-                failed: { type, message, attempts },
+                failed: { type, message, attempts, ...(request ? { request } : {}) },
               };
             }
           }
@@ -1124,6 +1128,19 @@ export class Transcriber {
       costEstimate: (paidAudioSeconds / 3600) * this.cfg.asr.unitPricePerHour,
       createdAt: nowIso(),
     };
+
+    /* 把"最像根因"的那次失败留给编排层写错误报告：
+       优先取**带请求上下文**的那条（有状态码与响应体），没有就取第一条失败。
+       这样报告里才可能出现「POST /ai/subtitle → HTTP 500，响应体 …」而不是"无请求上下文"。 */
+    const failure =
+      results.find((r) => r.failed?.request) ?? results.find((r) => r.failed);
+    if (failure?.failed) {
+      transcript.lastFailure = {
+        type: failure.failed.type,
+        message: failure.failed.message,
+        ...(failure.failed.request ? { request: failure.failed.request } : {}),
+      };
+    }
 
     log.info(
       `转写完成：${merged.segments.length} 条字幕，付费段 ${paidCalls}，缓存命中 ${cacheHits}，失败 ${failedWindows}，` +
