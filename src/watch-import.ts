@@ -80,6 +80,12 @@ export interface WatchImportOutcome {
   taskId?: string;
   /** 未导入时的原因（给人看的） */
   skipped?: string;
+  /** 这一场整体还在录制（任何分段都还没写稳） */
+  possiblyRecording?: boolean;
+  /** 这一场还有几个分段在写入（已闭合的部分照常导入） */
+  pendingParts?: number;
+  /** 还在写入的那些分段（界面据此列出"正在录制"的文件名与体积） */
+  pendingFiles?: Array<{ fileName: string; sizeMB: number }>;
 }
 
 export interface WatchImporterDeps {
@@ -335,6 +341,13 @@ export class WatchImporter {
           title: c.title,
           sizeMB: Math.round((c.sizeBytes / 1024 ** 2) * 10) / 10,
           ...(c.danmaPath ? { danmaPath: c.danmaPath } : {}),
+          /* ★ 把"本场还有分段在写入"一起报出去（哪怕这一段已经成功导入）。
+             监控面板的「正在录制」就是从这些行拼出来的 —— 2026-09-24 改成按文件判新鲜度后，
+             已闭合的分段能导入了，但"仍在写入"的行也跟着没了，面板上"正在录制"整块消失。
+             观测性不能因为修 bug 而丢，所以这里显式带上。 */
+          ...(c.possiblyRecording ? { possiblyRecording: true } : {}),
+          ...(c.pendingParts ? { pendingParts: c.pendingParts } : {}),
+          ...(c.pendingFiles?.length ? { pendingFiles: c.pendingFiles } : {}),
         };
 
         const skip = (reason: string): void => {

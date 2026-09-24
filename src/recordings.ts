@@ -294,6 +294,15 @@ export interface RecordingCandidate {
    * "还有 1 段在录，录完会自动进来"。`possiblyRecording=false` 且它 > 0 就是这种状态。
    */
   pendingParts?: number;
+  /**
+   * 还在写入的那些分段（文件名 + 体积），给界面如实列出来。
+   *
+   * 只有 `pendingParts` 一个数字时，界面只能说"还有 1 段在录"，用户没法核对是哪一个；
+   * 实测（2026-09-24 晚）改完新鲜度判定后，监控面板的「正在录制」整块消失了 ——
+   * 因为那块是从"因仍在写入而被跳过"的候选行拼出来的，而新逻辑下这个候选**已经能导入**、
+   * 不再产生那种跳过行。观测性不能因为修 bug 而丢掉，所以这里把名字一起带上。
+   */
+  pendingFiles?: Array<{ fileName: string; sizeMB: number }>;
 }
 
 /**
@@ -804,7 +813,12 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
          把还在写的分段混进去会让整场继续被跳过（就是本次修的那个 bug）。 */
       variants: [...usableFiles].sort((a, b) => (a.partIndex ?? -1) - (b.partIndex ?? -1)),
       possiblyRecording,
-      ...(freshFiles.length > 0 && settled.length > 0 ? { pendingParts: freshFiles.length } : {}),
+      ...(freshFiles.length > 0 && settled.length > 0
+        ? {
+            pendingParts: freshFiles.length,
+            pendingFiles: freshFiles.map((f) => ({ fileName: f.fileName, sizeMB: f.sizeMB })),
+          }
+        : {}),
     });
   }
 
@@ -853,6 +867,11 @@ export function describeCandidate(c: RecordingCandidate): string {
   if (c.variants.length > 1) parts.push(`${c.variants.length} 个版本`);
   if (c.hasDanmakuInPicture) parts.push('画面已烧弹幕');
   if (c.possiblyRecording) parts.push('可能仍在录制');
+  /* ★ 本场还有分段在写入时必须**说出来**。
+     2026-09-24 的修复把"整组是否还在录"改成按文件判定之后，已闭合的分段变得可导入了，
+     但界面上"可能仍在录制"也跟着消失 —— 用户会以为系统不知道还在录。
+     两个事实要同时讲清：这一段已经写完（可处理），本场还有 N 段在写（录完会自动进来）。 */
+  if (c.pendingFiles?.length) parts.push(`本场另有 ${c.pendingFiles.length} 段仍在写入`);
   if (c.importedBy) parts.push(`已导入(${c.importedBy.status})`);
   if (!c.usable) parts.push('文件不可用');
   return parts.join(' · ');

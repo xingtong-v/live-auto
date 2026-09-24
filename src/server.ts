@@ -2442,9 +2442,35 @@ export class UiServer {
     } catch (e) {
       watch = { error: (e as Error).message };
     }
-    const recordingNow = outcomes
-      .filter((o) => typeof o['skipped'] === 'string' && /仍在写入|可能仍在录制/.test(String(o['skipped'])))
-      .map((o) => ({ fileName: o['fileName'], title: o['title'], sizeMB: o['sizeMB'], note: o['skipped'] }));
+    /* 「正在录制」= 还在写入的那些分段。
+     *
+     * ⚠️ 不能只认"因仍在写入而被跳过"的行（旧写法）：2026-09-24 把新鲜度判定改成按文件之后，
+     *    已闭合的分段**可以导入**了，于是那种跳过行不再产生 —— 面板上「正在录制」整块消失
+     *    （用户当场发现并问「为什么现在不显示还在录制了」）。现在两条来源都收：
+     *      · `possiblyRecording`：整场都还没写稳（照旧）；
+     *      · `pendingFiles`：本场另有分段在写，而当前这一段已经进队列了。
+     *    后者要如实说明"这段已导入、那些还在写"，否则用户会以为系统漏了文件。 */
+    const recordingNow: Array<{ fileName: string; title: string; sizeMB: number; note: string }> = [];
+    for (const o of outcomes) {
+      const pending = Array.isArray(o['pendingFiles']) ? (o['pendingFiles'] as Array<{ fileName: string; sizeMB: number }>) : [];
+      if (o['possiblyRecording'] === true) {
+        recordingNow.push({
+          fileName: String(o['fileName'] ?? ''),
+          title: String(o['title'] ?? ''),
+          sizeMB: Number(o['sizeMB'] ?? 0),
+          note: typeof o['skipped'] === 'string' ? String(o['skipped']) : '仍在写入',
+        });
+        continue;
+      }
+      for (const p of pending) {
+        recordingNow.push({
+          fileName: p.fileName,
+          title: String(o['title'] ?? ''),
+          sizeMB: p.sizeMB,
+          note: `这一场已录完的那段已导入${o['taskId'] ? `（任务 ${String(o['taskId'])}）` : ''}；本段写稳后会自动进来`,
+        });
+      }
+    }
 
     /* ---- 4. 待删清单 ---- */
     let pendingDelete: Record<string, unknown> = { count: 0, items: [] };

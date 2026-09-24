@@ -88,6 +88,9 @@ interface CandOverrides {
   title?: string;
   /** 文件修改时间（毫秒）。默认「一小时前」；用来验「启用前就已存在」的判定 */
   mtimeMs?: number;
+  /** 本场还有分段在写入（已闭合的那段照常导入） */
+  pendingParts?: number;
+  pendingFiles?: Array<{ fileName: string; sizeMB: number }>;
 }
 
 function cand(fileName: string, over: CandOverrides = {}): RecordingCandidate {
@@ -118,6 +121,8 @@ function cand(fileName: string, over: CandOverrides = {}): RecordingCandidate {
       },
     ],
     possiblyRecording: over.possiblyRecording ?? false,
+    ...(over.pendingParts ? { pendingParts: over.pendingParts } : {}),
+    ...(over.pendingFiles ? { pendingFiles: over.pendingFiles } : {}),
   };
 }
 
@@ -512,6 +517,42 @@ async function main(): Promise<void> {
     await h.importer.scanOnce();
     eq('范围稳定后新录的照常自动导入', h.imported.length, 1);
     eq('导入的正是它', h.imported[0]?.videoPath, 'C:/fake/bilibili/范围稳定后新录的.flv');
+  }
+
+  /* ====== 12. 「本场还有分段在写入」必须报出去（哪怕这一段已经导入） ======
+   *
+   * 实测（2026-09-24 晚）：把新鲜度判定改成按文件之后，已闭合的分段能导入了，
+   * 但监控面板的「正在录制」整块消失 —— 因为那块是从"因仍在写入而被跳过"的行拼出来的，
+   * 而新逻辑下这个候选已经能导入、不再产生那种跳过行。用户当场问「为什么现在不显示还在录制了」。
+   * 这里锁死：成功导入的行也要带上 pendingFiles，界面才有东西可显示。 */
+  section('12. 成功导入的候选也要带上"本场还有 N 段在写入"');
+  {
+    /* ⚠️ 两个坑（都踩过）：
+       ① `makeHarness` **不要**显式传 `importExisting:false` —— 那样首轮扫描会把文件登记成
+          "启用前已存在"的基线，第二轮就被 `base0` 闸拦下（那是 §10 专门验的另一条规则）；
+       ② 本文件的 `ok` 是 `(cond, msg, extra)` 顺序（与 recordings.ts 的 `(name, cond)` 相反）。 */
+    const h = makeHarness([
+      cand('我来了.ts', {
+        pendingParts: 1,
+        pendingFiles: [{ fileName: '我来了-PART002.ts', sizeMB: 1076 }],
+      }),
+    ]);
+    await h.importer.scanOnce();
+    h.advance(31_000);
+    const outs = await h.importer.scanOnce();
+    eq('已闭合的那段照常导入', h.imported.length, 1);
+    const row = outs.find((o) => o.taskId) ?? outs[0];
+    eq('导入了这一行', Boolean(row?.taskId), true);
+    eq('这一行带上了 pendingParts', row?.pendingParts, 1);
+    eq('这一行带上了还在写的文件名（界面据此显示"正在录制"）', row?.pendingFiles?.[0]?.fileName, '我来了-PART002.ts');
+    ok(!row?.skipped, '这一行没有被标成"仍在写入"（它确实导入成功了）', String(row?.skipped));
+
+    /* 整场都还没写稳时，仍然是原来的"仍在写入"跳过语义（不能因为这次改动而丢掉） */
+    const h2 = makeHarness([cand('全在录.ts', { possiblyRecording: true })]);
+    await h2.importer.scanOnce();
+    const outs2 = await h2.importer.scanOnce();
+    ok(outs2[0]?.skipped?.includes('仍在写入') === true, '整场都在录时照旧跳过并说明原因', String(outs2[0]?.skipped));
+    eq('并且把它标成 possiblyRecording（界面据此显示"正在录制"）', outs2[0]?.possiblyRecording, true);
   }
 
   console.log('\n' + '─'.repeat(74));

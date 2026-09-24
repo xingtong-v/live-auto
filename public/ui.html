@@ -2171,8 +2171,8 @@ function renderMonitor(box) {
     </div>`;
   if (d.recordingNow.length) {
     html += `<h3 style="font-size:13px;margin:6px 0 8px">正在录制（还在写入，写稳了才会导入）</h3>
-      <table class="tbl"><thead><tr><th>文件</th><th>标题</th><th class="num">大小</th></tr></thead><tbody>
-      ${d.recordingNow.map((r) => `<tr><td class="mono-sm">${esc(r.fileName)}</td><td>${esc(r.title)}</td><td class="num">${r.sizeMB} MB</td></tr>`).join('')}
+      <table class="tbl"><thead><tr><th>文件</th><th>标题</th><th class="num">大小</th><th>说明</th></tr></thead><tbody>
+      ${d.recordingNow.map((r) => `<tr><td class="mono-sm">${esc(r.fileName)}</td><td>${esc(r.title)}</td><td class="num">${r.sizeMB} MB</td><td class="mono-sm">${esc(r.note || '')}</td></tr>`).join('')}
       </tbody></table>`;
   }
   if (outs.length) {
