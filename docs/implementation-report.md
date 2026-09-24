@@ -2187,4 +2187,71 @@ npm run errors-archive-mock      # 再出现测试污染时，把 mock 事件挪
 **验证必须走到"用户真正做的那一步"**（点那个按钮、看那句话），
 接口 200 / 单测全绿都不算数。
 
+---
+
+## 20. 热词接线：一条"能力在、线没接"的杠杆（2026-09-24）
+
+### 20.1 缘起
+
+用户拿一份 ASR 模型选型的分享来问"适合我的项目吗"。分析结论是：那份分享里的**落地形态**
+（实时流式、海外商业 API、买/租 GPU、SmartSub / LiveSpeech2Text 这类桌面工具）与本项目
+都不匹配，真正的短板不在"换哪个模型"，而在**已有能力没接上** —— 其中第一条就是热词：
+
+- `tools/local-asr/transcribe-funasr.py` 一直读 `spec["hotwords"]` 并传给
+  `generate(hotwords=[…])`（Fun-ASR 原生参数）；
+- 而 TS 侧 `src/asr.ts` 的 `LocalAsrOptions` **从来没有这个字段**，`buildLocalAsrSpec()`
+  也从不写它 ⇒ 用户改了 `data/glossary.json`，转写结果**毫无变化，且没有任何报错**。
+
+这不是"缺功能"，是"线没接"——最容易被忽略、也最伤信任的一类问题。
+
+### 20.2 改了什么
+
+| 位置 | 改动 |
+|---|---|
+| `src/glossary.ts` | 新增 `hotWordList(glossary, {max})`：把 anchors + terms 摊平成 ASR 热词数组（去空白/去重/丢超长句/按上限截断，并如实返回丢弃个数）；缺字段的手改词表不再抛异常 |
+| `src/asr.ts` | `LocalAsrOptions.hotwords`；`buildLocalAsrSpec` 的 funasr 分支按需写入（空则不写字段，便于一眼看出这次带没带）；`TranscribeDeps.hotwords` 是**惰性函数**（术语表可热改，读表时机应是"每次组装参数"而不是"服务启动"）；`resolveHotwords()` 三重保险（配置关 / 无来源 / 读表抛错 → 都只是"这次没热词"） |
+| `src/asr.ts` | ★ **热词进缓存键**：`asrCacheKey` 增加 `hotwords?`，且用**条件追加**而不是固定加空槽位 —— 后者会让所有既有缓存键一起失效（云端按小时计费，那是真金白银的重跑）。没热词时键与从前**逐字节相同** |
+| `src/daemon.ts` | 注入 `hotwords: () => hotWordList(this.glossary.load(), {max})`；有词被丢掉时记 warn（否则用户会以为"我写了却没生效"） |
+| `src/config.ts` + `config.example.json` | `asr.localFunasr.hotwordsEnabled`（默认 **true**）、`hotwordsMax`（默认 80）；示例配置补上了整个 `localFunasr` 段（此前缺失） |
+| `public/ui.html` | 配置面板新增热词开关与上限输入 + 回写 patch；顺带修掉**时间戳开关此前没绑事件**（点了没反应 —— 本项目真实发生过的坑） |
+
+### 20.3 真机 A/B（同一段素材、同一个模型、只差热词）
+
+素材 `data/local-asr-test/sample-300s.flv` 前 300 秒，本地 Fun-ASR-Nano（RTX 4070S，CUDA），
+走**真实 Transcriber**（就是流水线那条路），两次各用独立缓存目录：
+
+| | A 不带热词 | B 带热词（钢蹦） | 云端基准 |
+|---|---|---|---|
+| 目标词「钢蹦」命中 | 5 | **8** | 7 |
+| 相对云端基准 CER | 5.47% | **5.03%** | — |
+| 墙钟 | 163.2 s | 162.4 s | — |
+| 字幕条数 | 131 | 130 | — |
+
+日志侧证据：B 那次明确打出 `热词已注入（1 条，来自术语表）：钢蹦`。
+两次输出**不完全一致**（模型确实改口了），耗时无差别。
+
+> 结论：热词在这套流水线上**真的生效且是正向的**（更接近云端基准），代价约等于零。
+> 注意这也是**风险**：词表写错会主动把对的听成错的 —— 所以只放"确定会出现的专有名词"。
+
+### 20.4 验证
+
+| 手段 | 结果 |
+|---|---|
+| `test/local-funasr-provider.ts` | 39 → **57 断言**：热词进/不进 spec、whisper 不带该字段、清洗规则（去重/截断/坏表）、**缓存键三连**（没热词时与旧实现逐字节相同 / 带热词时变了 / 空指纹不留空槽位） |
+| `test/config-checks.ts` | 默认开启、上限为正；界面开关存在 + **被绑上** + 会回写 patch；示例配置有该段 |
+| 真机 A/B | 见上表（零费用） |
+| `npm run verify` | 37 个套件全绿 |
+
+### 20.5 顺带修掉：PowerShell 改配置文件会写入 BOM
+
+用 PowerShell 的 `Set-Content -Encoding UTF8` 往 `config.json` 插两行，它（Windows
+PowerShell 5.1）写成了 **UTF-8 with BOM**，而 `loadConfig` 是裸 `JSON.parse`
+→ `Unexpected token '﻿'`，**服务启动即挂**。这类事故的特点是"上一步看着成功了"。
+
+现在 `test/config-checks.ts` §5 静态钉住：`config.json` / `config.example.json` /
+`package.json` / `tsconfig.json` / `public/ui.html` / 代表性 `src/*.ts` 一律**不许有 BOM**，
+而 `launcher.ps1` **必须**有 BOM（Windows PowerShell 5.1 的编码要求，README 有专章）。
+凡是要改项目里的文本文件，一律用 Node（`fs.writeFileSync(p, s, 'utf8')`）而不是 shell 重定向。
+
+
 

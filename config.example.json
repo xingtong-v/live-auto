@@ -75,6 +75,21 @@
       "language": "zh",
       "threads": 8,
       "extraArgs": []
+    },
+    "localFunasr": {
+      "pythonPath": "",
+      "model": "FunAudioLLM/Fun-ASR-Nano-2512",
+      "hub": "ms",
+      "device": "auto",
+      "engine": "auto",
+      "maxCharsPerCue": 18,
+      "minCueDur": 0.6,
+      "timestamps": true,
+      "hotwordsEnabled": true,
+      "hotwordsMax": 80,
+      "chunkMinutes": 360,
+      "parallel": 1,
+      "timeoutSec": 14400
     }
   },
 

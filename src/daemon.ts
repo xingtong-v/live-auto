@@ -56,7 +56,7 @@ import {
 import { analyzeDanmaku } from './danmaku.ts';
 import { mergeDanmakuXmlFiles, pairSegmentDanmaku, chooseDanmaku } from './danmaku-merge.ts';
 import { findSiblingDanmaku } from './recordings.ts';
-import { GlossaryStore, correctTranscript } from './glossary.ts';
+import { GlossaryStore, correctTranscript, hotWordList } from './glossary.ts';
 import { TRASH_DIR, listTrash, moveToTrash, purgeTrash, restoreFromTrash, trashStats } from './trash.ts';
 import type {
   ArchiveItem,
@@ -243,6 +243,20 @@ export class Orchestrator {
       cache: new AsrCache(resolveDataPath(cfg.asr.cacheDir), this.logger),
       // CLI --local-asr：本次运行强制走本地识别（不改配置、不留副作用）
       ...(this.opts.asrProvider ? { provider: this.opts.asrProvider } : {}),
+      /* 术语表 → ASR 热词（只有本地 Fun-ASR 用得上）。
+         传**函数**而不是数组：术语表是可热改的文件，读表时机应当是"每次组装 ASR 参数"，
+         而不是"服务启动那一刻" —— 否则用户改完词表得重启才生效。
+         清洗/截断口径统一在 hotWordList() 里，这里只管把配置上限带过去；
+         有词被丢掉时说一声（否则用户会以为"我明明写了却没生效"）。 */
+      hotwords: () => {
+        const { words, dropped } = hotWordList(this.glossary.load(), { max: this.config.asr.localFunasr.hotwordsMax });
+        if (dropped > 0) {
+          this.logger.warn(`术语表里有 ${dropped} 个词没能作为热词传入（超长 / 超上限 ${this.config.asr.localFunasr.hotwordsMax}）`, {
+            data: { used: words.length, dropped },
+          });
+        }
+        return words;
+      },
     });
     this.publisher = new Publisher({ client: this.client, config: cfg, ledger: this.ledger, logger: this.logger });
     this.alerter = new DefaultAlerter({ config: cfg.alert, logger: this.logger });

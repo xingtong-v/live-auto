@@ -154,6 +154,18 @@ export interface AsrConfig {
     /** 是否要字级时间戳（关掉会退化成 VAD 段粒度，时间戳偏差从 ±0.2s 恶化到 ±2s） */
     timestamps: boolean;
     /**
+     * 是否把**术语表**当热词喂给 Fun-ASR（它原生支持 `hotwords`，其它 provider 不具备）。
+     *
+     * 为什么默认开：转写错字的两个消费者（选片 LLM、标题/标签生成）里，
+     * 专有名词错得最扎眼；而热词是**零新依赖、零显存、零幻觉风险**的一档提升 ——
+     * 不改模型、不改流程，只是把用户已经在维护的词表顺路带过去
+     * （此前 `tools/local-asr/transcribe-funasr.py` 一直收得到这个字段，
+     * 而 TS 侧从来没传过：能力在，线没接）。
+     */
+    hotwordsEnabled: boolean;
+    /** 最多传多少个热词（热词不是越多越好：太多会把解码带偏，且拖慢） */
+    hotwordsMax: number;
+    /**
      * 每块多长（分钟）。Fun-ASR 的模型加载约 96 秒是**固定成本**，所以默认取很大的值
      * （360 = 6 小时，普通录播一场就是**一块**），避免重复加载。
      */
@@ -729,6 +741,9 @@ function builtinDefaults(): AppConfig {
         maxCharsPerCue: 18,
         minCueDur: 0.6,
         timestamps: true,
+        // 术语表 → ASR 热词：能力一直在执行器里，TS 侧此前没接线（见 asr.ts）
+        hotwordsEnabled: true,
+        hotwordsMax: 80,
         chunkMinutes: 360,
         parallel: 1,
         timeoutSec: 4 * 3600,

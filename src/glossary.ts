@@ -12,11 +12,11 @@
  *
  * ## 为什么不做「热词直传 ASR」
  *
- * 查过基础设施的实际契约：`POST /ai/subtitle` 的请求体只有
+ * ⚠️ 这一段说的是**云端**那条路。查过基础设施的实际契约：`POST /ai/subtitle` 的请求体只有
  * `file / modelId / startTime / endTime / offset / song` 六个字段
  * （在 biliLive-tools 的 app.asar 里核对过 `subtitleRecognize` 的实现），
  * 既没有 `hotWord` 也没有 `vocabulary` 参数，整个 ASR 链路里搜不到任何热词相关字段。
- * 修改 biliLive-tools 是硬约束 #1 明确禁止的，所以**热词不能直传**。
+ * 修改 biliLive-tools 是硬约束 #1 明确禁止的，所以**云端热词不能直传**。
  *
  * 于是这里走两条等效但可控的路：
  *   1. **转写后确定性纠错**（`replacements`）：把已知的错听词直接替换成正确写法。
@@ -24,8 +24,12 @@
  *   2. **注入 LLM 提示词**（`terms` / `anchors`）：让选片与起标题的模型知道这些词是专有名词，
  *      不要改写、不要翻译、不要当成错别字"修正"。
  *
- * 另外保留 `hotWordsText()`：万一以后换成支持热词的 ASR（本地 faster-whisper 的
- * `initial_prompt`、阿里云百炼控制台的定制热词），可以一键复制这段文本直接用。
+ * ★ 但**本地**那条路可以直传，而且这条线此前一直没接上（2026-09-24 补上）：
+ *   `tools/local-asr/transcribe-funasr.py` 的 spec 里本来就有 `hotwords`，
+ *   Fun-ASR-Nano 的 `generate(hotwords=[...])` 是原生参数 —— 也就是说
+ *   "能力在、线没接"。现在 `asr.localFunasr.hotwordsEnabled` 默认开启，
+ *   由 `hotWordList()` 把本表摊平成数组传给它；`hotWordsText()` 仍保留给
+ *   "换成别的支持热词的 ASR 时一键复制"这个用途。
  *
  * ## 为什么单独一个文件而不是塞进 config.json
  *
@@ -288,6 +292,51 @@ export function renderGlossaryForPrompt(glossary: Glossary, opts: { maxTerms?: n
 export function hotWordsText(glossary: Glossary): { perLine: string; commaSeparated: string } {
   const all = [...glossary.anchors, ...glossary.terms];
   return { perLine: all.join('\n'), commaSeparated: all.join('，') };
+}
+
+/**
+ * 术语表 → **ASR 热词数组**（Fun-ASR 的 `hotwords` 参数收的就是字符串数组）。
+ *
+ * 与 `hotWordsText()` 同源（anchors + terms），但这里做的是"喂给模型"而不是"给人看"，
+ * 所以要多几道清洗 —— 这些规则都是为了让热词**只帮忙、不添乱**：
+ *
+ *  - 去首尾空白、丢掉空串：空热词会让模型的提示里出现空条目。
+ *  - 丢掉过长条目（>20 字）：热词是"词"，一条 40 字的句子塞进去只会稀释其它词；
+ *    长句本来就该由术语表纠错（`replacements`）处理。
+ *  - 去重（大小写与全半角无关）：`anchors` 和 `terms` 里同一个词出现两次很常见。
+ *  - 按 `max` 截断：热词不是越多越好 —— 太多会把解码带偏、也拖慢推理；
+ *    截断时**先 anchors 后 terms**（主播名/嘉宾名错得最显眼），并如实返回被截掉的数量。
+ *
+ * 返回 `{ words, dropped }`：`dropped > 0` 时调用方要记一条日志，
+ * 免得用户以为"我词表里明明有它，为什么没生效"。
+ */
+export function hotWordList(glossary: Glossary, opts: { max?: number } = {}): { words: string[]; dropped: number } {
+  const max = Math.max(0, opts.max ?? 80);
+  /* 容错：`data/glossary.json` 是用户可以手改的文件，缺字段/写成 null 都可能。
+     这条路径通往 ASR，**不能因为词表长得不对就把转写搞崩**（测试当场抓到过：
+     传 `{}` 直接 TypeError: glossary.anchors is not iterable）。 */
+  const anchors = Array.isArray(glossary?.anchors) ? glossary.anchors : [];
+  const terms = Array.isArray(glossary?.terms) ? glossary.terms : [];
+  const seen = new Set<string>();
+  const words: string[] = [];
+  let dropped = 0;
+  for (const raw of [...anchors, ...terms]) {
+    const w = String(raw ?? '').trim();
+    if (!w || w.length > 20) {
+      if (w) dropped++;
+      continue;
+    }
+    // 归一化只用于判重，传出去的仍是原样（大小写/全角形态由用户决定）
+    const key = w.normalize('NFKC').toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (words.length >= max) {
+      dropped++;
+      continue;
+    }
+    words.push(w);
+  }
+  return { words, dropped };
 }
 
 /* ============================================================================

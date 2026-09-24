@@ -262,6 +262,12 @@ export interface AsrCacheEntry {
     startTime: number;
     endTime: number;
     offset: number;
+    /**
+     * 热词指纹（只有本地 Fun-ASR 会有）。
+     * 它**进了缓存键**，所以换了热词就会重新转写；记在这里是为了排查
+     * "这条缓存是带热词跑出来的还是不带热词跑出来的"。
+     */
+    hotwords?: string;
   };
   srt: string;
   segments: TranscriptSegment[];

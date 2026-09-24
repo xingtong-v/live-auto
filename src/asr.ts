@@ -75,6 +75,12 @@ interface LocalAsrOptions {
   maxCharsPerCue?: number;
   minCueDur?: number;
   timestamps?: boolean;
+  /**
+   * 热词（只有 **Fun-ASR** 支持；whisper 的 `initial_prompt` 与云端 DashScope 定制热词
+   * 都还没接）。它是"零新依赖、零显存、零幻觉风险"的一档提升：不改模型也不改流程，
+   * 只是把用户已经在维护的术语表顺路带给模型 —— 而这条线此前一直没接。
+   */
+  hotwords?: string[];
 }
 
 /**
@@ -150,6 +156,9 @@ export function buildLocalAsrSpec(
       max_chars_per_cue: opts.maxCharsPerCue ?? 18,
       min_cue_dur: opts.minCueDur ?? 0.6,
       timestamps: opts.timestamps !== false,
+      /* 热词为空时**不写这个字段**：让 spec 干净，也便于在日志/测试里一眼看出
+         "这次到底带没带热词"（执行器那边 `spec.get("hotwords") or []` 本来就容错）。 */
+      ...(opts.hotwords && opts.hotwords.length > 0 ? { hotwords: opts.hotwords } : {}),
     };
   }
   return {
@@ -355,8 +364,19 @@ export function asrCacheKey(parts: {
   offset: number;
   /** 剪静音开启时把音频时间轴参数也纳入，避免与未剪静音的缓存混用 */
   trim?: string;
+  /**
+   * 热词指纹（只有本地 Fun-ASR 有）。
+   *
+   * ⚠️ 必须进键：热词会**实质改变输出**。不进键的话"打开/修改热词后重跑"会直接命中
+   * 旧缓存，用户看到的是"我改了设置却毫无变化" —— 本项目最忌讳的那种静默失效。
+   *
+   * ⚠️ 用**条件追加**而不是固定位置：固定加一个空槽位会让 hashKey 的输入数组变长，
+   * 于是**所有既有缓存键一起失效**（云端按小时计费，那是真金白银的重跑）。
+   * 这里只在有热词时追加，没热词时键与从前逐字节相同。
+   */
+  hotwords?: string;
 }): string {
-  return hashKey([
+  const base = [
     parts.videoFilePath,
     parts.videoFileSize,
     parts.videoFileUpdatedAt,
@@ -365,7 +385,9 @@ export function asrCacheKey(parts: {
     parts.endTime.toFixed(3),
     parts.offset.toFixed(3),
     parts.trim ?? '',
-  ]);
+  ];
+  if (parts.hotwords) base.push(`hw:${parts.hotwords}`);
+  return hashKey(base);
 }
 
 export class AsrCache {
@@ -648,6 +670,15 @@ export interface TranscribeDeps {
   cache?: AsrCache;
   /** 本次运行的 provider 覆盖（CLI `--local-asr`），不改配置、只影响本进程 */
   provider?: AppConfig['asr']['provider'];
+  /**
+   * 热词来源（**惰性**：每次组装本地 ASR 参数时才调一次）。
+   *
+   * 为什么是函数不是数组：术语表是可热改的文件（用户改完 `data/glossary.json`
+   * 下一场就该生效），而 Transcriber 是常驻对象 —— 传数组会把"启动那一刻的词表"冻住。
+   * 由调用方（Orchestrator）注入 `() => hotWordList(this.glossary.load()).words`，
+   * 这样读表、清洗、截断的口径只有一处。
+   */
+  hotwords?: () => string[];
 }
 
 export class Transcriber {
@@ -660,6 +691,8 @@ export class Transcriber {
    * 不改配置、不改文件，只影响这一个进程 —— 便于"试一次本地识别"而不留下副作用。
    */
   private providerOverride?: AppConfig['asr']['provider'];
+  /** 热词来源（惰性取值，见 TranscribeDeps.hotwords） */
+  private hotwordProvider?: () => string[];
 
   constructor(deps: TranscribeDeps) {
     this.client = deps.client;
@@ -667,6 +700,7 @@ export class Transcriber {
     this.logger = deps.logger ?? globalLog;
     this.cache = deps.cache ?? new AsrCache(deps.config.asr.cacheDir, this.logger);
     if (deps.provider) this.providerOverride = deps.provider;
+    if (deps.hotwords) this.hotwordProvider = deps.hotwords;
   }
 
   /** 配置热加载 */
@@ -747,6 +781,9 @@ export class Transcriber {
 
   private keyFor(w: WindowCall): string {
     const st = this.statOf(w.file);
+    /* 只有**真正会用热词的 provider** 才把指纹纳入键：
+       否则光是把术语表填上就会让云端/whisper 的既有缓存全部失配（那些缓存是花过钱的）。 */
+    const hw = this.provider === 'local-funasr' ? this.hotwordsFingerprint() : undefined;
     return asrCacheKey({
       videoFilePath: w.file,
       videoFileSize: st.size,
@@ -756,7 +793,15 @@ export class Transcriber {
       endTime: w.inFileEnd,
       offset: w.offset,
       trim: this.cfg.asr.silenceTrim.enabled ? `trim:${this.cfg.asr.silenceTrim.noiseDb}/${this.cfg.asr.silenceTrim.minSilenceSec}` : '',
+      ...(hw ? { hotwords: hw } : {}),
     });
+  }
+
+  /** 当前生效的热词指纹（排序后拼接，顺序变化不该导致缓存失效）；没热词时 undefined */
+  private hotwordsFingerprint(): string | undefined {
+    const words = this.resolveHotwords();
+    if (words.length === 0) return undefined;
+    return [...words].sort().join('|');
   }
 
   /** 文件属性缓存（同一文件多次查询只 stat 一次） */
@@ -844,6 +889,7 @@ export class Transcriber {
       );
     }
     if (!exists(scriptPath)) throw new Error(`本地 ASR 执行脚本缺失：${scriptPath}`);
+    const hotwords = this.resolveHotwords();
     return {
       engine: 'funasr',
       pythonPath,
@@ -860,8 +906,28 @@ export class Transcriber {
       maxCharsPerCue: f.maxCharsPerCue ?? 18,
       minCueDur: f.minCueDur ?? 0.6,
       timestamps: f.timestamps !== false,
+      ...(hotwords.length > 0 ? { hotwords } : {}),
       timeoutMs: Math.max(600, f.timeoutSec ?? 4 * 3600) * 1000,
     };
+  }
+
+  /**
+   * 取本次要用的热词（只有本地 Fun-ASR 用得上）。
+   *
+   * 三重保险，任何一步出问题都只是"这次没热词"，绝不能让转写因为热词而失败：
+   *  1. 配置关掉（`asr.localFunasr.hotwordsEnabled=false`）→ 空；
+   *  2. 没注入来源（例如单测/工具直接 new Transcriber）→ 空；
+   *  3. 读术语表抛错（文件被写坏）→ 空，并记一条 warn。
+   */
+  private resolveHotwords(): string[] {
+    if (this.cfg.asr.localFunasr.hotwordsEnabled === false) return [];
+    if (!this.hotwordProvider) return [];
+    try {
+      return this.hotwordProvider();
+    } catch (e) {
+      this.logger.warn(`读取热词失败，本次不带热词：${(e as Error).message}`);
+      return [];
+    }
   }
 
   /**
@@ -899,6 +965,15 @@ export class Transcriber {
           `${localOpts.engine === 'funasr' ? `，字级时间戳 ${localOpts.timestamps !== false ? '开' : '关'}` : ''}（不产生云端费用）`,
         { stage: 'TRANSCRIBING' },
       );
+      /* 热词要留痕：用户改完术语表最想知道的一件事就是"这次到底带没带进去"。
+         只报条数与前若干个，避免把整张词表刷进日志。 */
+      if (localOpts.hotwords?.length) {
+        const head = localOpts.hotwords.slice(0, 8).join('、');
+        log.info(`热词已注入（${localOpts.hotwords.length} 条，来自术语表）：${head}${localOpts.hotwords.length > 8 ? ' 等' : ''}`, {
+          stage: 'TRANSCRIBING',
+          data: { hotwords: localOpts.hotwords.length },
+        });
+      }
     }
 
     /* 并发：云端最多 2（对上游要克制）；本地 Fun-ASR 由实测决定 ——
@@ -943,6 +1018,9 @@ export class Transcriber {
     }
 
     let done = 0;
+    /* 热词指纹在整场里取一次：它既进缓存键，也写进缓存条目（见下）。
+       同一场里热词不会变，逐窗口重复读术语表是白费。 */
+    const hwFingerprint = this.provider === 'local-funasr' ? this.hotwordsFingerprint() : undefined;
     const results = await Promise.all(
       effectiveWindows.map((w) =>
         limit(async (): Promise<UnitResult> => {
@@ -1040,6 +1118,8 @@ export class Transcriber {
                   startTime: w.inFileStart,
                   endTime: w.inFileEnd,
                   offset: w.offset,
+                  // 留痕：这条缓存是带热词跑出来的（键里也有它，见 asrCacheKey）
+                  ...(hwFingerprint ? { hotwords: hwFingerprint } : {}),
                 },
                 srt: cacheSrt,
                 segments,

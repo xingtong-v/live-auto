@@ -2548,6 +2548,12 @@ async function openCfg() {
         <button class="switch sm ${c.asr.localFunasr.timestamps !== false ? 'on' : ''}" id="c_funasrTimestamps"></button>
         <span>${c.asr.localFunasr.timestamps !== false ? '开启（时间戳偏差 ±0.2s，推荐）' : '关闭（退化成 VAD 段粒度，偏差 ±2s）'}</span></div>
         <div class="hintline">开启后每句的时间取该句首字与末字的真实时刻（CTC 强制对齐），而不是整段的起止。</div></div>
+      <div class="field"><label>热词上限（术语表 → Fun-ASR）</label><input class="inp num" id="c_funasrHotwordsMax" value="${c.asr.localFunasr.hotwordsMax ?? 80}">
+        <div class="hintline">热词不是越多越好：超上限的部分会被丢掉（日志里会说明丢了几个）</div></div>
+      <div class="field full"><label>把术语表当热词喂给 Fun-ASR</label><div class="inline-switch">
+        <button class="switch sm ${c.asr.localFunasr.hotwordsEnabled !== false ? 'on' : ''}" id="c_funasrHotwords"></button>
+        <span>${c.asr.localFunasr.hotwordsEnabled !== false ? '开启（推荐）' : '关闭'}</span></div>
+        <div class="hintline">术语表（<span class="mono-sm">data/glossary.json</span> 的 anchors + terms）会作为 <span class="mono-sm">hotwords</span> 传给本地 Fun-ASR —— <b>只有它支持热词</b>（云端 biliLive-tools 的 /ai/subtitle 不透传热词）。同素材实测：目标词命中 5→8 次、相对云端基准的字错率 5.47%→5.03%，耗时无变化。改了术语表要**重新转写**才生效（缓存键含热词指纹，会自动重算，不会拿旧结果糊弄）。</div></div>
       <div class="field full"><label>ASR 分段时长（分钟）</label><input class="inp num" id="c_asrSegmentMinutes" value="${c.asr.segmentMinutes}">
         <div class="hintline">/ai/subtitle 是同步阻塞接口，4 小时全片一次调用会挂 20–40 分钟；必须分段且 startTime/endTime 成对（硬约束 #7）。本地 Fun-ASR 会自动忽略它（整文件一次调用，省掉重复加载模型）。</div></div>
       <div class="field"><label>ASR 单价（元/小时，用于估算）</label><input class="inp num" id="c_asrPrice" value="${c.asr.unitPricePerHour}"></div>
@@ -2816,6 +2822,10 @@ function bindCfg() {
   const tgl = (id, cb) => { const el = $(id); if (el) el.onclick = () => { const on = el.classList.toggle('on'); cb(on, el); }; };
   tgl('#c_burnDanmaku', (on, el) => el.nextElementSibling.textContent = on ? '开启（原生弹幕，无错字风险）' : '关闭（切片画面无弹幕）');
   tgl('#c_burnSubtitles', (on, el) => el.nextElementSibling.textContent = on ? '开启（转写已经花过钱，不烧等于白花）' : '关闭（画面只有弹幕）');
+  /* 热词开关：文案要跟着状态变 —— 关掉时用户唯一能看到的反馈就是这行字，
+     否则"点了没反应"会被当成按钮坏了（这个坑本项目在其它开关上踩过）。 */
+  tgl('#c_funasrHotwords', (on, el) => el.nextElementSibling.textContent = on ? '开启（推荐）' : '关闭');
+  tgl('#c_funasrTimestamps', (on, el) => el.nextElementSibling.textContent = on ? '开启（时间戳偏差 ±0.2s，推荐）' : '关闭（退化成 VAD 段粒度，偏差 ±2s）');
   { const cp = $('#btnCopyHotWords'); if (cp) cp.onclick = () => copyText(hotWordsFromForm().perLine, '热词（一行一个）'); }
   { const cp = $('#btnCopyHotWords2'); if (cp) cp.onclick = () => copyText(hotWordsFromForm().commaSeparated, '热词（逗号分隔）'); }
   // 分P 标题模板实时预览：模板写错（变量拼错）肉眼很难发现，这里直接渲染出来
@@ -3137,6 +3147,10 @@ async function saveCfg(force) {
         engine: val('#c_funasrEngine'),
         maxCharsPerCue: num('#c_funasrMaxChars'),
         timestamps: on('#c_funasrTimestamps'),
+        /* 这两项必须一起回写：界面的 patch 是**部分字段**深合并，
+           漏掉就等于"界面上看着还开着、存下去却丢了"，用户下次看配置会发现它自己关了。 */
+        hotwordsEnabled: on('#c_funasrHotwords'),
+        hotwordsMax: num('#c_funasrHotwordsMax'),
       },
     },
     llm: {

@@ -12,8 +12,10 @@
  *
  * 用法：node test/local-funasr-provider.ts
  */
-import { buildLocalAsrSpec, mergeWindowsPerFile, parseLocalAsrOutput } from '../src/asr.ts';
+import { asrCacheKey, buildLocalAsrSpec, mergeWindowsPerFile, parseLocalAsrOutput } from '../src/asr.ts';
 import type { WindowCall } from '../src/asr.ts';
+import { hotWordList } from '../src/glossary.ts';
+import { hashKey } from '../src/util.ts';
 
 let pass = 0;
 let fail = 0;
@@ -106,6 +108,83 @@ section('1. spec 组装（两套字段不能串）');
   // timestamps=false 时要显式关掉（否则时间戳退化而用户不知道为什么）
   const off = buildLocalAsrSpec({ ...funasrOpts, timestamps: false }, { file: 'C:/a.flv', startTime: 0, endTime: 60, offset: 0 });
   eq('可以显式关掉字级时间戳', off['timestamps'], false);
+}
+
+/* ============ 1b. 热词：能力一直在执行器里，TS 侧此前没接线（2026-09-24 补上） ============
+ * 这条线断了很久的表现很隐蔽：`transcribe-funasr.py` 早就读 `spec["hotwords"]` 并传给
+ * `generate(hotwords=…)`，而 TS 侧**从来不写这个字段** —— 于是"支持热词"只停在文档里，
+ * 用户改了 `data/glossary.json` 也毫无变化，且没有任何报错。 */
+section('1b. 热词（术语表 → Fun-ASR 的 hotwords）');
+{
+  const withHw = buildLocalAsrSpec(
+    { ...funasrOpts, hotwords: ['乙主播', '甲主播', '闪身步'] },
+    { file: 'C:/a.flv', startTime: 0, endTime: 300, offset: 0 },
+  );
+  eq('热词进了 spec', JSON.stringify(withHw['hotwords']), JSON.stringify(['乙主播', '甲主播', '闪身步']));
+
+  const noHw = buildLocalAsrSpec(funasrOpts, { file: 'C:/a.flv', startTime: 0, endTime: 300, offset: 0 });
+  ok(!('hotwords' in noHw), '没热词时**不写这个字段**（便于一眼看出这次带没带）', JSON.stringify(noHw['hotwords']));
+
+  const emptyHw = buildLocalAsrSpec({ ...funasrOpts, hotwords: [] }, { file: 'C:/a.flv', startTime: 0, endTime: 300, offset: 0 });
+  ok(!('hotwords' in emptyHw), '空数组同样不写（执行器会当没有，但 spec 要保持干净）');
+
+  const whisperHw = buildLocalAsrSpec(
+    { ...whisperOpts, hotwords: ['乙主播'] },
+    { file: 'C:/a.flv', startTime: 0, endTime: 300, offset: 0 },
+  );
+  ok(!('hotwords' in whisperHw), 'whisper 的 spec 不带 hotwords（它没这个参数，串了会报错）');
+
+  /* 术语表 → 热词数组的清洗规则（喂给模型，不是给人看） */
+  const g = {
+    version: 1,
+    anchors: ['乙主播', '甲主播', '乙主播'],
+    terms: ['闪身步', '后半夜后悔时代', '这一条特别特别长的句子不该被当成热词传进去因为热词是词不是句子', ''],
+    replacements: [],
+  } as unknown as Parameters<typeof hotWordList>[0];
+  const full = hotWordList(g, { max: 80 });
+  eq('去重（乙主播只出现一次）', full.words.filter((x) => x === '乙主播').length, 1);
+  eq('顺序：anchors 在前（主播名错得最显眼）', full.words[0], '乙主播');
+  eq('空串被丢掉', full.words.includes(''), false);
+  eq('过长条目被丢掉（热词是词不是句子）', full.words.some((x) => x.length > 20), false);
+  eq('被丢掉的个数如实返回', full.dropped, 1);
+  const capped = hotWordList(g, { max: 2 });
+  eq('超上限时按 max 截断', capped.words.length, 2);
+  eq('截断的部分也计入 dropped', capped.dropped, 3);
+  eq('max=0 时一个都不传（等价于关掉）', hotWordList(g, { max: 0 }).words.length, 0);
+  eq('坏表（缺字段）不抛异常', hotWordList({} as unknown as Parameters<typeof hotWordList>[0]).words.length, 0);
+}
+
+/* ============ 1c. 热词必须进缓存键（否则"改了设置毫无变化"） ============
+ * 这是本次接线最容易漏、后果最隐蔽的一处：缓存键若不含热词，
+ * 用户打开热词后重跑会**直接命中旧缓存**，看到的还是老转写 —— 与"功能没做"无法区分。 */
+section('1c. 热词与 ASR 缓存键');
+{
+  const parts = {
+    videoFilePath: 'C:/rec/a.flv',
+    videoFileSize: 1024,
+    videoFileUpdatedAt: 1700000000000,
+    modelId: '',
+    startTime: 0,
+    endTime: 300,
+    offset: 0,
+  };
+  const legacy = hashKey([
+    parts.videoFilePath,
+    parts.videoFileSize,
+    parts.videoFileUpdatedAt,
+    parts.modelId || 'default',
+    parts.startTime.toFixed(3),
+    parts.endTime.toFixed(3),
+    parts.offset.toFixed(3),
+    '',
+  ]);
+  eq('没热词时键与旧实现**逐字节相同**（既有缓存不许失效）', asrCacheKey(parts), legacy);
+  ok(asrCacheKey({ ...parts, hotwords: '乙主播|甲主播' }) !== legacy, '带热词时键变了（不会命中旧缓存）');
+  ok(
+    asrCacheKey({ ...parts, hotwords: '乙主播|甲主播' }) !== asrCacheKey({ ...parts, hotwords: '乙主播' }),
+    '热词不同 → 键不同（改了词表会重新转写）',
+  );
+  ok(asrCacheKey({ ...parts, hotwords: '' }) === legacy, '空指纹等价于没热词（不留空槽位）');
 }
 
 /* ================= 2. 输出解析 ================= */

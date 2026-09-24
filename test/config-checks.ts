@@ -11,8 +11,11 @@
  *
  * 用法：node test/config-checks.ts
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { checkAfterUploadDelete } from '../src/cleanup.ts';
 import { loadConfig } from '../src/config.ts';
+import { ROOT_DIR } from '../src/util.ts';
 
 let pass = 0;
 let fail = 0;
@@ -27,6 +30,9 @@ function ok(name: string, cond: boolean, detail?: string): void {
     failures.push(`${name}${detail ? ` :: ${detail}` : ''}`);
     console.log(`  \x1b[31m✗ ${name}\x1b[0m${detail ? ` :: ${detail}` : ''}`);
   }
+}
+function eq<T>(name: string, actual: T, expected: T): void {
+  ok(name, actual === expected, actual === expected ? undefined : `期望 ${String(expected)}，实际 ${String(actual)}`);
 }
 function section(t: string): void {
   console.log(`\n\x1b[1m${t}\x1b[0m`);
@@ -100,6 +106,59 @@ section('3. 边界与健壮性');
   // 字段名大小写不敏感（不同版本的键名风格不一致）
   const upper = checkAfterUploadDelete(cfg, { Webhook: { AfterUploadDeletAction: 'delete' } });
   ok('字段名大小写不敏感', !upper.ok, upper.message);
+}
+
+section('4. 热词配置（术语表 → 本地 Fun-ASR）与界面接线');
+{
+  /* 默认必须**开着**：热词是零成本、零风险的一档提升，默认关掉等于用户永远用不上
+     （而这条线此前正是"能力在、没接线"的典型）。 */
+  const d = loadConfig().config.asr.localFunasr;
+  ok('默认开启热词', d.hotwordsEnabled !== false, String(d.hotwordsEnabled));
+  ok('默认热词上限是正整数', Number.isFinite(d.hotwordsMax) && d.hotwordsMax > 0, String(d.hotwordsMax));
+
+  /* 界面接线：开关存在、**被绑上**、并且会被回写进配置 patch。
+     "开关没绑"在本项目真实发生过（点了没反应、保存下去永远是 false），
+     所以这三件事都要静态钉住，而不是靠肉眼看页面。 */
+  const html = fs.readFileSync(path.join(ROOT_DIR, 'public', 'ui.html'), 'utf8');
+  ok('配置面板有热词开关', /id="c_funasrHotwords"/.test(html));
+  ok('有热词上限输入框', /id="c_funasrHotwordsMax"/.test(html));
+  ok('热词开关被绑上（tgl 逐个绑定）', /tgl\('#c_funasrHotwords'/.test(html));
+  ok('时间戳开关也被绑上（此前漏绑，点了没反应）', /tgl\('#c_funasrTimestamps'/.test(html));
+  ok('两个字段都会回写进配置 patch', /hotwordsEnabled: on\('#c_funasrHotwords'\)/.test(html) && /hotwordsMax: num\('#c_funasrHotwordsMax'\)/.test(html));
+  ok('界面写清了"只有本地 Fun-ASR 支持热词"', /只有它支持热词|只有本地 Fun-ASR/.test(html));
+
+  /* 示例配置要让新用户看得见这两个开关 */
+  const example = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'config.example.json'), 'utf8')) as {
+    asr?: { localFunasr?: { hotwordsEnabled?: boolean; hotwordsMax?: number } };
+  };
+  eq('config.example.json 里有 localFunasr 段', typeof example.asr?.localFunasr, 'object');
+  eq('示例里默认开启热词', example.asr?.localFunasr?.hotwordsEnabled, true);
+}
+
+section('5. 不许有 BOM（本次真踩：PowerShell 改配置时加上了 BOM，服务直接起不来）');
+{
+  /* 实测事故：用 PowerShell 的 `Set-Content -Encoding UTF8` 往 config.json 插两行，
+     它（Windows PowerShell 5.1）会写成 **UTF-8 with BOM**，而 `loadConfig` 是裸
+     `JSON.parse` → 报 `Unexpected token '﻿'`，服务启动即挂。
+     这类事故的特点是"上一步看着成功了"，所以要用测试钉住。
+     ⚠️ `.ps1` 是**必须**带 BOM 的（见 README 的编码陷阱），这里要排除。 */
+  const check = [
+    'config.json',
+    'config.example.json',
+    'package.json',
+    'tsconfig.json',
+    'public/ui.html',
+    'src/config.ts',
+    'src/asr.ts',
+  ];
+  for (const rel of check) {
+    const buf = fs.readFileSync(path.join(ROOT_DIR, rel));
+    const bom = buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf;
+    ok(`${rel} 没有 BOM`, !bom, bom ? '开头是 EF BB BF —— 用编辑器另存为「UTF-8 无 BOM」' : undefined);
+  }
+  // .ps1 反过来：必须带 BOM，否则中文注释在 PowerShell 5.1 下会乱码/报错
+  const ps1 = fs.readFileSync(path.join(ROOT_DIR, 'launcher.ps1'));
+  ok('launcher.ps1 **必须**带 BOM（Windows PowerShell 5.1 的编码要求）', ps1[0] === 0xef && ps1[1] === 0xbb && ps1[2] === 0xbf);
 }
 
 console.log('\n' + '─'.repeat(74));
