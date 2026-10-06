@@ -2631,7 +2631,18 @@ toast 里没有 `undefined`）。**这两个缺陷只有截图/真机才看得�
    顺带发现：`test/e2e-offline.ts` 那个断言原本拿**仓库真实 config.json** 去比**用例自己的夹具配置**，
    夹具是 1、真配置是 0 时就会报"期望 0，实际 1"的假失败 —— 改成比夹具自己的值。
    （另：biliLive-tools 的投稿预设 `default` 是 `is_only_self=0`（公开，与我们的选择一致），
-   而 `甲主播` 那个预设仍是 1 —— 两个主播可见性不一致，已就此单独问用户。）
+   而 `甲主播` 那个预设原本是 1 —— 两个主播可见性不一致，已问用户，用户选择**一起改成公开**，见第 3 条。）
+3. **biliLive-tools 投稿预设已对齐成公开**：`node tools/blt-preset-set.ts --set is_only_self=0
+   --preset xcz9r0pf7t`（原文件自动备份为 `presets.json.backup-<时间戳>`），复核两个预设现在都是 0。
+   **不需要重启 biliLive-tools** —— 直接读 app.asar 求证：`class CommonPreset` 的
+   `async get(id)` 走 `await this.list()`，而 `list()` 每次都 `await fs.readJSON(presetsPath)`，
+   用的时候现读盘，没有内存缓存（biliLive-tools 当时正开着，这一点必须求证而不是猜）。
+   顺带发现一个**死配置项**：`publish.uploadPresetId` 目前没有任何作用 ——
+   `src/publish.ts` 里是 `void input.uploadPresetId`（投稿 config 由我们自己拼好整份传过去），
+   界面上也没有它的入口。留着不碍事，但别指望改它会有反应。
+   另一个顺手修掉的工具缺陷：`tools/asar-grep.ts` 里写死的 asar 路径带真实用户名，
+   被 `tools/sanitize-for-public.ts` 脱敏成 `C:/Users/demo/...` 之后就永远 ENOENT ——
+   现在按 `BLT_ASAR` 环境变量 → `%USERPROFILE%\Desktop\...` → `demo` 路径依次找。
 2. **回收站已按用户指示清空**：27 个条目 / 7.75 GB（`POST /api/trash/purge {confirm:true}` →
    `已彻底删除 27 项，释放 7.8 GB`），`data/trash` 现在 0 个文件，
    D 盘余量 324.3 GB → **332.0 GB**。⚠️ 注意 `GET /api/trash` 返回的字段名是
