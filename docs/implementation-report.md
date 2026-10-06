@@ -2977,3 +2977,85 @@ CDN 那头关流修不了，但"一场直播被拆成 N 个任务、N 次转写�
 回归：`recordings 107`、`stitch 36`、`watch 79`、`config 34`、`monitor-panel 183`、
 `pending-delete 115` 全绿；`typecheck` 干净。真实清单已在上面 28.3 复核。
 
+
+## 28. 「还是有自启现象」——`-WindowStyle Hidden` 挡不住 Windows Terminal；顺带查到一次真崩溃（2026-10-07）
+
+用户在两处修好后又报：**「还是有自启现象」**。这次没有猜，装了个**顶层窗口监视器**
+（`EnumWindows`，每 120ms 扫一遍，记录新出现的控制台类窗口 + 属主进程），守着计划任务那一跳看。
+
+### 28.1 抓到的现行
+
+```
+01:07:48.827  PseudoConsoleWindow          state=**visible**  owner=powershell.exe -NoProfile -NoLogo -NonInteractive -WindowStyle Hidden …
+01:07:48.924  CASCADIA_HOSTING_WINDOW_CLASS state=**visible**  title="…\powershell.exe"
+```
+
+**根因**：这台机器的**默认终端是 Windows Terminal**。控制台窗口由 `WindowsTerminal.exe` 创建，
+`-WindowStyle Hidden`（即 STARTUPINFO 的 `SW_HIDE`）在 WT 下**不生效** ⇒ 每 10 分钟闪一个终端窗口。
+路径上试过但都不行：wscript/mshta 垫片（子进程照样交给默认终端）；
+S4U（"不管用户是否登录都运行"，会话 0 里结构上不可能有窗口）—— `Register-ScheduledTask`
+报 **Access is denied**（需要"作为批处理作业登录"权限，本脚本刻意不要求管理员）。
+
+**解法**：`conhost.exe --headless`（本机 10.0.26200 实测支持，退出码 0）。任务动作变成：
+
+```
+conhost.exe --headless "powershell.exe" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass `
+  -File "…\tools\ensure-service.ps1" -Port 3000
+```
+
+改完连续观测两跳：
+
+```
+01:13:13.731  PseudoConsoleWindow  state=hidden  owner=powershell.exe …
+01:23:14.717  PseudoConsoleWindow  state=hidden  owner=powershell.exe …
+```
+
+**只有隐藏窗口，屏幕上什么都不出现。**（同一时段 01:21:48 还抓到一次**用户自己双击桌面快捷方式**——
+那是 `run.cmd` 起的交互式启动器，标题「直播切片助手 · live_auto」，可见窗口是**手动路径的设计**，不是自启。）
+
+### 28.2 顺带查到的第二件事：服务真的崩过一次（Node 堆 OOM）
+
+看 `data/logs/service-error.log` 才发现 00:21:59 那个实例在 **01:17:03 直接 abort** 了：
+
+```
+FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory
+```
+
+时间线：00:54:03 开始转写（6 小时窗口）→ 01:16:40 转写完成（1151 条，868.7s）→ **23 秒后进程崩**。
+崩了之后是**用户自己点桌面快捷方式**（01:21:48）把它拉回来的；否则看门狗会在 10 分钟内静默拉起。
+所以"看起来在重启"确实还有第二个来源：**崩溃 + 拉起**，而不是窗口。
+
+已排除的：弹幕解析（那场 XML 只有 0.28MB，`loadDanmaku` 的 64MB 上限根本没碰到）、
+轮询泄漏（连续打 40 次 `/api/monitor` + `/api/tasks`，工作集稳定在 114MB，单次 40ms）。
+**没定论**：那 23 秒里是"转写产物落盘 → 分析"这段，缺证据（当时既没有内存曲线也没有崩溃报告）。
+
+### 28.3 为此加的取证与余量（三处启动路径必须一致）
+
+| 内容 | 位置 |
+|---|---|
+| `--max-old-space-size=8192`（默认上限实测约 4.3GB，机器有 32GB 没用上；这是余量不是修复） | `tools/ensure-service.ps1`、`launcher.ps1`、`tools/restart-service.ts` |
+| `--report-on-fatalerror` + `--report-directory=data\logs`（下次 OOM 会留诊断报告：堆构成、原生栈、环境；已用 `--max-old-space-size=40` 的 OOM 实测过会写 21KB 报告） | 同上 |
+| 每 5 分钟一行内存曲线（`内存：RSS … · 堆 …/…MB`），超过堆上限 60% 升级为 warn 并带队列状态 | `src/daemon.ts` |
+| `/api/health` 新增 `memory: {rssMB, heapUsedMB, heapTotalMB, heapLimitMB, externalMB}` | `src/daemon.ts` |
+
+实测（重启后）：`{"rssMB":131,"heapUsedMB":32,"heapTotalMB":99,"heapLimitMB":8384,"externalMB":13}`，
+日志里能看到 `内存：RSS 119MB · 堆 43/8384MB（启动基线）` —— 8192 的堆上限确实生效了。
+
+### 28.4 验证
+
+| 手段 | 结果 |
+|---|---|
+| 顶层窗口监视器（`data\watch-windows.ps1`，EnumWindows） | 改前抓到 `state=visible` 的 WT 窗口；改后**两跳都只有 hidden** |
+| `Start-ScheduledTask` 手动触发 | 服务 pid 不变、`LastTaskResult=0`、watchdog.log 无新增（静默通过） |
+| 杀掉服务 → `Start-ScheduledTask` | 看门狗用**新参数**把它拉回来（命令行核对含 `--max-old-space-size=8192 --report-on-fatalerror`） |
+| `test/service-watchdog.ts` | 33 → **52 项**：新增 ①b（三条启动路径的参数一致性，9 项）+ 内存可观测性（`/api/health` 字段、堆上限 >4300MB、日志有基线行） |
+| 回归 | `monitor-panel` 182、`performance-reflux` 80、`config-checks` 34、`smoke` 66 全绿 |
+
+### 28.5 两个反复踩到的坑（已进套件）
+
+1. **`.ps1` 丢 BOM**：编辑工具重写文件会把 UTF-8 BOM 去掉，PowerShell 5.1 随即按 ANSI(936) 解码，
+   中文变乱码并报 `Unexpected token`。套件②现在逐个文件检查 BOM + 抽检语法 ——
+   这一轮它当场抓到了我自己刚改坏的 `ensure-service.ps1`。
+2. **按命令行特征找进程会匹配到自己**：用 `CommandLine -like '*STANDIN*'` 清理替身进程时，
+   先杀掉的是**我自己这条命令的宿主**（它的命令行里就有 `STANDIN`），于是 harness 连报三次
+   `Windows Job runner exited …`。正确做法：把匹配串拼出来（`'setInter' + 'val('`），或用 `ParentProcessId` 限定。

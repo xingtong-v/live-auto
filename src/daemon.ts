@@ -16,6 +16,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import v8 from 'node:v8';
 import { BiliLiveClient } from './api.ts';
 import type { AppConfig } from './config.ts';
 import { ConfigStore, resolveDataPath } from './config.ts';
@@ -515,6 +516,39 @@ export class Orchestrator {
       if (rec.checked) this.logger.info(`崩溃恢复：检查 ${rec.checked} 个卡住的切片，确认 ${rec.confirmed} 个已发布`, { data: rec.notes });
     } catch (e) {
       this.logger.warn('崩溃恢复检查失败（不阻塞启动）', { data: { error: (e as Error).message } });
+    }
+
+    /* 内存看门狗：每 5 分钟写一行内存曲线，逼近堆上限时升级为 warn（并带上当前任务/阶段）。
+       背景：2026-10-07 01:17:03 服务因 `JavaScript heap out of memory` **直接崩掉**
+       （进程 abort，不是 JS 异常），事后无从归因 —— 日志里只有崩溃本身，没有内存曲线。
+       现在：① 这一行给出爬升曲线；② 启动参数带 --report-on-fatalerror，真崩了会留诊断报告。
+       定时器 unref()：不阻止进程退出（否则 CLI 命令会挂住不退）。 */
+    const memTimer = setInterval(() => {
+      try {
+        const m = process.memoryUsage();
+        const limit = v8HeapLimitBytes();
+        const rssMB = Math.round(m.rss / 1048576);
+        const usedMB = Math.round(m.heapUsed / 1048576);
+        const limitMB = Math.round(limit / 1048576);
+        const line = `内存：RSS ${rssMB}MB · 堆 ${usedMB}/${limitMB}MB · external ${Math.round(m.external / 1048576)}MB`;
+        if (usedMB / limitMB > 0.6) {
+          this.logger.warn(
+            `${line} —— 已超过堆上限的 60%，留意是否有大对象泄漏（${this.busy ? '有任务在跑' : '当前空闲'}，队列 ${this.queue.length} 个）`,
+          );
+        } else {
+          this.logger.info(line);
+        }
+      } catch {
+        /* 内存日志失败绝不影响主流程 */
+      }
+    }, 5 * 60_000);
+    memTimer.unref?.();
+    // 启动时先记一条（能看到基线）
+    try {
+      const m0 = process.memoryUsage();
+      this.logger.info(`内存：RSS ${Math.round(m0.rss / 1048576)}MB · 堆 ${Math.round(m0.heapUsed / 1048576)}/${Math.round(v8HeapLimitBytes() / 1048576)}MB（启动基线）`);
+    } catch {
+      /* ignore */
     }
 
     // webhook 补投（§4.1）
@@ -3076,10 +3110,21 @@ export class Orchestrator {
     tombstones: number;
     version: string;
     uptimeSec: number;
+    /**
+     * 进程内存快照（MB）。
+     *
+     * 为什么要暴露它：2026-10-07 01:17:03 服务**崩过一次**，stderr 里是
+     * `FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory`
+     * —— 起来之后用户看到的就是"它又自己重启了"。事后完全无法归因（没有内存曲线、没有报告）。
+     * 现在：① 这里暴露实时值，健康面板/接口随时能看到；② 每 5 分钟往日志写一行；
+     * ③ 启动参数带 `--report-on-fatalerror`，下次真的 OOM 会在 data/logs 留下诊断报告。
+     */
+    memory: { rssMB: number; heapUsedMB: number; heapTotalMB: number; heapLimitMB: number; externalMB: number };
     mode: { autoPublish: boolean; isOnlySelf: boolean; dryRun: boolean; allowPaid: boolean };
     prompts: ReturnType<PromptStore['list']>;
   }> {
     const cfg = this.config;
+    const mem = process.memoryUsage();
     const out: Awaited<ReturnType<Orchestrator['health']>> = {
       bililive: { ok: false, expected: cfg.bililive.versionExpected, drift: false, baseUrl: cfg.bililive.baseUrl, message: '未连接' },
       todayPublished: this.ledger.todayPublishedCount(),
@@ -3091,6 +3136,13 @@ export class Orchestrator {
       tombstones: this.ledger.tombstoneCount(),
       version: APP_VERSION,
       uptimeSec: Math.round((Date.now() - Date.parse(this.bootedAt)) / 1000),
+      memory: {
+        rssMB: Math.round(mem.rss / 1048576),
+        heapUsedMB: Math.round(mem.heapUsed / 1048576),
+        heapTotalMB: Math.round(mem.heapTotal / 1048576),
+        heapLimitMB: Math.round(v8HeapLimitBytes() / 1048576),
+        externalMB: Math.round(mem.external / 1048576),
+      },
       mode: {
         autoPublish: cfg.publish.autoPublish,
         isOnlySelf: cfg.publish.isOnlySelf === 1,
@@ -3199,8 +3251,22 @@ export class StageError extends Error {
   }
 }
 
-function emptyCost(): TaskCost {
-  return {
+/**
+ * 当前进程的 V8 堆上限（字节）。
+ *
+ * 为什么要显示它：`--max-old-space-size` 决定"多大的对象图会把进程打死"，
+ * 而它与机器内存有关（同一份代码在不同机器上的上限不同）——
+ * 内存日志里只有绝对 MB 是没法判断"离崩还有多远"的，必须跟上限一起看。
+ */
+function v8HeapLimitBytes(): number {
+  try {
+    return v8.getHeapStatistics().heap_size_limit;
+  } catch {
+    return 0;
+  }
+}
+
+function emptyCost(): TaskCost {  return {
     asrEstimate: 0,
     asrAudioSeconds: 0,
     llmActual: 0,

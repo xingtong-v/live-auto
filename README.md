@@ -51,16 +51,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\autostart.ps1 -Remove
 以及**看门狗**：每 10 分钟检查一次服务在不在，不在就拉起来（`-WatchdogMinutes 0` 可关）。
 
 **自动这一路是「无窗口」的**：任务动作固定为
-`powershell -NonInteractive -WindowStyle Hidden -File tools\ensure-service.ps1 -Port 3000`，
+`conhost.exe --headless powershell.exe -NoProfile -NoLogo -NonInteractive -File tools\ensure-service.ps1 -Port 3000`，
 它的规则只有三条 —— 端口在监听就**什么都不做**（哪怕 HTTP 探活超时）、端口空闲才隐藏启动、
 **从不杀任何进程**，而且只有真的启动了服务才往 `data/logs/watchdog.log` 写一行。
-理由（2026-10-06 用户报「我的切片助手在反复重启」，实测结论）：
+理由（2026-10-06/07 用户两次报「反复重启 / 还是有自启现象」，都是实测出来的）：
 
 - 老注册让任务去跑 `launcher.ps1`，而那是**给人双击的交互式启动器**：它创建可见窗口，
-  于是每 10 分钟在屏幕上闪一个窗口（这就是"反复重启"的观感）；
+  于是每 10 分钟在屏幕上闪一个窗口；
 - 它只用 **3 秒** HTTP 探活判断"服务在不在"，服务忙时会误判成"不在" → 起第二个实例（撞端口）
   → 收尾时按命令行特征把项目目录下的 node.exe 全杀掉 ⇒ **把健康的服务杀掉**；
-- 它启动服务后常驻前台持有 ⇒ 关掉那个窗口＝服务停掉，下一跳又开一个窗口。
+- 它启动服务后常驻前台持有 ⇒ 关掉那个窗口＝服务停掉，下一跳又开一个窗口；
+- ⚠️ **`-WindowStyle Hidden` 不足以藏掉窗口**：这台机器的默认终端是 **Windows Terminal**，
+  控制台窗口由 `WindowsTerminal.exe` 创建并**可见**（顶层窗口监视器实测：01:07:48 出现
+  `CASCADIA_HOSTING_WINDOW_CLASS state=visible`）。改成 `conhost.exe --headless` 之后，
+  连续两跳（01:13:13 / 01:23:14）只出现 `PseudoConsoleWindow state=hidden`，**屏幕上什么都不出现**。
+  （S4U"不管用户是否登录都运行"看着更彻底，但需要提权，实测注册报 Access is denied。）
 
 现在：**自动 = 无窗口守护脚本**（只拉起、不杀、不持有）；**手动 = 桌面快捷方式**
 （`launcher.ps1`，有窗口、看得见日志、关窗口即停服务 —— 这是给人用的设计）。

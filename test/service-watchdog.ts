@@ -74,10 +74,36 @@ section('① 服务守护脚本：只拉起，绝不杀');
   ok('★ 可执行代码里没有 Stop-Process（注释里提到不算）', !/Stop-Process/.test(code), (code.match(/.*Stop-Process.*/) ?? [''])[0].trim());
   ok('★ 可执行代码里没有 taskkill', !/taskkill/i.test(code));
   ok('用 -WindowStyle Hidden 启动服务（否则又是"屏幕上闪窗口"）', /-WindowStyle\s+Hidden/.test(txt));
+  /* 探测必须**严格有界**：实测（2026-10-07 00:57:48 那一跳）服务忙时
+     `Invoke-WebRequest -TimeoutSec 5` 没有按时返回，守护进程挂了 2 分钟以上，
+     而任务策略是 IgnoreNew ⇒ 后面每一跳都被忽略，看门狗等于失效。 */
+  ok('★ 探活走 HttpClient + CancellationToken（硬超时，不会挂住）', /HttpClient/.test(txt) && /CancellationTokenSource/.test(txt));
+  ok('★ 不再用裸的 Invoke-WebRequest 做探活', !/Invoke-WebRequest/.test(code), (code.match(/.*Invoke-WebRequest.*/) ?? [''])[0].trim());
   ok('先检查端口是否在监听（端口被占就绝不起第二个实例）', /function Test-PortListening/.test(txt) && /if \(\$listening\) \{/.test(txt));
   ok('★ 端口在监听但探活失败时也不动手（判为"在跑但繁忙"）', /判定为「服务在跑但繁忙」/.test(txt));
   ok('只有真的启动了服务才写日志（平时静默，不刷屏）', /只有真的启动了服务才写一行日志/.test(txt));
   ok('等等就绪时有上限（不会永远挂着）', /\$WaitSec/.test(txt) && /仍\s*未就绪/.test(txt));
+}
+
+/* ========================================================================== */
+section('①b 崩溃取证与内存余量：启动参数三处必须一致');
+{
+  /* 2026-10-07 01:17:03 服务因 `JavaScript heap out of memory` 整个进程 abort（默认堆上限约 4GB，
+     机器有 32GB 却没吃上）—— 事后既没有报告也没有内存曲线，只能从 stderr 一行 FATAL 反推。
+     现在三条启动路径（看门狗 / 交互启动器 / 手动重启工具）都必须带同样的参数，
+     否则"手动重启出来的服务"和"看门狗拉起来的服务"能力不同，下次照样查不出来。 */
+  const wd = fs.readFileSync(watchdogPath, 'utf8');
+  const lc = fs.readFileSync(launcherPath, 'utf8');
+  const rs = fs.readFileSync(path.join(ROOT_DIR, 'tools', 'restart-service.ts'), 'utf8');
+  for (const [name, src] of [
+    ['看门狗 ensure-service.ps1', wd],
+    ['交互启动器 launcher.ps1', lc],
+    ['手动重启 restart-service.ts', rs],
+  ] as const) {
+    ok(`${name} 带 --max-old-space-size=8192（给内存尖峰留余量）`, /--max-old-space-size=8192/.test(src));
+    ok(`${name} 带 --report-on-fatalerror（崩了留诊断报告）`, /--report-on-fatalerror/.test(src));
+    ok(`${name} 带 --report-directory（报告落到 data\\logs）`, /--report-directory/.test(src));
+  }
 }
 
 /* ========================================================================== */
@@ -127,11 +153,24 @@ section('③ 计划任务的动作：无窗口的守护脚本（不是可见窗�
   });
   ok('任务已注册', xml.includes('<Task'), xml.slice(0, 80));
   ok('★ 动作是 tools\\ensure-service.ps1', /ensure-service\.ps1/.test(xml), (xml.match(/<Arguments>.*?<\/Arguments>/) ?? [''])[0].slice(0, 200));
-  ok('★ 动作带 -WindowStyle Hidden（用户看不到窗口闪）', /-WindowStyle Hidden/.test(xml));
   ok('动作带 -NonInteractive', /-NonInteractive/.test(xml));
   ok('动作**不再**直接跑 launcher.ps1', !/launcher\.ps1/.test(xml), (xml.match(/<Arguments>.*?<\/Arguments>/) ?? [''])[0].slice(0, 200));
+  /* ★ 2026-10-07 实测补的一条：这台机器的默认终端是 Windows Terminal，
+     此时 `-WindowStyle Hidden` **不生效**（控制台窗口由 WindowsTerminal.exe 创建并可见）——
+     用户报的「还是有自启现象」就是每 10 分钟闪的那个 WT 窗口（顶层窗口监视器抓到：
+     01:07:48.827 PseudoConsoleWindow state=visible / 01:07:48.924 CASCADIA_HOSTING_WINDOW_CLASS state=visible）。
+     唯一不需要提权的可靠解法是 conhost.exe --headless（实测本机 10.0.26200 支持）。 */
+  ok('★ 动作的可执行文件是 conhost.exe（不是 powershell.exe）', /<Command>\s*[^<]*conhost\.exe\s*<\/Command>/.test(xml), (xml.match(/<Command>.*?<\/Command>/) ?? [''])[0]);
+  ok('★ 动作带 --headless（无头控制台 ⇒ 不存在窗口，WT 也闪不出来）', /--headless/.test(xml), (xml.match(/<Arguments>.*?<\/Arguments>/) ?? [''])[0].slice(0, 200));
   ok('看门狗仍然是每 10 分钟一跳', /<Interval>PT10M<\/Interval>/.test(xml));
   ok('只允许一个实例（IgnoreNew，避免并发撞端口）', /MultipleInstancesPolicy>IgnoreNew</.test(xml));
+  /* S4U 试过但在这台机器上被拒绝（非管理员上下文 Access is denied）—— 别退回去。
+     注：Interactive 身份在任务 XML 里序列化成 `InteractiveToken`（不是 "Interactive"）。 */
+  ok(
+    '身份仍是 Interactive（S4U 需要提权，注册会被拒）',
+    /<LogonType>InteractiveToken<\/LogonType>/.test(xml) && !/<LogonType>S4U<\/LogonType>/.test(xml),
+    (xml.match(/<LogonType>.*?<\/LogonType>/) ?? [''])[0],
+  );
 }
 
 /* ========================================================================== */
@@ -152,18 +191,20 @@ section('⑤ 自启安装器：默认装无窗口看门狗，-VisibleLauncher �
 {
   const ac = fs.readFileSync(autostartPath, 'utf8');
   ok('新增 -VisibleLauncher 开关', /\$VisibleLauncher/.test(ac));
-  ok(
-    '★ 默认动作字符串指向守护脚本（-File "{0}" -Port {1} 里的 $watchdog）+ -WindowStyle Hidden',
-    /-NonInteractive -WindowStyle Hidden/.test(ac) && /-f \$watchdog, \$port/.test(ac) && /\$watchdog = Join-Path \$ROOT 'tools\\ensure-service\.ps1'/.test(ac),
-    (ac.match(/.*\$argLine = .*ensure.*/) ?? ac.match(/.*-f \$watchdog.*/) ?? [''])[0].trim(),
-  );
+  ok('★ 默认动作字符串指向守护脚本（-File "{0}" -Port {1} 里的 $watchdog）', /--headless "\{0\}"/.test(ac) && /-f \$ps, \$watchdog, \$port/.test(ac), (ac.match(/.*--headless.*/) ?? [''])[0].trim());
+  /* ★ 无窗口这件事只能靠 conhost --headless：本机默认终端是 Windows Terminal，
+     `-WindowStyle Hidden`（SW_HIDE）拦不住 WindowsTerminal.exe 创建的可见窗口
+     （顶层窗口监视器 01:07:48 抓到 state=visible 的 CASCADIA_HOSTING_WINDOW_CLASS）。
+     S4U 走不通（非管理员注册报 Access is denied），所以方案必须是 conhost --headless。 */
+  ok('★ 安装器用 conhost.exe 作为动作可执行文件', /\$execute = \$conhost/.test(ac) || /conhost\.exe/.test(ac));
+  ok('★ 安装器会**验证**任务 XML 里确实有 conhost + --headless（不是写完就算）', /动作已设为 conhost\.exe --headless/.test(ac));
+  ok('不再默认用 S4U（需要提权，实测被拒）', !/LogonType S4U/.test(ac) && /LogonType Interactive/.test(ac));
   ok('可见窗口的老行为被显式标注为可选', /想要老的"看得见窗口"的行为：加 -VisibleLauncher/.test(ac));
   ok('状态输出会提示"任务动作是哪个脚本"', /任务动作/.test(ac) && /无窗口、只拉起、绝不杀进程/.test(ac));
 }
 
 /* ========================================================================== */
-section('⑥ 非破坏性实跑：服务在跑时，守护脚本必须什么都不做');
-{
+section('⑥ 非破坏性实跑：服务在跑时，守护脚本必须什么都不做');{
   const probe = async (): Promise<{ up: boolean; pid?: number }> => {
     try {
       const r = await fetch(`http://127.0.0.1:${PORT}/api/bootstrap`);
@@ -184,8 +225,7 @@ section('⑥ 非破坏性实跑：服务在跑时，守护脚本必须什么都�
   const logPath = path.join(ROOT_DIR, 'data', 'logs', 'watchdog.log');
   const logBefore = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
 
-  if (!before.up) {
-    /* 服务不在运行时**不跑**守护脚本：它会（正确地）把服务拉起来，
+  if (!before.up) {    /* 服务不在运行时**不跑**守护脚本：它会（正确地）把服务拉起来，
        那是"改动生产状态"，不该由测试触发。这里显式说明，不静默跳过。 */
     console.log('  \x1b[33m· 服务当前不在运行 —— 跳过实跑（避免测试把服务拉起来）；静态约束仍然有效\x1b[0m');
   } else {
@@ -204,6 +244,18 @@ section('⑥ 非破坏性实跑：服务在跑时，守护脚本必须什么都�
     eq('★ 服务 pid 没变（没有重启）', after.pid, before.pid);
     const logAfter = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
     eq('★ 没有往 watchdog.log 写任何东西（静默通过）', logAfter.length, logBefore.length);
+
+    /* 内存可观测性：出问题（OOM）时唯一能看的就是这两个地方 —— 接口字段 + 日志里的基线行 */
+    const health = (await (await fetch(`http://127.0.0.1:${PORT}/api/health`)).json()) as {
+      health?: { memory?: { rssMB?: number; heapUsedMB?: number; heapLimitMB?: number } };
+    };
+    const mem = health.health?.memory;
+    ok('★ /api/health 暴露进程内存（rss/heapUsed/heapLimit）', Boolean(mem && typeof mem.rssMB === 'number' && typeof mem.heapUsedMB === 'number' && typeof mem.heapLimitMB === 'number'), JSON.stringify(mem));
+    ok('★ 堆上限已被抬高（默认约 4GB；启动参数带 8192 ⇒ 明显大于 4300MB）', Number(mem?.heapLimitMB ?? 0) > 4300, String(mem?.heapLimitMB));
+    const today = new Date().toLocaleDateString('sv-SE');
+    const appLog = path.join(ROOT_DIR, 'data', 'logs', `live_auto-${today}.jsonl`);
+    const appText = fs.existsSync(appLog) ? fs.readFileSync(appLog, 'utf8') : '';
+    ok('★ 应用日志里有内存基线行（崩溃前能看到爬升）', /内存：RSS \d+MB · 堆 \d+\/\d+MB/.test(appText), appText.split('\n').filter((l) => l.includes('内存：')).slice(-1)[0]?.slice(0, 140) ?? '(没有内存行)');
   }
 }
 

@@ -58,10 +58,31 @@ function Test-PortListening {
 }
 
 function Test-HttpReady {
+  <#
+    硬超时探活。
+    为什么不用 `Invoke-WebRequest -TimeoutSec 5`：实测（2026-10-07 00:57:48 那一跳）
+    服务正忙时那个参数**不生效** —— 守护进程挂了 2 分钟以上才回来，而任务策略是
+    IgnoreNew，于是后面每一跳都被忽略，看门狗等于失效（比不探活更糟：看起来还在跑）。
+    HttpClient + CancellationTokenSource 是**硬**超时：到点就取消，绝不多等。
+  #>
+  $client = $null
+  $cts = $null
   try {
-    $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/bootstrap" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-    return ($r.StatusCode -eq 200)
-  } catch { return $false }
+    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue | Out-Null
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [TimeSpan]::FromSeconds(6)
+    $cts = New-Object System.Threading.CancellationTokenSource
+    [void]$cts.CancelAfter(4000)
+    $resp = $client.GetAsync("http://127.0.0.1:$Port/api/bootstrap", $cts.Token).GetAwaiter().GetResult()
+    $okc = ([int]$resp.StatusCode -eq 200)
+    $resp.Dispose()
+    return $okc
+  } catch {
+    return $false
+  } finally {
+    if ($cts) { $cts.Dispose() }
+    if ($client) { $client.Dispose() }
+  }
 }
 
 $listening = Test-PortListening
@@ -97,10 +118,25 @@ if (-not $nodeExe) {
 $outLog = Join-Path $logDir 'service-console.log'
 $errLog = Join-Path $logDir 'service-error.log'
 
-Write-WdLog "服务不在运行（端口 $Port 空闲）—— 以隐藏窗口启动：$nodeExe src\cli.ts run --port $Port"
+Write-WdLog ("服务不在运行（端口 $Port 空闲）—— 以隐藏窗口启动：" + $nodeExe + " --max-old-space-size=8192 --report-on-fatalerror src\cli.ts run --port " + $Port)
 try {
+  <#
+    启动参数里的三件事：
+      · --max-old-space-size=8192：给内存尖峰留余量。2026-10-07 01:17:03 服务因为
+        `JavaScript heap out of memory` **整个进程 abort**（默认堆上限约 4GB，而机器有 32GB 内存没用上）。
+        这不是修复，是别让一次尖峰把服务打死；
+      · --report-on-fatalerror：真崩了会在 data\logs 留一份诊断报告（含堆构成、原生栈、环境），
+        下次不用再靠猜（这次就是因为没有任何报告，只能从 stderr 的一行 FATAL 反推）；
+      · --report-directory：报告落到日志目录，跟其它日志一起轮转。
+    注意：这里按"路径不含空格"直接拼参数；项目若被搬到含空格的目录，需要给这些参数加引号。
+  #>
   $proc = Start-Process -FilePath $nodeExe `
-    -ArgumentList @('src\cli.ts', 'run', '--port', "$Port") `
+    -ArgumentList @(
+      '--max-old-space-size=8192',
+      '--report-on-fatalerror',
+      "--report-directory=$logDir",
+      'src\cli.ts', 'run', '--port', "$Port"
+    ) `
     -WorkingDirectory $root `
     -WindowStyle Hidden `
     -RedirectStandardOutput $outLog `

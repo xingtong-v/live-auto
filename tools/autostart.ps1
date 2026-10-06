@@ -175,20 +175,39 @@ if (-not (Test-Path -LiteralPath $ps)) { $ps = 'powershell.exe' }
 #     · 它只用 3 秒 HTTP 探活判断"服务在不在" → 服务忙时误判成"不在" → 起第二个实例
 #       （端口被占）→ 收尾时按命令行特征把项目目录下的 node.exe 全杀掉 → 把**健康的服务**杀掉；
 #     · 它启动服务后常驻前台持有：关掉那个窗口＝服务停掉，下一跳又开一个窗口。
-#   现在动作固定为 tools\ensure-service.ps1 -WindowStyle Hidden：
-#   端口在监听就什么都不做（哪怕探活超时）、端口空闲才隐藏启动、**从不杀进程**。
+#
+# ★ 2026-10-07 再改：光加 `-WindowStyle Hidden` **还不够**。
+#   用户接着报「还是有自启现象」，我用顶层窗口监视器（EnumWindows，120ms 一次）抓到了现行：
+#     01:07:48.827  PseudoConsoleWindow          state=**visible**  owner=powershell.exe -WindowStyle Hidden …
+#     01:07:48.924  CASCADIA_HOSTING_WINDOW_CLASS state=**visible**  title="…\powershell.exe"
+#   根因：这台机器的**默认终端是 Windows Terminal**。控制台窗口由 WindowsTerminal.exe 创建，
+#   `-WindowStyle Hidden`（就是 STARTUPINFO 的 SW_HIDE）在 WT 下**不生效** ⇒ 每 10 分钟闪一个
+#   Windows Terminal 窗口。wscript/mshta 垫片也一样（子进程照样被交给默认终端）。
+#   试过 S4U（"不管用户是否登录都运行"，会话 0 里结构上不可能有窗口）：
+#   `Register-ScheduledTask` 报 **Access is denied** —— S4U 需要"作为批处理作业登录"权限，
+#   非管理员上下文注册不了（本脚本刻意不要求管理员权限）。
+#   最终方案：**`conhost.exe --headless`**（Windows 11 26200 实测支持，退出码 0、无窗口）。
+#   它让控制台以"无头"方式创建：既留在用户会话（不需要任何特权），又**不存在窗口**。
 #   想要老的"看得见窗口"的行为：加 -VisibleLauncher。
+$conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+$execute = $ps
 if ($VisibleLauncher) {
   $argLine = '-NoProfile -NoLogo{0} -ExecutionPolicy Bypass -File "{1}"{2} -NoPause' -f `
     $(if ($Hidden) { ' -WindowStyle Hidden' } else { '' }), `
     $launcher, `
     $(if ($Browser) { '' } else { ' -NoBrowser' })
+} elseif (Test-Path -LiteralPath $conhost) {
+  # 关键：动作的可执行文件是 conhost.exe，PowerShell 只是它的参数
+  $execute = $conhost
+  $argLine = '--headless "{0}" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -File "{1}" -Port {2}' -f $ps, $watchdog, $port
 } else {
+  # 老系统没有 --headless：退回 -WindowStyle Hidden（会有 WT 闪窗，但功能正确）
+  Warn2 '本机没有 conhost.exe --headless 支持，退回 -WindowStyle Hidden（默认终端是 Windows Terminal 时可能仍闪一下窗口）'
   $argLine = '-NoProfile -NoLogo -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Port {1}' -f $watchdog, $port
 }
 
 try {
-  $action = New-ScheduledTaskAction -Execute $ps -Argument $argLine -WorkingDirectory $ROOT
+  $action = New-ScheduledTaskAction -Execute $execute -Argument $argLine -WorkingDirectory $ROOT
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
   # Delay 在 PS 5.1 里只能改 CIM 对象的属性
   $trigger.Delay = 'PT{0}S' -f [Math]::Max(0, $DelaySec)
@@ -198,6 +217,9 @@ try {
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+  # 身份固定用 Interactive（受限级别、不需要管理员）：
+  #   S4U 虽然"结构上无窗口"，但注册需要"作为批处理作业登录"权限 —— 实测非管理员上下文
+  #   直接报 Access is denied。无窗口这件事已经由上面的 conhost --headless 解决。
   $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 
   # 看门狗要**独立的时间触发器**，不能只挂在登录触发器上：
@@ -239,6 +261,15 @@ try {
     } else {
       Ok '看门狗未开启（-WatchdogMinutes 0）：服务被杀掉后不会自动回来'
     }
+    # ★ 无窗口这件事必须**验证**：默认终端是 Windows Terminal 时 `-WindowStyle Hidden` 不生效，
+    #   所以动作必须是 conhost.exe --headless。读 XML 确认，别信"我写了参数"。
+    if (-not $VisibleLauncher) {
+      if ($verify -match '<Command>\s*[^<]*conhost\.exe\s*</Command>' -and $verify -match '--headless') {
+        Ok '动作已设为 conhost.exe --headless（无窗口，默认终端是 Windows Terminal 也不闪）'
+      } else {
+        Warn2 '动作里没有 conhost.exe --headless —— 每 10 分钟可能仍会闪一个终端窗口'
+      }
+    }
   } catch {
     Warn2 "设置 MultipleInstancesPolicy 失败：$($_.Exception.Message)（launcher.ps1 的第 0 步检查仍可兜底）"
   }
@@ -256,9 +287,11 @@ try {
   Write-Host '  退路：改用「启动文件夹」（不需要管理员权限，但没有延迟/重试能力）' -ForegroundColor Yellow
   $startup = [Environment]::GetFolderPath('Startup')
   $cmdPath = Join-Path $startup 'live_auto.cmd'
-  $content = "@echo off`r`n`"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$launcher`" -NoBrowser -NoPause`r`n"
+  # 退路也必须是无窗口的：用 conhost --headless 跑守护脚本（绝不再写"可见窗口的 launcher"，
+  # 那正是用户抱怨的东西）。
+  $content = "@echo off`r`n`"$conhost`" --headless `"$ps`" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -File `"$watchdog`" -Port $port`r`n"
   [System.IO.File]::WriteAllText($cmdPath, $content, (New-Object System.Text.ASCIIEncoding))
-  Ok "已改为写入启动文件夹：$cmdPath"
-  Write-Host '  （删除该文件即可取消自启）' -ForegroundColor DarkGray
+  Ok "已改为写入启动文件夹（无窗口）：$cmdPath"
+  Write-Host '  （删除该文件即可取消自启；注意这条退路没有"每 10 分钟看门狗"能力）' -ForegroundColor DarkGray
 }
 exit 0

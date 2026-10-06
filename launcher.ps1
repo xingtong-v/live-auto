@@ -260,7 +260,18 @@ Ok '前端界面文件已就绪'
 # ---------------------------------------------------------------- 2. 启动后端
 Head '2. 启动后端服务'
 
-$cliArgs = @('src\cli.ts', 'run', '--port', "$Port")
+$logDir = Join-Path $ROOT 'data\logs'
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+
+# 与 tools\ensure-service.ps1 保持一致：给内存尖峰留余量 + 崩了留诊断报告。
+# （2026-10-07 01:17:03 服务因 `JavaScript heap out of memory` 整个进程 abort，默认堆上限约 4GB，
+#   而机器有 32GB —— 事后没有任何报告，只能从 stderr 的一行 FATAL 反推。现在两边都带这三个参数。）
+$cliArgs = @(
+  '--max-old-space-size=8192',
+  '--report-on-fatalerror',
+  "--report-directory=$logDir",
+  'src\cli.ts', 'run', '--port', "$Port"
+)
 if ($DryRun) { $cliArgs += '--dry-run' }
 if ($AllowPaid) { $cliArgs += '--allow-paid' }
 if ($Room) { $cliArgs += @('--room', $Room) }
@@ -270,8 +281,6 @@ if ($DryRun -and -not $AllowPaid) {
   Say '  dry-run 且未允许付费：不会调用付费 ASR / LLM（硬约束 #14）' Green
 }
 
-$logDir = Join-Path $ROOT 'data\logs'
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 $consoleLog = Join-Path $logDir 'launcher-console.log'
 if (Test-Path $consoleLog) { Remove-Item $consoleLog -Force -ErrorAction SilentlyContinue }
 

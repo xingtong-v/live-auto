@@ -173,8 +173,13 @@ if (oldPid) {
 
 /* ---- 2) 起新进程（detached，独立于本脚本存活） ---- */
 line('');
-line('  启动新进程：node src/cli.ts run');
-const child = spawn(process.execPath, [path.join(ROOT, 'src', 'cli.ts'), 'run'], {
+line('  启动新进程：node src/cli.ts run（带内存余量与崩溃报告参数，与自启那一路一致）');
+/* ⚠️ 这三个参数必须与 tools\ensure-service.ps1 / launcher.ps1 保持一致：
+   否则"手动重启出来的服务"和"看门狗拉起来的服务"能力不同 ——
+   2026-10-07 01:17:03 服务因 `JavaScript heap out of memory` 整个进程 abort，
+   当时既没有更大的堆上限、也没有留下任何诊断报告，只能从 stderr 一行 FATAL 反推。 */
+const heapFlags = ['--max-old-space-size=8192', '--report-on-fatalerror', `--report-directory=${path.join(ROOT, 'data', 'logs')}`];
+const child = spawn(process.execPath, [...heapFlags, path.join(ROOT, 'src', 'cli.ts'), 'run'], {
   cwd: ROOT,
   detached: true,
   stdio: 'ignore',
