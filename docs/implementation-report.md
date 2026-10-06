@@ -3059,3 +3059,79 @@ FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaS
 2. **按命令行特征找进程会匹配到自己**：用 `CommandLine -like '*STANDIN*'` 清理替身进程时，
    先杀掉的是**我自己这条命令的宿主**（它的命令行里就有 `STANDIN`），于是 harness 连报三次
    `Windows Job runner exited …`。正确做法：把匹配串拼出来（`'setInter' + 'val('`），或用 `ParentProcessId` 限定。
+
+## 29. 「1 个多小时才 200 多 M」= 显示正确；但顺着它挖出了"反复重启"的**真正根因**（2026-10-07）
+
+### 29.1 先回答显示问题：是对的
+
+| 段 | 时间 | 时长 | 大小 | 码率（ffprobe 实测） |
+|---|---|---|---|---|
+| 段1（已闭合） | 23:46:05 → 00:45:05 | 59.0 分钟 | 320.3 MB | **759 kbps** |
+| 段2（正在写） | 00:45:05 → 01:34:47 | 49.7 分钟 | 273.5 MB | **767 kbps** |
+| 合计 | 108.7 分钟（＝面板里 biliLive-tools 的 01:47:35） | | ~594 MB | |
+
+两段首尾相接（00:45:05 / 00:44:59，相差 6 秒的边界），**一分钟没丢**。
+`.ts` 是 biliLive-tools 的**原始流复制**（不重编码），码率就是源流码率；同一个主播 10-03 两场实测
+**787 / 794 kbps**，完全一致 ⇒ 这个主播的原画就这个码率。面板上那个数字来自上一轮扫描（≤60 秒前），
+所以比"此刻"略小（文件约 70 KB/s）。
+
+### 29.2 但这一场有个致命副作用：`totalDuration = 0`
+
+台账里这一场 `source.totalDuration = 0`、`segments[].duration = 0` —— 因为**导入时 ffprobe 被判为不可用**
+（日志里那条 `找不到可用的 ffprobe … 全局时间轴不可用`），所有时长字段记成了 0。
+
+### 29.3 真正根因：SuperChat 的**绝对**时间戳 → 密度曲线要建 1.79 亿个窗口 → 8GB 堆爆
+
+用 256MB 小堆逐子步骤复跑（探针打印每步内存），最后一条是：
+
+```
+末个 = {"time":1791304995.684, "rawTime":1791304995.684, "kind":"superchat", …}
+```
+
+biliLive-tools 的弹幕 XML 里两类节点的时间语义**不同**：
+
+```xml
+<d  p="5.189,1,25,…" timestamp="1791301571821">普通弹幕</d>      <!-- p[0] = 相对秒 ✔ -->
+<sc ts="15.469" price="30000" timestamp="1791301582101">…</sc>  <!-- 相对时间在 ts 上！ -->
+```
+
+`danmaku.ts` 的 `pickRawTime` 旧顺序是 `['rawTime','raw_time','timestamp','ts','stime','time']` ——
+`timestamp`（绝对 Unix 毫秒）排在 `ts`（相对秒）**前面** ⇒ 那 35 条 SC 的 time 变成 1791301582 秒（≈2026 年）。
+接着 `buildDensity` 在"视频时长未知"（`videoDuration=0`）时按**最大时刻**兜底算 span ⇒
+`n = ceil(1.79e9 / 10)` = **1.79 亿个窗口对象** ⇒ 堆一路涨到 8GB → V8 `FATAL … heap out of memory` →
+**进程 abort**（不是 JS 异常，所以没有任何 try/catch 能拦住）。
+
+崩溃报告（`--report-on-fatalerror` 派上了用场）：
+`old_space 6930MB + large_object_space 1027MB，limit 8384MB，rss 8193MB`。
+
+于是形成闭环：**崩 → 看门狗 2 分钟内拉起 → 启动恢复把它重新入队 → 再崩**。
+它就是用户两次报的"反复重启"（窗口只是表象，这是实质）。
+
+### 29.4 三处修复
+
+| 修复 | 位置 |
+|---|---|
+| **解析层**：相对时间优先（`ts`/`stime`/`time` 排在 `timestamp` 之前）；只有绝对时间戳的条目用**开播锚点**换算（锚点 = `<d>` 的 `timestamp − p[0]×1000`，取最小）；连锚点都没有就**丢弃并如实告知**（宁可少几条 SC 的时刻，也不让 1.79e9 流进下游） | `src/danmaku.ts` `pickRawTime` / XML 解析 |
+| **密度层护栏**：兜底 span 只认"像相对时间"的时刻（`< 1e8` 秒 ≈ 3.17 年），并且窗口数硬上限 20 万 —— 任何脏时间都不该有机会把进程撑死 | `src/danmaku.ts` `buildDensity` |
+| **崩溃循环刹车**：同一个任务启动时自动重跑超过 **3 次**就停手，只记警告（"请查看错误报告，修好后手动点继续"）；手动入队（= 用户点继续/重跑）会把计数清零 | `src/daemon.ts` `recoverUnfinishedTasks` + `types.ts` `autoResumeCount` |
+
+### 29.5 验证
+
+| 手段 | 结果 |
+|---|---|
+| 探针（同样的输入，256MB 小堆） | 修前：`FATAL 堆爆`；修后：**31MB 通过**，SC 时刻 = **3429.052 秒**（相对），密度窗口 **354 个**（不是 1.79 亿） |
+| 真机端到端 | 之前崩三次的那一场 `auto-20261006165057-i52y` **跑完了 ANALYZED**（此前每次死在弹幕解析），服务内存 219MB（此前 8GB abort） |
+| `test/segment-danmaku.ts` §⑪（新增 8 项） | 100 项全绿：SC 用 `ts`、带锚点换算、无锚点丢弃并告警、`ts="0"` 合法保留、密度硬上限 |
+| `test/boot-requeue.ts` ②b（新增 8 项） | 21 项全绿：连续 3 次启动都会被捡、第 4 次停手、计数清零后恢复 |
+| 回归 | `performance-reflux` 80 / `monitor-panel` 182 / `watch-import` 79 / `typecheck` 全绿 |
+
+顺带修掉一个**测试污染真实日志**的问题：`Ledger` 默认用全局 logger，
+于是新套件往真实 `data/logs/live_auto-<date>.jsonl` 里灌了几十条「新建场次任务」，
+排查线上问题时把日志尾部刷掉了（正是这次找 OOM 现场时踩到的）。现在套件传静默 logger。
+
+### 29.6 还没解决 / 需要留意的
+
+1. **`totalDuration = 0` 的根**（导入时 ffprobe 不可用）没查：自检里 ffprobe 是好的，
+   但导入路径当时判成不可用。这一场的时间轴因此仍按"单窗口整文件"转写，字幕时间戳可能与视频有偏移。
+   已在 `media.ts` 侧留了降级告警；下次导入时我会盯一下 `segments[].duration` 是否正常。
+2. 那一场现在停在 `ANALYZED`（待审核）——如果配置是半自动，需要你在界面上确认；全自动会继续切片。

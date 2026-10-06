@@ -57,7 +57,7 @@ import {
   stripTimestampPrefix,
   toSegmentLikes,
 } from '../src/danmaku-merge.ts';
-import { parseDanmakuXml } from '../src/danmaku.ts';
+import { parseDanmakuXml, buildDensity } from '../src/danmaku.ts';
 
 let pass = 0;
 let fail = 0;
@@ -416,6 +416,61 @@ section('⑨ 真实 XML 形态：`p` 后面还有属性（实测踩到的静默�
   fs.rmSync(a, { force: true });
   fs.rmSync(b, { force: true });
   fs.rmSync(out, { force: true });
+}
+
+/* ========================================================================== */
+section('⑪ 事件条目的绝对时间戳（2026-10-07 把服务打死三次的那个 bug）');
+{
+  /* 实测事故：biliLive-tools 的 XML 里 SuperChat 长这样
+       `<sc ts="15.469" price="30000" user="…" uid="…" timestamp="1791301582101">`
+     相对时间在 `ts` 上，`timestamp` 是**绝对 Unix 毫秒**。旧代码按
+     ['rawTime','raw_time','timestamp','ts',…] 顺序取，先命中 timestamp ⇒ 那 35 条 SC 的
+     time 变成 1791301582 秒（≈2026 年）。紧接着，因为那一场 ffprobe 不可用（totalDuration=0），
+     密度曲线按"最大时刻"兜底算 span ⇒ 要建 **1.79 亿个**窗口对象 ⇒ 8GB 堆爆、进程 abort、
+     看门狗拉起、启动恢复又把它排进队列 ⇒ 再爆 —— 用户看到的就是"切片助手在反复重启"。 */
+  const real =
+    '<?xml version="1.0" encoding="utf-8"?>\n<i>\n' +
+    '<d p="5.189,1,25,16777215,1791301571821,0,3707026920180333,3707026920180333,0" user="甲" uid="1" timestamp="1791301571821">普通弹幕</d>\n' +
+    '<d p="3529.193,1,25,16777215,1791305093648,0,2,2,0" user="乙" uid="2" timestamp="1791305093648">末尾弹幕</d>\n' +
+    '<sc ts="15.469" price="30000" user="丙" uid="3" timestamp="1791301582101">SC 内容</sc>\n' +
+    '</i>\n';
+  const parsed = parseDanmakuXml(real);
+  eq('三条条目都在（两条弹幕 + 一条 SC）', parsed.items.length, 3);
+  const sc = parsed.items.find((i) => i.kind === 'superchat')!;
+  ok('★ SC 的时刻是**相对秒**（≈15.5），不是 17.9 亿', sc !== undefined && sc.time > 15 && sc.time < 16, String(sc?.time));
+  eq('普通弹幕时刻不受影响', Math.round(parsed.items[0]!.time), 5);
+
+  /* 只有绝对时间戳、且文件里有可作锚点的 <d>（带 timestamp + 相对 p）⇒ 应换算成相对时间 */
+  const onlyAbs =
+    '<i>\n' +
+    '<d p="10.000,1,25,16777215,1791300000000,0,1,1,0" user="甲" uid="1" timestamp="1791300000000">锚点</d>\n' +
+    '<gift giftname="小心心" num="3" price="1000" user="丁" uid="4" timestamp="1791300060000">礼物</gift>\n' +
+    '</i>\n';
+  const p2 = parseDanmakuXml(onlyAbs);
+  const gift = p2.items.find((i) => i.kind === 'gift')!;
+  eq('★ 只有绝对时间戳的礼物按开播锚点换算（10 + 60 = 70 秒）', Math.round(gift.time), 70);
+  ok('换算这件事会在 warnings 里说明', p2.warnings.some((w) => w.includes('绝对 Unix 毫秒')), JSON.stringify(p2.warnings));
+
+  /* 连锚点都没有（文件里只有绝对时间戳、没有任何带相对时间的条目）⇒ 丢弃并如实告知 */
+  const noAnchor =
+    '<i>\n<sc price="30" user="戊" uid="5" timestamp="1791301582101">孤零零的 SC</sc>\n</i>\n';
+  const p3 = parseDanmakuXml(noAnchor);
+  eq('没有锚点时该条被丢弃（不谎报、也不留脏时间）', p3.items.length, 0);
+  ok('丢弃原因写清楚了', p3.warnings.some((w) => w.includes('已丢弃')), JSON.stringify(p3.warnings));
+  /* 反过来：只要条目自己带相对时间（`ts="0"`），它就能定位，不该被丢 */
+  const relZero = '<i>\n<sc ts="0" price="30" user="己" uid="6" timestamp="1791301582101">开场 SC</sc>\n</i>\n';
+  const p4 = parseDanmakuXml(relZero);
+  eq('带相对时间的 SC 保留（time=0 也是合法位置）', p4.items.length, 1);
+  eq('时刻按相对字段取值', p4.items[0]!.time, 0);
+
+  /* 密度曲线必须自带护栏：把 1.79e9 直接塞进去也只能产出有限个窗口 */
+  const bogus = [
+    { time: 5, rawTime: 5, kind: 'danmaku' as const, text: 'a' },
+    { time: 1791304995, rawTime: 1791304995, kind: 'superchat' as const, text: 'SC' },
+  ];
+  const density = buildDensity(bogus, { windowSec: 10, videoDuration: 0 });
+  ok('★ 密度窗口数被硬上限拦住（旧代码这里会产出 1.79 亿个）', density.length > 0 && density.length <= 200_000, String(density.length));
+  ok('脏时刻不参与"最大时刻"兜底（span 仍按合理弹幕算）', density.length < 100, String(density.length));
 }
 
 /* ========================================================================== */

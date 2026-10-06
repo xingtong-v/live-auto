@@ -349,21 +349,58 @@ function splitP(p: string | undefined): string[] {
 /**
  * 时间字段推定：
  *  1) p 的第 0 段（B站标准：相对开播时刻的秒，可能带小数）
- *  2) 显式属性（不同工具产出差异大；time 放最后，因为 SC 的 time 可能是停留时长）
- * 走 toSec 兜住「毫秒时间戳」写法（陷阱 #9）。
+ *  2) **相对**时间属性（ts / stime / time 等；不同工具产出差异大）
+ *  3) 最后才轮到 `timestamp` —— 它是**绝对** Unix 毫秒时间戳，必须再减"开播时刻"才能当相对时间用
+ *
+ * ★ 2026-10-07 实测事故（服务被 OOM 打死三次，最终定位到这里）：
+ *   biliLive-tools 的弹幕 XML 里 `<sc ts="15.469" price="30000" timestamp="1791301582101">`
+ *   —— 相对时间在 `ts` 上，`timestamp` 是绝对毫秒。旧顺序把 `timestamp` 排在 `ts` 前面，
+ *   于是那 35 条 SuperChat 的 time 被当成 1791301582 秒（≈ 2026 年）而不是 15 秒。
+ *   接着 `buildDensity` 在"视频时长未知"（ffprobe 缺失 ⇒ totalDuration=0）时按**最大时刻**
+ *   兜底算 span ⇒ 要建 1.79 亿个窗口对象 ⇒ 8GB 堆爆 → 进程 abort → 看门狗拉起 →
+ *   启动恢复又把它排进队列 → 再爆…… 用户看到的就是"反复重启"。
+ *
+ * 返回值带 `absolute` 标记：绝对时间戳要等整份文件读完、拿到开播锚点后再换算。
  */
-function pickRawTime(attrs: Record<string, string>, fields: string[]): number | undefined {
+function pickRawTime(
+  attrs: Record<string, string>,
+  fields: string[],
+): { sec: number; absolute: boolean; epochMs?: number } | undefined {
   const fromP = toSec(num(fields[0]));
-  if (fromP !== undefined) return round3(fromP);
-  for (const key of ['rawTime', 'raw_time', 'timestamp', 'ts', 'stime', 'time']) {
+  if (fromP !== undefined) {
+    /* ★ 顺便把 `timestamp`（绝对毫秒）也带上：它是**开播锚点**的唯一来源。
+       `<d p="5.189" … timestamp="1791301571821">` 同时给了相对与绝对两种时间，
+       锚点 = 绝对 − 相对 ⇒ 其它只有绝对时间戳的条目（某些 SC/礼物）才能被换算成相对时间。 */
+    const epochMs = num(attrs['timestamp']);
+    return epochMs !== undefined
+      ? { sec: round3(fromP), absolute: false, epochMs }
+      : { sec: round3(fromP), absolute: false };
+  }
+  for (const key of ['rawTime', 'raw_time', 'ts', 'stime', 'time']) {
     const v = num(attrs[key]);
     if (v !== undefined) {
       const sec = toSec(v);
-      if (sec !== undefined) return round3(sec);
+      // 相对字段里出现"像绝对时间戳"的值也要防一手（有的产出把 timestamp 塞进 time）
+      if (sec !== undefined && sec < EPOCH_LOOKALIKE_SEC) {
+        const epochMs = num(attrs['timestamp']);
+        return epochMs !== undefined ? { sec: round3(sec), absolute: false, epochMs } : { sec: round3(sec), absolute: false };
+      }
     }
+  }
+  const ms = num(attrs['timestamp']);
+  if (ms !== undefined) {
+    const sec = toSec(ms);
+    if (sec !== undefined) return { sec: round3(sec), absolute: true, epochMs: ms };
   }
   return undefined;
 }
+
+/**
+ * 「看起来像绝对 Unix 秒」的门槛：1e8 秒 ≈ 1973 年。
+ * 没有任何一场直播的**相对**时间会超过它（那是 3.17 年），
+ * 而绝对时间戳（2026 年 ≈ 1.79e9）稳稳超过它 —— 用它区分两者安全且简单。
+ */
+const EPOCH_LOOKALIKE_SEC = 1e8;
 
 /** 事件附加信息（SC 金额 / 舰长等级 / 礼物名 + 数量） */
 function eventExtra(kind: DanmakuEventKind, attrs: Record<string, string>): { extra?: string; value?: number } {
@@ -421,6 +458,10 @@ export function parseDanmakuXml(content: string, opts: { maxItems?: number } = {
   let sawSuperchat = false;
   let sawGuard = false;
   let sawGift = false;
+  /* 绝对时间戳（只有 timestamp、没有相对字段）的条目：等读完文件、拿到开播锚点后再换算 */
+  const pendingAbsolute: Array<{ item: DanmakuItem; epochMs: number }> = [];
+  /* 开播锚点 = min(绝对时刻 − 相对时刻)，从**同时带两者**的条目（如 <d p="5.189" timestamp="…">）推出来 */
+  let anchorMs: number | undefined;
 
   walkItemTags(tree, (tag, node) => {
     const nodes = Array.isArray(node) ? node : [node];
@@ -435,10 +476,14 @@ export function parseDanmakuXml(content: string, opts: { maxItems?: number } = {
 
       const attrs = nodeAttrs(one);
       const fields = splitP(attrs['p']);
-      const rawTime = pickRawTime(attrs, fields);
-      if (rawTime === undefined) {
+      const picked = pickRawTime(attrs, fields);
+      if (picked === undefined) {
         dropped++;
         continue;
+      }
+      if (picked.absolute === false && picked.epochMs !== undefined) {
+        const a = picked.epochMs - picked.sec * 1000;
+        if (Number.isFinite(a) && (anchorMs === undefined || a < anchorMs)) anchorMs = a;
       }
 
       let text = nodeText(one);
@@ -468,18 +513,53 @@ export function parseDanmakuXml(content: string, opts: { maxItems?: number } = {
       }
 
       counts[kind]++;
-      items.push({
+      const item: DanmakuItem = {
         // 解析阶段 time 先与 rawTime 相同；基准偏移由 applyOffset 统一施加
-        time: rawTime,
-        rawTime,
+        time: picked.sec,
+        rawTime: picked.sec,
         kind,
         text,
         ...(user ? { user } : {}),
         ...(extra !== undefined ? { extra } : {}),
         ...(value !== undefined ? { value } : {}),
-      });
+      };
+      if (picked.absolute && picked.epochMs !== undefined) pendingAbsolute.push({ item, epochMs: picked.epochMs });
+      items.push(item);
     }
   });
+
+  /* 绝对时间戳换算：只有拿到开播锚点才能定位；拿不到就**丢弃**并如实告知 ——
+     宁可少几条 SC 的时间信号，也不能让 1.79e9 这种时刻流进密度曲线（那会把进程撑爆）。 */
+  let convertedAbsolute = 0;
+  if (pendingAbsolute.length) {
+    if (anchorMs !== undefined) {
+      for (const p of pendingAbsolute) {
+        const sec = round3((p.epochMs - anchorMs) / 1000);
+        if (Number.isFinite(sec) && sec >= 0) {
+          p.item.time = sec;
+          p.item.rawTime = sec;
+          convertedAbsolute++;
+        }
+      }
+    } else {
+      for (const p of pendingAbsolute) {
+        const idx = items.indexOf(p.item);
+        if (idx >= 0) items.splice(idx, 1);
+      }
+      warnings.push(
+        `有 ${pendingAbsolute.length} 条事件只带绝对时间戳（Unix 毫秒）且文件里没有可作锚点的相对时间条目，` +
+          `无法定位它们在视频里的位置，已丢弃（不影响弹幕密度信号）`,
+      );
+      dropped += pendingAbsolute.length;
+      for (const p of pendingAbsolute) {
+        const k = p.item.kind;
+        if (typeof k === 'string' && counts[k] > 0) counts[k]--;
+      }
+    }
+    if (convertedAbsolute > 0) {
+      warnings.push(`有 ${convertedAbsolute} 条事件的时间戳是绝对 Unix 毫秒，已按开播锚点换算成相对时间`);
+    }
+  }
 
   const parsed: ParsedDanmaku = {
     items,
@@ -846,12 +926,21 @@ export function buildDensity(items: DanmakuItem[], opts: { windowSec: number; vi
   if (span <= 0) {
     // 视频时长未知时用弹幕最晚时刻兜底，避免产出空曲线（下游仍会拿到可用信号）
     let maxTime = 0;
-    for (const it of items) if (it.time > maxTime) maxTime = it.time;
+    for (const it of items) {
+      /* ★ 只认"像相对时间"的时刻（< 1e8 秒 ≈ 3.17 年）。
+         2026-10-07 实测事故：一条 SuperChat 的时刻是**绝对** Unix 秒 1.79e9，
+         这里兜底算出 span=1.79e9 ⇒ 循环建 1.79 亿个窗口对象 ⇒ 8GB 堆爆、进程 abort。
+         解析层已经修好（相对/绝对时间分开处理），但这里必须再兜一层：
+         密度曲线只是选片信号，任何脏时间都不该有机会把进程撑死。 */
+      if (it.time > 0 && it.time < EPOCH_LOOKALIKE_SEC && it.time > maxTime) maxTime = it.time;
+    }
     span = maxTime > 0 ? maxTime + windowSec : 0;
   }
   if (span <= 0) return [];
-
-  const n = Math.max(1, Math.ceil(span / windowSec));
+  // 硬上限：即便时长字段本身离谱（例如 10 年），也只建这么多窗口
+  const MAX_BUCKETS = 200_000;
+  span = Math.min(span, MAX_BUCKETS * windowSec);
+  const n = Math.max(1, Math.min(MAX_BUCKETS, Math.ceil(span / windowSec)));
   const points: DensityPoint[] = [];
   for (let i = 0; i < n; i++) {
     points.push({

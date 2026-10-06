@@ -518,6 +518,16 @@ export class Orchestrator {
       this.logger.warn('崩溃恢复检查失败（不阻塞启动）', { data: { error: (e as Error).message } });
     }
 
+    /* 崩溃恢复（第二半）：**把没做完的任务重新捡回来**。
+       上面那一步只修"卡住的切片"，而队列是内存态 —— 上次崩溃时正在跑/排在队列里的任务
+       重启后就没人管了（实测：一场 55 分钟录播因此从未被处理，面板却显示"已导入过"）。
+       用户主动停掉的场次有 stoppedByUserAt 标记，不会被复活。 */
+    try {
+      await this.recoverUnfinishedTasks();
+    } catch (e) {
+      this.logger.warn('启动恢复（重新入队未完成任务）失败（不阻塞启动）', { data: { error: (e as Error).message } });
+    }
+
     /* 内存看门狗：每 5 分钟写一行内存曲线，逼近堆上限时升级为 warn（并带上当前任务/阶段）。
        背景：2026-10-07 01:17:03 服务因 `JavaScript heap out of memory` **直接崩掉**
        （进程 abort，不是 JS 异常），事后无从归因 —— 日志里只有崩溃本身，没有内存曲线。
@@ -803,8 +813,82 @@ export class Orchestrator {
 
   /** 入队并异步推进；同一时间只处理一场 */
   async enqueue(taskId: string, fromStage?: Stage): Promise<void> {
+    /* 任何一次入队都意味着「现在要跑它」——顺手清掉"用户停过"的标记，
+       否则用户点了继续/重跑之后，下次服务重启又会因为旧标记把它跳过。
+       ⚠️ 清可选字段必须走第三个参数 `{unset:[...]}`：`patch` 里的 undefined 会被静默忽略
+       （这个坑在 updateTask 的注释里写着，实测踩过 —— 这里同样适用）。 */
+    try {
+      const rec = this.ledger.getTask(taskId);
+      if (rec?.stoppedByUserAt || (rec?.autoResumeCount ?? 0) > 0) {
+        this.ledger.updateTask(taskId, {}, { unset: ['stoppedByUserAt', 'autoResumeCount'] });
+      }
+    } catch {
+      /* 标记清理失败不阻塞入队 */
+    }
     this.queue.push(fromStage ? { taskId, fromStage } : { taskId });
     void this.drainQueue();
+  }
+
+  /**
+   * 启动时的**接着处理**：把「录完了但什么都没做」的任务重新入队。
+   *
+   * 实测背景（2026-10-07 01:17）：服务在处理一场 55 分钟录播时因堆 OOM 崩掉，
+   * 崩溃恢复把任务从 `TRANSCRIBING` 修回 `RECORDED`，而队列是内存态、重启后是空的 ——
+   * 那一场就再也没被处理过（素材白录、ASR/切片/投稿全没发生），
+   * 而面板上显示的是「已导入过（任务 …，状态 RECORDED）」，看起来像在处理。
+   *
+   * 安全边界：
+   *   · 只挑 `RECORDED`（素材就绪、零产出）——`ANALYZED` 是半自动模式**等用户确认**，绝不自动跑；
+   *   · 用户在界面上主动停过的场次（`stoppedByUserAt`）不会被复活；
+   *   · 源素材已经不在磁盘上的（清理删过）只记一条 warning，不入队，免得刷一屏失败报告；
+   *   · 已经在队列里的不重复入队。
+   */
+  async recoverUnfinishedTasks(): Promise<{ requeued: string[]; skippedMissing: string[]; refused: string[]; blocked: string[] }> {
+    const candidates = this.ledger.requeueCandidates();
+    const requeued: string[] = [];
+    const skippedMissing: string[] = [];
+    const refused: string[] = [];
+    const blocked: string[] = [];
+    for (const c of candidates) {
+      if (this.queue.some((q) => q.taskId === c.id)) {
+        refused.push(c.id);
+        continue;
+      }
+      const rec = this.ledger.getTask(c.id);
+      /* ★ 自动重跑次数上限：崩溃 → 拉起 → 重新入队 → 再崩，这条闭环必须有刹车。
+         实测（2026-10-07）：一场录播的弹幕解析 bug 让进程 OOM abort，
+         看门狗拉起后启动恢复又把它排进队列，于是每 2 分钟崩一次 —— 用户看到的就是"反复重启"。
+         超过上限就停手并留下警告：宁可停在"待处理"让人看见，也不能无限重启。 */
+      const tries = rec?.autoResumeCount ?? 0;
+      if (tries >= MAX_AUTO_RESUME) {
+        this.logger.warn(
+          `启动恢复：任务 ${c.id}（${c.title}）已自动重跑 ${tries} 次仍未完成，**停止自动重跑** —— ` +
+            `请在界面上查看它的错误报告，修好原因后手动点「继续处理」`,
+          { data: { taskId: c.id, autoResumeCount: tries } },
+        );
+        blocked.push(c.id);
+        continue;
+      }
+      const files = [
+        ...(rec?.source?.segments ?? []).map((s) => s.path),
+        ...(rec?.source?.rawFiles ?? []),
+      ].filter((p): p is string => typeof p === 'string' && p.length > 0);
+      if (files.length > 0 && !files.some((p) => exists(p))) {
+        skippedMissing.push(c.id);
+        this.logger.warn(`启动恢复：任务 ${c.id}（${c.title}）的源素材已不在磁盘上，跳过不重跑`);
+        continue;
+      }
+      requeued.push(c.id);
+      this.ledger.updateTask(c.id, { autoResumeCount: tries + 1 });
+      await this.enqueue(c.id, 'RECORDED');
+    }
+    if (requeued.length) {
+      this.logger.info(
+        `启动恢复：重新入队 ${requeued.length} 个「已录制但未处理」的任务（上次是在处理它们时停的，接着跑）`,
+        { data: { tasks: requeued.slice(0, 10) } },
+      );
+    }
+    return { requeued, skippedMissing, refused, blocked };
   }
 
   private async drainQueue(): Promise<void> {
@@ -2586,6 +2670,15 @@ export class Orchestrator {
     this.queue = this.queue.filter((q) => q.taskId !== taskId);
     this.progress.delete(taskId);
 
+    /* ★ 记下「用户主动停的」：崩溃恢复会把中断的任务修回可恢复状态（TRANSCRIBING → RECORDED），
+       而"用户点停止"走的是同一条修复路径 —— 两者落到同一个状态。没有这个标记，
+       服务下次重启时启动恢复会把用户明确不要的场次又捡回来跑（白烧 GPU / 白花钱）。 */
+    try {
+      this.ledger.updateTask(taskId, { stoppedByUserAt: nowIso() });
+    } catch {
+      /* 标记写不进去也不该让"停止"失败 */
+    }
+
     const repair = this.ledger.repairStuckTask(taskId);
     const note = removedFromQueue
       ? '已移出待处理队列，并修复了台账状态'
@@ -3223,6 +3316,15 @@ export class Orchestrator {
 
 /** 应用版本（写入错误报告，便于对照） */
 export const APP_VERSION = '1.0.0';
+
+/**
+ * 启动恢复时，同一个任务最多自动重跑几次。
+ *
+ * 存在的理由（2026-10-07 实测闭环）：任务触发的 bug 会让进程整个 abort，
+ * 而"崩溃 → 看门狗拉起 → 启动恢复重新入队 → 再崩"会无限循环 —— 2 分钟一轮，
+ * 用户看到的现象就是"切片助手在反复重启"。3 次之后停手并留警告。
+ */
+const MAX_AUTO_RESUME = 3;
 
 /** 带阶段信息的错误，用于精确定位失败阶段 */
 export class StageError extends Error {

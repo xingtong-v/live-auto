@@ -812,8 +812,32 @@ export class Ledger {
     return this.task(taskId);
   }
 
-  listTasks(opts: { status?: TaskStatus[]; limit?: number; sinceMs?: number; search?: string } = {}): TaskRecord[] {
+  /**
+   * 服务启动时该「接着处理」的任务：状态是 `RECORDED`（录完了但还什么都没做）且**不是用户主动停的**。
+   *
+   * 实测（2026-10-07）：一场 55 分钟的录播 00:53 自动导入、00:54 开始转写、01:17 服务 OOM 崩掉；
+   * 重启时崩溃恢复把它从 `TRANSCRIBING` 修回 `RECORDED`，而**队列是内存态**、启动时是空的 ——
+   * 于是这一场再也没人处理：面板显示「已导入过（任务 …，状态 RECORDED）」，看着像在处理，实际永远躺着。
+   * （那段 320MB 素材是白录的，ASR/切片/投稿全都没发生。）
+   *
+   * 只挑 `RECORDED` 的理由：它意味着"素材就绪、什么都没产出"，
+   * 重跑一定是从头做、且 ASR 缓存能复用已完成的窗口；而 `ANALYZED`（待审核）这类
+   * 是**半自动模式等用户确认**的状态，自动重跑会绕过用户的审核动作，绝不能碰。
+   */
+  requeueCandidates(): Array<{ id: string; title: string; updatedAt: string }> {
     this.load();
+    const out: Array<{ id: string; title: string; updatedAt: string }> = [];
+    for (const rec of Object.values(this.data.tasks)) {
+      if (rec.status !== 'RECORDED') continue;
+      if (rec.stoppedByUserAt) continue; // 用户明确停掉的：不许复活
+      out.push({ id: rec.id, title: rec.title ?? '', updatedAt: rec.updatedAt ?? '' });
+    }
+    // 早的先来（按最后更新时间升序），保证积压时的处理顺序符合直觉
+    out.sort((a, b) => String(a.updatedAt).localeCompare(String(b.updatedAt)));
+    return out;
+  }
+
+  listTasks(opts: { status?: TaskStatus[]; limit?: number; sinceMs?: number; search?: string } = {}): TaskRecord[] {    this.load();
     let rows: TaskRecord[] = Object.values(this.data.tasks);
     const status = opts.status;
     if (status && status.length > 0) rows = rows.filter((t) => status.includes(t.status));
