@@ -1789,13 +1789,41 @@ export class Ledger {
     danmaku?: number;
     reply?: number;
     share?: number;
+    /* 下面几个是「让表现页在台账之外也能自洽」的字段（2026-10-06 加）：
+       台账里的任务会被用户删掉（实测当天批量删了十几个），一删就再也 join 不出标题与评分，
+       表现页会跟着变空 —— 把标题/评分/分P 数一起落进 performance.jsonl，页面就只依赖这份历史。 */
+    /** 稿件标题（取不到就是 bvid） */
+    title?: string;
+    /** 该稿件内最高分片段的 LLM 评分（相关性表的横轴） */
+    score?: number;
+    /** 分P 数（多分P 模式下 ≥2） */
+    parts?: number;
+    /** 稿件已确认不存在（被删/下架）：之后不再请求，页面上明确标出来 */
+    gone?: boolean;
+    /** 稿件存在但取不到统计（实测 `state=-4 已锁定`）：如实标出来，**不写 0 冒充数据** */
+    unavailable?: string;
   }): void {
     const row: Record<string, unknown> = {
       bvid: entry.bvid,
       date: entry.date,
       at: nowIso(),
     };
-    const optional = ['taskId', 'clipIndex', 'view', 'like', 'coin', 'favorite', 'danmaku', 'reply', 'share'] as const;
+    const optional = [
+      'taskId',
+      'clipIndex',
+      'view',
+      'like',
+      'coin',
+      'favorite',
+      'danmaku',
+      'reply',
+      'share',
+      'title',
+      'score',
+      'parts',
+      'gone',
+      'unavailable',
+    ] as const;
     for (const key of optional) {
       const value = entry[key];
       if (value !== undefined) row[key] = value;
@@ -1818,33 +1846,123 @@ export class Ledger {
     return typeof limit === 'number' && limit > 0 ? rows.slice(-limit) : rows;
   }
 
-  /** 近 N 天已发布且尚未拉过数据的 bvid 列表（供 WP6 步骤 11 每日回流） */
-  bvidsNeedingPerformance(days: number, now: Date = new Date()): Array<{ bvid: string; taskId: string; clipIndex: number }> {
+  /**
+   * 近 N 天需要拉取表现数据的稿件（供 WP6 步骤 11 每日回流）。
+   *
+   * ★ 判据是「**有 bvid**」而不是「状态 == PUBLISHED」（2026-10-06 实测修复）。
+   *
+   * 为什么：多分P 模式下切片是**追加**进 biliLive-tools 那份稿件的，续传时台账里就写上了
+   * 目标稿件的 bvid（publish.ts 成功分支），但状态只到 `SUBMITTED` —— 而周期性反查是
+   * **按稿件标题**匹配的，分P 标题不是稿件标题，永远匹配不上，于是这些切片永远停在 SUBMITTED。
+   * 结果：表现回流一个候选都取不到（`checked=0`），界面上「稿件表现」永远是空的
+   * （实测线上 12 个切片全是有 bvid 的 SUBMITTED，一条数据都拉不回来）。
+   *
+   * ★ 候选来自三个来源（2026-10-06 补第二、三个）：
+   *   ① 台账里「已投出且有 bvid」的切片；
+   *   ② `performance.jsonl` 里近 N 天出现过的 bvid —— **任务被删掉之后仍然继续跟踪**。
+   *      实测：用户当天批量删了十几个任务，一删这些稿件的表现就从页面上消失了，
+   *      可稿件还在 B站 上、数据还在变；表现页不该因为本地清理而失忆。
+   *   ③ 调用方传进来的 `extra`（＝ biliLive-tools 的**我的稿件列表**）——
+   *      覆盖「完整版由 biliLive-tools 自己投、台账里根本没有任务」的稿件。
+   *
+   * @param extra 额外的候选（来自稿件列表）：bvid 必填，title/parts/ctime 可选
+   */
+  bvidsNeedingPerformance(
+    days: number,
+    now: Date = new Date(),
+    extra: Array<{ bvid: string; title?: string; parts?: number; ctime?: number }> = [],
+  ): Array<{ bvid: string; taskId?: string; clipIndex?: number; title?: string; score?: number; parts?: number }> {
     this.load();
     const windowDays = Number.isFinite(days) && days > 0 ? days : 1;
     const sinceMs = now.getTime() - windowDays * 86400_000;
+    const fromDate = fmtDate(sinceMs);
     const today = fmtDate(now);
-    // 当天已有回流记录的 bvid 直接跳过（每天只拉一次）
+    // 当天已有回流记录的 bvid 直接跳过（每天只拉一次）；同时记住最近一次记录的标题/评分/分P，供退化时沿用
     const pulledToday = new Set<string>();
+    const carried = new Map<string, { title?: string; score?: number; parts?: number; at: string }>();
+    /* 最近一次记录说「稿件已不存在」的 bvid：不再反复请求（每天 11 个废请求纯属浪费）。
+       文件是追加写的 → 后面的行更新，直接覆盖上一次的判断；稿件若重新出现在稿件列表里（extra）会重新纳入。 */
+    const goneLatest = new Set<string>();
     for (const row of readJsonl<Record<string, unknown>>(this.performancePath)) {
       const bvid = typeof row['bvid'] === 'string' ? row['bvid'] : '';
-      if (bvid && String(row['date'] ?? '') === today) pulledToday.add(bvid);
+      if (!bvid) continue;
+      const date = String(row['date'] ?? '');
+      if (date === today) pulledToday.add(bvid);
+      if (row['gone'] === true) goneLatest.add(bvid);
+      else goneLatest.delete(bvid); // 后来的行说它又在了 → 撤销标记
+      // 历史行只在窗口内参与「沿用」；文件本身是追加写的，后面的行更新，直接覆盖
+      if (date >= fromDate) {
+        const prev = carried.get(bvid);
+        const title = typeof row['title'] === 'string' ? row['title'] : prev?.title;
+        const score = typeof row['score'] === 'number' ? row['score'] : prev?.score;
+        const parts = typeof row['parts'] === 'number' ? row['parts'] : prev?.parts;
+        carried.set(bvid, {
+          at: date,
+          ...(title !== undefined ? { title } : {}),
+          ...(score !== undefined ? { score } : {}),
+          ...(parts !== undefined ? { parts } : {}),
+        });
+      }
     }
-    const out: Array<{ bvid: string; taskId: string; clipIndex: number }> = [];
+    type Cand = { bvid: string; taskId?: string; clipIndex?: number; title?: string; score?: number; parts?: number };
+    const out: Cand[] = [];
     const seen = new Set<string>();
+    const clipScore = new Map<string, number>(); // bvid → 该稿件内最高分（相关性表的横轴）
+    const clipParts = new Map<string, number>(); // bvid → 台账里能数到的分P 数
+    const clipTitle = new Map<string, string>();
+    /* 稿件列表里的 bvid：既用来过滤「已判定不存在」的历史行，也说明它当前确实还在 */
+    const listedBvids = new Set(extra.map((e) => String(e.bvid ?? '').trim()).filter((b) => b.length > 0));
+    const skip = (bvid: string): boolean =>
+      seen.has(bvid) || pulledToday.has(bvid) || (goneLatest.has(bvid) && !listedBvids.has(bvid));
     for (const [taskId, taskRecord] of Object.entries(this.data.tasks)) {
       const rec = taskRecord as LedgerTaskRecord;
       for (const clip of this.clipsArray(rec)) {
-        if (clip.status !== 'PUBLISHED' || !clip.bvid) continue;
+        /* 只要「投出去了且知道 bvid」就算：PUBLISHED 是常规态，
+           SUBMITTED+bvid 是多分P 续传后的常态（见方法注释）。SUBMITTING 还没有 bvid，天然被排除。 */
+        if (!clip.bvid) continue;
+        if (clip.status !== 'PUBLISHED' && clip.status !== 'SUBMITTED') continue;
         if (clip.archiveGoneAt) continue; // 已判定稿件不存在（被删/下架），不再反复请求
-        if (seen.has(clip.bvid) || pulledToday.has(clip.bvid)) continue;
+        const bvid = clip.bvid;
+        clipParts.set(bvid, (clipParts.get(bvid) ?? 0) + 1);
+        if (typeof clip.score === 'number' && clip.score > (clipScore.get(bvid) ?? -Infinity)) {
+          clipScore.set(bvid, clip.score);
+          clipTitle.set(bvid, clip.title);
+        }
+        if (skip(bvid)) continue;
         const when = clip.submitTime ?? parseIsoMs(taskRecord.publishedAt) ?? parseIsoMs(taskRecord.updatedAt);
         if (when !== undefined && when < sinceMs) continue;
-        seen.add(clip.bvid);
-        out.push({ bvid: clip.bvid, taskId, clipIndex: clip.index });
+        seen.add(bvid);
+        out.push({ bvid, taskId, clipIndex: clip.index });
       }
     }
-    return out;
+    /* ② 历史里跟踪过的稿件（任务可能已被删） */
+    for (const [bvid, hist] of carried) {
+      if (skip(bvid)) continue;
+      seen.add(bvid);
+      out.push({
+        bvid,
+        ...(hist.title !== undefined ? { title: hist.title } : {}),
+        ...(hist.score !== undefined ? { score: hist.score } : {}),
+        ...(hist.parts !== undefined ? { parts: hist.parts } : {}),
+      });
+    }
+    /* ③ 稿件列表里的稿件（完整版可能没有对应的本地任务） */
+    for (const item of extra) {
+      const bvid = String(item.bvid ?? '').trim();
+      if (!bvid || seen.has(bvid) || pulledToday.has(bvid)) continue;
+      // 列表项带创建时间时按窗口过滤；没有时间就保守地纳入（宁可多查一次）
+      if (typeof item.ctime === 'number' && item.ctime > 0 && item.ctime * 1000 < sinceMs) continue;
+      seen.add(bvid);
+      const title = item.title ?? carried.get(bvid)?.title;
+      out.push({ bvid, ...(title !== undefined ? { title } : {}), ...(item.parts !== undefined ? { parts: item.parts } : {}) });
+    }
+    /* 用台账里的评分/分P 数补全（历史行里没有这些字段时也能拿到） */
+    return out.map((c) => ({
+      ...c,
+      ...(c.score === undefined && clipScore.has(c.bvid) ? { score: clipScore.get(c.bvid) } : {}),
+      ...(c.title === undefined && clipTitle.has(c.bvid) ? { title: clipTitle.get(c.bvid) } : {}),
+      ...(c.parts === undefined && clipParts.has(c.bvid) ? { parts: clipParts.get(c.bvid) } : {}),
+    }));
   }
 
   /* -------------------------------------------------------------------------

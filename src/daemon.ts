@@ -2562,10 +2562,21 @@ export class Orchestrator {
   }
 
   /**
-   * 拉取近 30 天已发布切片的表现数据，追加写入 `performance.jsonl`。
+   * 拉取近 30 天稿件的表现数据，追加写入 `performance.jsonl`。
    *
    * 设计取舍（原文依据）：每日一次、**只读接口**、无风控压力。
    * 本版只做**拉取与存储**，不做任何自动调整阈值/模型（那是附录 B 的二期功能）。
+   *
+   * ★ 2026-10-06 修复（用户报「稿件表现 这里现在没办法工作」）三个真实缺陷：
+   *   ① **统计字段读错了层级**：biliLive-tools v3.22.1 的 `/bili/user/archive/:bvid` 把数字放在
+   *      `View.stat` 里，顶层没有 `stat` —— 旧代码 `detail.stat.view` 恒为 undefined，
+   *      于是每次都写 `view: 0`（实测 performance.jsonl 里 11 行全是 0，页面自然全是 0）。
+   *      现在 `View.stat` 优先、顶层 `stat` 兼容兜底，并把 `View.videos`（分P 数）与标题一起落账。
+   *   ② **候选只来自台账**：台账里的任务被删掉（实测用户当天批量删了十几个），
+   *      这些稿件的表现就再也拉不到了。现在还会沿用 performance.jsonl 里跟踪过的 bvid，
+   *      并把 biliLive-tools 的**我的稿件列表**作为第三来源（覆盖完整版由 biliLive-tools 投、本地没任务的稿件）。
+   *   ③ **稿件消失只是日志**：详情查不到时旧逻辑只写一条 debug，页面上看不出发生了什么。
+   *      现在确认消失的会写一条 `gone` 记录（页面明确标「稿件已不存在」），并且当天不再重试。
    */
   async refreshPerformance(opts: { days?: number } = {}): Promise<{
     checked: number;
@@ -2575,26 +2586,53 @@ export class Orchestrator {
   }> {
     const days = opts.days ?? 30;
     const notes: string[] = [];
-    const pending = this.ledger.bvidsNeedingPerformance(days);
     const failed: Array<{ bvid: string; error: string }> = [];
     let updated = 0;
 
+    /* 稿件列表：一次请求，既用于「我的稿件」枚举，也用于「详情查不到时确认是否真的没了」 */
+    /* 稿件列表：一次请求，三个用途 —— 枚举我的全部稿件、给候选补标题/分P 数、
+       详情取不到时**区分「被删」与「已锁定/审核中」**（实测两份 09-26 的稿件是 `state=-4 已锁定`：
+       B站 侧公开接口 -404、biliLive-tools 详情 500，但它们并没有被删，不能报成「已不存在」）。 */
+    let listed: Array<{ bvid: string; title?: string; ctime?: number; state?: number; stateDesc?: string }> = [];
+    let listOk = false;
+    try {
+      const archives = await this.client.biliArchives({ page: 1, pageSize: 100 });
+      listed = archives
+        .map((a) => ({
+          bvid: String(a.bvid ?? '').trim(),
+          ...(typeof a.title === 'string' ? { title: a.title } : {}),
+          ...(typeof a.ctime === 'number' ? { ctime: a.ctime } : {}),
+          ...(typeof a.state === 'number' ? { state: a.state } : {}),
+          ...(typeof a.state_desc === 'string' ? { stateDesc: a.state_desc } : {}),
+        }))
+        .filter((a) => a.bvid.length > 0);
+      listOk = true;
+    } catch (e) {
+      notes.push(`读取我的稿件列表失败（只影响「完整版稿件」的枚举与稿件状态判定）：${(e as Error).message.slice(0, 80)}`);
+    }
+    const listedMap = new Map(listed.map((a) => [a.bvid, a]));
+
+    const pending = this.ledger.bvidsNeedingPerformance(days, new Date(), listed);
     if (pending.length === 0) {
-      notes.push(`近 ${days} 天没有需要拉取表现数据的切片（可能都已拉过，或还没有已发布且反查到 bvid 的切片）`);
+      notes.push(`近 ${days} 天没有需要拉取表现数据的稿件（可能都已拉过，或还没有「已投出且拿到 bvid」的切片）`);
       return { checked: 0, updated: 0, failed, notes };
     }
 
-    this.logger.info(`开始拉取稿件表现数据：${pending.length} 个切片（每日一次，只读接口）`);
+    this.logger.info(`开始拉取稿件表现数据：${pending.length} 个稿件（每日一次，只读接口）`);
     const today = fmtLocal().slice(0, 10);
+    let unavailable = 0;
 
     for (const item of pending) {
       try {
-        const detail = await this.client.biliArchiveDetail(item.bvid);
-        const stat = (detail.stat ?? {}) as Record<string, number | undefined>;
+        const detail = await this.client.biliArchiveDetail(item.bvid, { retry: 0 });
+        /* ★ 数字在 View.stat（见方法注释）；两个层级都认，避免版本差异又把页面打成 0 */
+        const stat = (detail.View?.stat ?? detail.stat ?? {}) as Record<string, number | undefined>;
+        const title = detail.View?.title ?? detail.title ?? item.title;
+        const parts = typeof detail.View?.videos === 'number' ? detail.View.videos : item.parts;
         this.ledger.recordPerformance({
           bvid: item.bvid,
-          taskId: item.taskId,
-          clipIndex: item.clipIndex,
+          ...(item.taskId !== undefined ? { taskId: item.taskId } : {}),
+          ...(item.clipIndex !== undefined ? { clipIndex: item.clipIndex } : {}),
           date: today,
           view: stat['view'] ?? 0,
           like: stat['like'] ?? 0,
@@ -2603,30 +2641,39 @@ export class Orchestrator {
           danmaku: stat['danmaku'] ?? 0,
           reply: stat['reply'] ?? 0,
           share: stat['share'] ?? 0,
+          ...(title !== undefined ? { title } : {}),
+          ...(item.score !== undefined ? { score: item.score } : {}),
+          ...(parts !== undefined ? { parts } : {}),
         });
         updated++;
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         failed.push({ bvid: item.bvid, error: msg });
-        // 单个稿件查询失败不影响其它（可能是稿件被删或接口限流）
+        // 单个稿件查询失败不影响其它（可能是稿件被删、被锁定或接口限流）
         if (isArchiveGoneError(msg)) {
-          // 错误文案有歧义（「啥都木有」在**审核中/转码中**也会出现），必须再确认一次：
-          // 该 bvid 是否已从稿件列表里消失。列表里还在 → 只是详情暂时取不到，不算消失。
-          let stillListed = false;
-          try {
-            const archives = await this.client.biliArchives({ page: 1, pageSize: 100 });
-            stillListed = archives.some((a) => a.bvid === item.bvid);
-          } catch {
-            stillListed = true; // 列表都查不到时**宁可当作还在**，避免误标记
-          }
-          if (stillListed) {
-            this.logger.debug(`稿件 ${item.bvid} 详情暂不可用但仍在稿件列表中（审核/转码中？），保留后续重试`);
+          const meta = listOk ? listedMap.get(item.bvid) : undefined;
+          if (listOk && !meta) {
+            /* 列表里没有 → 确实没了（用户删稿 / 下架）。再拉没有意义。 */
+            this.markPerformanceGone(item, today, '已不在稿件列表（被删或下架）');
+            notes.push(`稿件 ${item.bvid} 已不在稿件列表（被删或下架），已标记，页面会显示「稿件已不存在」`);
+          } else if (meta && typeof meta.state === 'number' && meta.state !== 0) {
+            /* 列表里在、但状态不是「开放浏览」（实测 -4 = 已锁定）：
+               B站 侧不公开就取不到统计，**如实标注**，绝不写 0 冒充数据。 */
+            unavailable++;
+            this.ledger.recordPerformance({
+              bvid: item.bvid,
+              ...(item.taskId !== undefined ? { taskId: item.taskId } : {}),
+              ...(item.clipIndex !== undefined ? { clipIndex: item.clipIndex } : {}),
+              date: today,
+              ...(meta.title !== undefined ? { title: meta.title } : item.title !== undefined ? { title: item.title } : {}),
+              ...(item.score !== undefined ? { score: item.score } : {}),
+              ...(item.parts !== undefined ? { parts: item.parts } : {}),
+              unavailable: meta.stateDesc ?? `稿件状态异常（state=${meta.state}）`,
+            });
+            notes.push(`稿件 ${item.bvid} 当前状态是「${meta.stateDesc ?? `state=${meta.state}`}」，取不到统计（页面标为不可用，不写 0）`);
           } else {
-            // 确认消失（用户删稿 / 被下架）：重试没有意义，
-            // 记下来，之后不再对它发起请求，否则每天都会重试 3 次并刷一条 ERROR。
-            this.ledger.setClipStatus(item.taskId, item.clipIndex, 'PUBLISHED', { archiveGoneAt: nowIso() });
-            notes.push(`稿件 ${item.bvid} 已不在稿件列表（被删或下架），已标记并停止拉取表现数据`);
-            this.logger.warn(`稿件 ${item.bvid} 已确认消失，标记 archiveGoneAt 后不再重试`);
+            /* 开放浏览却查不到：多半是审核/转码/缓存延迟，保留后续重试，不落行（也不写 0） */
+            this.logger.debug(`稿件 ${item.bvid} 详情暂不可用但仍在稿件列表中（审核/转码中？），保留后续重试`);
           }
         } else {
           this.logger.debug(`拉取 ${item.bvid} 表现数据失败：${msg}`);
@@ -2634,11 +2681,40 @@ export class Orchestrator {
       }
     }
     notes.push(
-      `已更新 ${updated}/${pending.length} 个切片的表现数据到 performance.jsonl；` +
-        `与 decisions.jsonl 按 taskId 关联后可在 UI 查看「LLM 评分 vs 实际表现」`,
+      `已更新 ${updated}/${pending.length} 个稿件的表现数据到 performance.jsonl` +
+        (unavailable ? `（另有 ${unavailable} 个稿件因状态异常取不到统计）` : '') +
+        `；页面上「LLM 评分 vs 实际播放」按稿件汇总（多分P 同稿件共享总播放）。`,
     );
     this.logger.info(notes[notes.length - 1]!);
     return { checked: pending.length, updated, failed, notes };
+  }
+
+  /**
+   * 记一条「稿件已不存在」的表现记录，并在有对应切片时把台账也标掉。
+   *
+   * 为什么要有单独的记录而不是只写台账：候选现在也来自 performance.jsonl 与稿件列表，
+   * 台账里可能压根没有这些稿件的任务（完整版由 biliLive-tools 投的、或任务已被用户删掉的）。
+   * 只写台账的话这些稿件明天还会被当成新候选重新请求一遍。
+   */
+  private markPerformanceGone(
+    item: { bvid: string; taskId?: string; clipIndex?: number; title?: string; score?: number; parts?: number },
+    today: string,
+    reason: string,
+  ): void {
+    this.ledger.recordPerformance({
+      bvid: item.bvid,
+      ...(item.taskId !== undefined ? { taskId: item.taskId } : {}),
+      ...(item.clipIndex !== undefined ? { clipIndex: item.clipIndex } : {}),
+      date: today,
+      ...(item.title !== undefined ? { title: item.title } : {}),
+      ...(item.score !== undefined ? { score: item.score } : {}),
+      ...(item.parts !== undefined ? { parts: item.parts } : {}),
+      gone: true,
+    });
+    if (item.taskId && item.clipIndex !== undefined) {
+      this.ledger.setClipStatus(item.taskId, item.clipIndex, 'PUBLISHED', { archiveGoneAt: nowIso() });
+    }
+    this.logger.warn(`稿件 ${item.bvid} ${reason}，已标记，不再反复拉取表现数据`);
   }
 
   /** 每月费用汇总（使用期辅助功能：成本月度汇总） */

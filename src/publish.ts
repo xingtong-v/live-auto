@@ -2471,15 +2471,20 @@ export class Publisher {
       this.archiveDetailCache.clear();
       for (const p of titled) {
         if (p.kind === 'clip' && p.clipIndex !== undefined) {
-          this.ledger.setClipStatus(task.id, p.clipIndex, 'SUBMITTED', {
+          /* ★★ 续传成功 + 目标稿件 bvid 已知 ⇒ 直接记 **PUBLISHED**（2026-10-06 实测修复）。
+             这两件事都已经由上面的 confirmPartTitlesLanded 确认：分P 真的出现在了这个稿件里，
+             而稿件的 bvid 是确定的。旧写法无论确认与否都只记 SUBMITTED，后果是：
+               · 周期性反查是**按稿件标题**找的，分P 标题 ≠ 稿件标题 → 永远反查不到 → 永远停在 SUBMITTED；
+               · 表现回流（bvidsNeedingPerformance）与「稿件表现」页面只认 PUBLISHED → 页面永远是空的（实测）；
+               · 本场状态也永远到不了 PUBLISHED，`cleanup.deleteAfterUpload`（用完即删）不触发。
+             仍然写 bvid（同 bvid、不同 cid，这些切片就是该稿件的分P）。
+             没有 resumeAid（新建稿件）时 bvid 尚不可知，保持 SUBMITTED 交给周期性反查。 */
+          const landed = Boolean(resumeAid && opts.resumeBvid);
+          this.ledger.setClipStatus(task.id, p.clipIndex, landed ? 'PUBLISHED' : 'SUBMITTED', {
             uploadTaskId: res.taskId,
             submitTime: submitTimeMs,
             dtime,
-            /* ★ 续传：这些切片就是目标稿件的分P（同 bvid、不同 cid），所以直接把该稿件的 bvid 写进台账。
-               不写的话它们会永远停在 SUBMITTED 且无 bvid —— 周期性反查是**按稿件标题**找的，
-               而分P 标题不是稿件标题，永远找不到；于是本场到不了 PUBLISHED，
-               `cleanup.deleteAfterUpload`（用完即删）也就永远不触发（实测一场 20 GB 录播会一直留着）。 */
-            ...(resumeAid && opts.resumeBvid ? { bvid: opts.resumeBvid, publishedAt: nowIso() } : {}),
+            ...(landed && opts.resumeBvid ? { bvid: opts.resumeBvid, publishedAt: nowIso() } : {}),
           });
           const c = this.ledger.getClip(task.id, p.clipIndex);
           if (c) {

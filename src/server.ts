@@ -3055,35 +3055,98 @@ export class UiServer {
   private performanceView(): Record<string, unknown> {
     const perf = this.orch.ledger.readPerformance({ sinceMs: Date.now() - 30 * 86400_000 });
     const tasks = this.orch.ledger.listTasks({ limit: 300 });
-    // 按 taskId 关联 decisions 与 performance，看「LLM 高分 vs 实际表现」
-    const rows: Array<Record<string, unknown>> = [];
+    /* 按 bvid 汇总「LLM 评分 vs 实际表现」。
+       ★ 2026-10-06 实测修复（用户报「这里现在没办法工作」），三处：
+       ① 判据从「状态 == PUBLISHED」放宽为「**有 bvid 且已投出**」：多分P 续传后切片停在
+          SUBMITTED 是常态（周期性反查按稿件标题匹配，分P 标题永远匹配不上），旧判据让整页恒为空。
+       ② **行来自 performance.jsonl（union 台账）**：台账里的任务被删掉后，旧实现连行都拼不出来，
+          可稿件还在 B站 上、数据还在变。现在只要历史里有这个 bvid 就照样出页面。
+       ③ **按稿件去重**：多分P 模式下同一稿件的各分P 共享稿件总播放，逐个分P 出一行会把同一份
+          播放数重复 N 次 —— 相关性表的"稿件数"会被分P 多的稿件带偏。 */
+    type LedgerAgg = { titles: string[]; scores: number[]; parts: number; degraded: boolean; dtime?: number; taskId: string; index: number };
+    const byBvid = new Map<string, LedgerAgg>();
     for (const t of tasks) {
       for (const c of this.orch.ledger.getClips(t.id)) {
-        if (c.status !== 'PUBLISHED' || !c.bvid) continue;
-        const p = perf.filter((x) => (x as { bvid?: string }).bvid === c.bvid).sort(
-          (a, b2) => String((b2 as { date?: string }).date).localeCompare(String((a as { date?: string }).date)),
-        )[0] as { view?: number; like?: number; coin?: number; favorite?: number; danmaku?: number; date?: string } | undefined;
-        rows.push({
-          taskId: t.id,
-          index: c.index,
-          title: c.title,
-          bvid: c.bvid,
-          url: `https://www.bilibili.com/video/${c.bvid}`,
-          llmScore: c.score,
-          degraded: c.degraded,
-          publishedAt: c.dtime ? fmtLocal(c.dtime * 1000) : undefined,
-          view: p?.view,
-          like: p?.like,
-          coin: p?.coin,
-          favorite: p?.favorite,
-          danmaku: p?.danmaku,
-          statDate: p?.date,
-        });
+        if (!c.bvid) continue;
+        if (c.status !== 'PUBLISHED' && c.status !== 'SUBMITTED') continue;
+        const cur = byBvid.get(c.bvid);
+        if (cur) {
+          cur.parts++;
+          cur.titles.push(c.title);
+          cur.scores.push(c.score);
+        } else {
+          byBvid.set(c.bvid, {
+            titles: [c.title],
+            scores: [c.score],
+            parts: 1,
+            degraded: c.degraded,
+            ...(c.dtime !== undefined ? { dtime: c.dtime } : {}),
+            taskId: t.id,
+            index: c.index,
+          });
+        }
       }
     }
-    const withView = rows.filter((r) => typeof r['view'] === 'number');
-    withView.sort((a, b) => Number(b['view'] ?? 0) - Number(a['view'] ?? 0));
-    // LLM 评分分档 vs 平均播放
+    /* 每个 bvid 取最近一次回流记录（文件是追加写的，后出现的更新） */
+    type PerfRow = {
+      bvid?: string;
+      date?: string;
+      at?: string;
+      view?: number;
+      like?: number;
+      coin?: number;
+      favorite?: number;
+      danmaku?: number;
+      reply?: number;
+      share?: number;
+      title?: string;
+      score?: number;
+      parts?: number;
+      gone?: boolean;
+      unavailable?: string;
+    };
+    const latest = new Map<string, PerfRow>();
+    for (const raw of perf) {
+      const r = raw as PerfRow;
+      const bvid = typeof r.bvid === 'string' ? r.bvid : '';
+      if (!bvid) continue;
+      const prev = latest.get(bvid);
+      // 同一天的短行（只有 gone/unavailable）也要能覆盖，所以直接以文件顺序为准
+      if (!prev || String(r.date ?? '') >= String(prev.date ?? '')) latest.set(bvid, r);
+    }
+    const rows: Array<Record<string, unknown>> = [];
+    const bvids = new Set<string>([...byBvid.keys(), ...latest.keys()]);
+    for (const bvid of bvids) {
+      const agg = byBvid.get(bvid);
+      const p = latest.get(bvid);
+      const best = agg ? Math.max(...agg.scores) : undefined;
+      const title = agg?.titles[0] ?? p?.title ?? bvid;
+      rows.push({
+        bvid,
+        url: `https://www.bilibili.com/video/${bvid}`,
+        title,
+        ...(agg ? { taskId: agg.taskId, index: agg.index } : {}),
+        /* 评分取该稿件内最高分的那一P：稿件播放由所有分P 共同贡献，最高分那一P 最有解释力 */
+        llmScore: best ?? p?.score,
+        degraded: agg?.degraded ?? false,
+        partCount: agg?.parts ?? p?.parts ?? 1,
+        publishedAt: agg?.dtime ? fmtLocal(agg.dtime * 1000) : undefined,
+        view: p?.view,
+        like: p?.like,
+        coin: p?.coin,
+        favorite: p?.favorite,
+        danmaku: p?.danmaku,
+        /* 只有**真的拉到统计**才算有数据日期：锁定/已删的行也带日期的话，
+           页面会显示「数据日期 = 今天」却一个数字都没有（自相矛盾）。 */
+        statDate: typeof p?.view === 'number' ? p.date : undefined,
+        ...(p?.gone ? { gone: true } : {}),
+        ...(p?.unavailable ? { unavailable: p.unavailable } : {}),
+      });
+    }
+    const scored = rows.filter((r) => typeof r['view'] === 'number');
+    scored.sort((a, b) => Number(b['view'] ?? 0) - Number(a['view'] ?? 0));
+    // LLM 评分分档 vs 平均播放（只有既有播放又有评分的稿件参与相关性）
+    const withView = scored.filter((r) => typeof r['llmScore'] === 'number');
     const buckets = [
       { name: '≥9.0', min: 9, max: 11 },
       { name: '8.0–9.0', min: 8, max: 9 },
@@ -3096,11 +3159,18 @@ export class UiServer {
       return { bucket: b.name, count: items.length, avgView: Math.round(avg) };
     });
     return {
-      rows: withView.slice(0, 100),
+      /* 已经拉到数据的按播放降序；还没拉到的（未拉取/不可用）排在后面也一样可见 —— 空页面最没用 */
+      rows: [...scored, ...rows.filter((r) => typeof r['view'] !== 'number')].slice(0, 100),
       correlation,
       note:
         'LLM 评分是内容侧的判断，实际表现还受标题、发布时间、封面与推送影响 —— 本页只呈现相关性，不做因果结论。' +
-        '数据每日回流一次（performance.jsonl）。',
+        '数据每日回流一次（performance.jsonl）。' +
+        '多分P 模式下同一稿件的各分P 共享该稿件的总播放，所以这里**按稿件（bvid）去重**，' +
+        '评分取该稿件内最高分的那一P；「稿件数」因此是稿件数而非分P 数。' +
+        '「已锁定 / 仅自己可见」的稿件 B站 不公开统计，本页如实标注而不写 0。',
+      partTotal: rows.reduce((a, r) => a + Number(r['partCount'] ?? 1), 0),
+      archiveTotal: rows.length,
+      pulledTotal: scored.length,
     };
   }
 }

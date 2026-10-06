@@ -149,7 +149,9 @@ export interface ArchiveItem {
   desc?: string;
   ctime?: number;   // 秒
   pubtime?: number; // 秒
+  /** 0 = 开放浏览；-2 审核中；-4 已锁定（实测；`state_desc` 是中文文案） */
   state?: number;
+  state_desc?: string;
   stat?: {
     view?: number;
     like?: number;
@@ -163,9 +165,27 @@ export interface ArchiveItem {
   [k: string]: unknown;
 }
 
-/** GET /bili/user/archive/:bvid 稿件详情（数据回流来源） */
+/**
+ * GET /bili/user/archive/:bvid 稿件详情（数据回流来源）。
+ *
+ * ⚠️ 实测（biliLive-tools v3.22.1）：**统计数字在 `View.stat` 里，不在顶层 `stat`**。
+ * 顶层 `stat` 压根不存在 —— 旧代码读 `detail.stat.view` 拿到的一直是 `undefined`，
+ * 于是每次回流都写 `view: 0`：界面上「稿件表现」两段永远是 0 / 空（2026-10-06 用户报障的根因之一）。
+ * 两种形状都声明出来：顶层 `stat` 保留兼容（万一某个版本挪回去），`View` 是主路径。
+ */
 export interface ArchiveDetail extends ArchiveItem {
   stat?: ArchiveItem['stat'];
+  View?: {
+    bvid?: string;
+    aid?: number;
+    /** 分P 数 */
+    videos?: number;
+    title?: string;
+    /** 0 = 开放浏览 */
+    state?: number;
+    stat?: ArchiveItem['stat'];
+    [k: string]: unknown;
+  };
 }
 
 /** GET /user/list 账号（文档写数组，实测可能是对象，两种都要兼容） */
