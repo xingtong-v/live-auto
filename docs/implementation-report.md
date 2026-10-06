@@ -2883,8 +2883,8 @@ powershell.exe -NoProfile -NoLogo -NonInteractive -WindowStyle Hidden `
 | 守护脚本实跑（服务在跑时） | 退出码 0、1.7–2.1 秒返回、**服务 pid 未变**、node 进程数未变、`watchdog.log` **没有新增行**（静默通过） |
 | `Start-ScheduledTask` 手动触发 | 守护进程带 `-WindowStyle Hidden`（命令行核对）、服务 pid 未变、`LastTaskResult=0`、无日志写入 |
 | 「隐藏子进程能否活过任务结束」 | 用**同构的替身任务**（临时任务名 + 立即退出的脚本 + `Start-Process -WindowStyle Hidden`）验证：子进程在任务动作结束后 **35 秒以上仍存活**（这是"看门狗拉起服务后不会被连带收掉"的关键不确定性），验证后已清理替身进程与临时任务 |
-| `test/service-watchdog.ts`（**新增**） | **33 项全绿**：守护脚本无杀进程动作、BOM 与语法、任务动作=X 守护脚本+隐藏窗口+不再是 launcher、launcher 的清理已限定为子进程、非破坏性实跑（rc=0/pid 不变/无日志） |
-| 破坏性实跑（杀服务→看门狗拉回） | **默认不跑**，且**队列忙时自动拒绝**（本地 ASR 被打断会白烧 GPU）。需要时：`npm run service-watchdog-live` |
+| `test/service-watchdog.ts`（**新增**） | **33 项全绿**（`--live-restart` 时 38 项）：守护脚本无杀进程动作、BOM 与语法、任务动作=X 守护脚本+隐藏窗口+不再是 launcher、launcher 的清理已限定为子进程、非破坏性实跑（rc=0/pid 不变/无日志） |
+| 破坏性实跑（杀服务→看门狗拉回） | **已跑通**（等流水线连续 90 秒空闲后执行）：杀掉 pid 31524 → `Start-ScheduledTask` → 看门狗隐藏启动 pid **17152** → **任务结束后 30 秒仍存活** → `watchdog.log` 恰好两行（"服务不在运行…启动" + "服务已就绪"）；复查：服务主窗口句柄 **0**（无窗口）、launcher/守护残留进程 **0**。该步骤默认不跑且**队列忙时自动拒绝**（本地 ASR 被打断会白烧 GPU），需要时：`npm run service-watchdog-live` |
 
 顺带钉住的一条铁律（本轮被它坑过）：**所有 `.ps1` 必须是 UTF-8 带 BOM** ——
 编辑工具重写文件会丢掉 BOM，PowerShell 5.1 随即按 ANSI(936) 解码，中文变乱码并报
