@@ -115,6 +115,26 @@ function Test-Service([string]$u) {
   } catch { return $false }
 }
 
+# ★ 端口在监听也算「服务在跑」——哪怕 HTTP 探活超时。
+#   为什么必须补这一条（2026-10-06 实测）：HTTP 探活只有 3 秒超时，服务在忙
+#   （事件循环被同步操作占住）时会失败，于是启动器以为"没在跑"，去起第二个实例：
+#   第二个实例撞端口（EADDRINUSE）后，下面 finally 里的"按命令行特征兜底清理"
+#   会把**正在健康运行的那个服务**一起杀掉 —— 用户看到的就是"反复重启"。
+#   判定顺序：端口被占 ⇒ 绝不启动第二个（宁可什么都不做，也不能杀掉健康的服务）。
+function Test-Port([int]$p) {
+  try {
+    $c = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction Stop
+    if ($c) { return $true }
+  } catch { }
+  try {
+    $client = New-Object System.Net.Sockets.TcpClient
+    $iar = $client.BeginConnect('127.0.0.1', $p, $null, $null)
+    $okc = $iar.AsyncWaitHandle.WaitOne(800, $false)
+    $client.Close()
+    return $okc
+  } catch { return $false }
+}
+
 function Resolve-Node {
   $c = New-Object System.Collections.Generic.List[string]
   if ($env:LIVE_AUTO_NODE) { $c.Add($env:LIVE_AUTO_NODE) }
@@ -149,14 +169,29 @@ Set-Location -LiteralPath $ROOT
 
 # ---------------------------------------------------------------- 0. 已在运行？
 Head '0. 检查服务是否已在运行'
-if (Test-Service $URL) {
+$already = Test-Service $URL
+if (-not $already -and (Test-Port $Port)) {
+  # 端口被占但探活没通过：**服务在跑但繁忙**（实测过：3 秒超时太短）。
+  # 这种情况绝不能当"没在跑"——否则会起第二个实例并把健康的那个杀掉。
+  Ok "服务已经在运行（端口 $Port 在监听；/api/bootstrap 暂时没响应，多半正忙）"
+  $already = $true
+}
+if ($already) {
   Ok "服务已经在运行：$URL"
   if (-not $NoBrowser) {
     Say '  正在打开界面…' DarkGray
     $null = Open-App $URL
   }
   Say '  （无需重复启动；关闭本窗口不会停止已在运行的服务）' DarkGray
-  Pause-Exit 0
+  # ★ 这里原来会停在「按任意键关闭此窗口」。实测（2026-10-06 23:26）用户双击桌面快捷方式后
+  #   那个窗口一直挂在桌面上等着按键，看起来就像"启动失败/卡住了"。
+  #   服务既然已经在跑，这个窗口没有任何信息量 —— 自动关掉即可。
+  if (-not $NoPause) {
+    Write-Host ''
+    Say '  本窗口 8 秒后自动关闭（无需操作）…' DarkGray
+    Start-Sleep -Seconds 8
+  }
+  exit 0
 }
 
 # ---------------------------------------------------------------- 1. 环境检查
@@ -313,16 +348,19 @@ try {
     Start-Sleep -Milliseconds 500
   }
 } finally {
-  # 收尾：确保把后端子进程一起收掉，不留孤儿进程
+  # 收尾：确保把**我们自己启动的**后端子进程一起收掉，不留孤儿进程。
+  # ★ 2026-10-06 改：这里原来有一发"双保险"，按命令行特征扫全机 node.exe
+  #   （`CommandLine -like "*$ROOT*"`）逐个 Stop-Process。那太危险了：
+  #   只要本窗口是在"误判服务没在跑"之后打开的，这一发就会把**另一个健康实例**杀掉。
+  #   现在只收自己的子进程（ParentProcessId == 本进程），别人的服务一律不碰。
   if ($proc -and -not $proc.HasExited) {
     Write-Host ''
     Say '正在停止服务…' DarkGray
     try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch { }
     Start-Sleep -Milliseconds 800
   }
-  # 双保险：按命令行特征再扫一遍
   Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and $_.CommandLine -like "*$ROOT*" } |
+    Where-Object { $_.ParentProcessId -eq $PID } |
     ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
   Say '服务已停止。' DarkGray
 }

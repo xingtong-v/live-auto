@@ -2816,3 +2816,82 @@ GET /api/performance → 21 个稿件 / 243 个分P / 已拉到数据 8 个
 
 实测（真机、35 个真实文件）：页面上这一块从「12 行密集表格 + 每行一句重复指引」
 变成 **1 行结论 + 1 行可折叠表头（35 个）**，需要展开时才展开。
+
+## 27. 「我的切片助手在反复重启」——服务没重启，是窗口在闪（2026-10-06）
+
+用户问：「为什么 我的切片助手 在反复重启」。
+
+### 27.1 逐秒观测的结论：服务没有在重启
+
+对进程做逐秒采样（服务 pid + 端口 3000 的持有者 + launcher 进程集合），覆盖了 23:34:15 那一跳：
+
+```
+23:34:16  LAUNCHER SET CHANGED -> [31520@23:34:16@task=True]     ← 计划任务那一跳的 launcher 起来了
+23:34:18  LAUNCHER SET CHANGED -> [9936@23:26:21@task=False]    ← 2 秒后它自己退出
+END 23:34:46   服务 pid 全程 = 31524（22:21:36 启动，未变）
+```
+
+配合计划任务自己的记录：`LastRunTime=23:24:16  LastTaskResult=0`（0 = 成功），
+即**每一跳都只做了"检查一下、发现服务在跑、退出"**。
+今天的启动清单（本地时间，取自 `data/logs/live_auto-*.jsonl` 的启动横幅）：
+
+```
+17:01:29（开机） 20:44:22 | 21:24:20 21:24:27 21:31:08 21:52:10 22:03:40 22:05:26 22:08:15 22:21:36
+```
+
+21:24–22:21 那一串**是我和并行的另一个会话在改代码后主动重启服务**（每次都要重启才能加载新代码），
+不是自动循环：真正的 10 分钟跳点是 `:24 :34 :44 :54 :04 :14`，而清单里只有 21:24:27 落在跳点上。
+
+### 27.2 那"反复重启"的观感是从哪来的：三个真实缺陷
+
+1. **计划任务跑的是给人双击的交互式启动器**。
+   `tools/autostart.ps1` 注册的动作是 `launcher.ps1 -NoBrowser -NoPause`，而 `launcher.ps1`
+   是前台交互式启动器：它**创建可见控制台窗口**。于是每 10 分钟屏幕上闪一个窗口
+   （任务 `Hidden=False`、动作里也没有 `-WindowStyle Hidden`）。
+2. **探活只有 3 秒，误判就会杀健康服务**。
+   `launcher.ps1` 用 `GET /api/bootstrap`（3 秒超时）判断"服务在不在"。服务忙时（事件循环被占住）
+   会超时 → 判成"没在跑" → 起**第二个**实例 → 第二个实例撞端口（EADDRINUSE）→
+   紧接着它 `finally` 里的"双保险"按命令行特征扫全机：
+   `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where CommandLine -like "*$ROOT*"`，
+   **把正在健康运行的那个服务一起杀掉**。加上任务本身的"失败重试 3 次 / 每分钟"，
+   这就是一条真正的重启链。
+3. **启动器常驻前台持有服务**。它启动服务后自己留在前台（日志往窗口里灌）：
+   关掉那个窗口 = 服务停掉 → 下一跳又开一个窗口 ⇒ 用户看到的就是"反复重启"。
+   实测 23:26:21 桌面快捷方式起的那次（`task=False`）就是这种窗口，而且因为 `run.cmd` 不带
+   `-NoPause`，它**停在"按任意键关闭此窗口"**不动 —— 看起来像卡死。
+
+### 27.3 改法：自动这一路彻底无窗口、只拉起、绝不杀
+
+| 文件 | 改动 |
+|---|---|
+| `tools/ensure-service.ps1`（**新增**） | 计划任务专用守护：① 端口在监听 ⇒ **什么都不做**（哪怕探活超时，判为"在跑但繁忙"）；② 端口空闲 ⇒ `Start-Process -WindowStyle Hidden` 起独立服务，等就绪后退出（上限 180 秒）；③ **全脚本没有 Stop-Process / taskkill**。只在真启动时往 `data/logs/watchdog.log` 写一行 |
+| `tools/autostart.ps1` | 默认动作改成 `powershell -NoProfile -NoLogo -NonInteractive -WindowStyle Hidden -File tools\ensure-service.ps1 -Port <port>`；新增 `-VisibleLauncher` 回到老行为；`-Status` 会打印"任务动作是哪个脚本"并对旧注册给出告警 |
+| `launcher.ps1` | ① 新增 `Test-Port`，「端口在监听但探活失败」判为**在跑但繁忙**（不再误判）；② 收尾清理限定为**自己的子进程**（`ParentProcessId -eq $PID`），删掉按命令行扫全机的那一发；③ 「已在运行」时窗口 8 秒后自动关闭，不再停在"按任意键" |
+| `README.md` | 自启一节重写：自动=无窗口守护、手动=桌面快捷方式（有窗口、关窗口即停），以及"想停久一点"用 `Disable-ScheduledTask` |
+
+已把线上任务重新注册（`tools\autostart.ps1 -Install`），当前动作：
+
+```
+powershell.exe -NoProfile -NoLogo -NonInteractive -WindowStyle Hidden `
+  -ExecutionPolicy Bypass -File "F:\deepseek\live_auto\tools\ensure-service.ps1" -Port 3000
+```
+
+### 27.4 验证
+
+| 手段 | 结果 |
+|---|---|
+| 守护脚本实跑（服务在跑时） | 退出码 0、1.7–2.1 秒返回、**服务 pid 未变**、node 进程数未变、`watchdog.log` **没有新增行**（静默通过） |
+| `Start-ScheduledTask` 手动触发 | 守护进程带 `-WindowStyle Hidden`（命令行核对）、服务 pid 未变、`LastTaskResult=0`、无日志写入 |
+| 「隐藏子进程能否活过任务结束」 | 用**同构的替身任务**（临时任务名 + 立即退出的脚本 + `Start-Process -WindowStyle Hidden`）验证：子进程在任务动作结束后 **35 秒以上仍存活**（这是"看门狗拉起服务后不会被连带收掉"的关键不确定性），验证后已清理替身进程与临时任务 |
+| `test/service-watchdog.ts`（**新增**） | **33 项全绿**：守护脚本无杀进程动作、BOM 与语法、任务动作=X 守护脚本+隐藏窗口+不再是 launcher、launcher 的清理已限定为子进程、非破坏性实跑（rc=0/pid 不变/无日志） |
+| 破坏性实跑（杀服务→看门狗拉回） | **默认不跑**，且**队列忙时自动拒绝**（本地 ASR 被打断会白烧 GPU）。需要时：`npm run service-watchdog-live` |
+
+顺带钉住的一条铁律（本轮被它坑过）：**所有 `.ps1` 必须是 UTF-8 带 BOM** ——
+编辑工具重写文件会丢掉 BOM，PowerShell 5.1 随即按 ANSI(936) 解码，中文变乱码并报
+`The string is missing the terminator`。套件②会对仓库里全部 `.ps1`（当前 7 个）逐个检查 BOM 并抽检解析。
+
+另一个值得记下的坑：**按命令行特征杀进程时，匹配串会出现在自己的命令行里**。
+我用 `CommandLine -like '*STANDIN*'` 清理替身进程时，先杀掉的其实是**我自己这条命令的宿主进程**
+（它的命令行里含 `STANDIN`），于是 harness 报了三次
+`Windows Job runner exited ... before proving its managed range empty`。
+正确做法是把匹配串**拼出来**（`'setInter' + 'val('`），或用 `ParentProcessId` 限定。

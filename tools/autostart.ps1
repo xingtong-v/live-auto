@@ -59,12 +59,18 @@ param(
   [int]$DelaySec = 30,
   [int]$WatchdogMinutes = 10,
   [switch]$Hidden,
-  [switch]$Browser
+  [switch]$Browser,
+  # 老行为：让计划任务去跑**可见窗口**的交互式启动器（默认不再这么干，见下方注释）
+  [switch]$VisibleLauncher
 )
 
 $ErrorActionPreference = 'Stop'
 $ROOT = Split-Path -Parent $PSScriptRoot
 $launcher = Join-Path $ROOT 'launcher.ps1'
+# 计划任务默认跑这个**无窗口**的服务守护（见 tools\ensure-service.ps1 顶部注释：
+# 让计划任务去跑交互式启动器，等于每 10 分钟在屏幕上闪一个窗口，
+# 而且它只用 3 秒 HTTP 探活判断"服务在不在" —— 服务忙时会误判、进而起第二个实例并把健康的那个杀掉）。
+$watchdog = Join-Path $ROOT 'tools\ensure-service.ps1'
 $port = 3000
 try {
   $cfg = Get-Content -LiteralPath (Join-Path $ROOT 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -88,6 +94,10 @@ function Test-Service {
 
 if (-not (Test-Path -LiteralPath $launcher)) {
   Err2 "找不到启动器：$launcher"
+  exit 1
+}
+if (-not $VisibleLauncher -and -not (Test-Path -LiteralPath $watchdog)) {
+  Err2 "找不到服务守护脚本：$watchdog（它负责无窗口地拉起服务）"
   exit 1
 }
 
@@ -124,6 +134,14 @@ if ($Status) {
     } else {
       Write-Host '       看门狗      未开启（服务被杀掉后不会自动回来）' -ForegroundColor DarkGray
     }
+    # 动作是哪一个脚本：老的注册会去跑 launcher.ps1（可见窗口）—— 那正是"反复重启"的观感来源
+    $act = ($t.Actions | ForEach-Object { [string]$_.Arguments }) -join ' '
+    if ($act -match 'ensure-service\.ps1') {
+      Ok '任务动作     tools\ensure-service.ps1（无窗口、只拉起、绝不杀进程）'
+    } elseif ($act -match 'launcher\.ps1') {
+      Warn2 '任务动作     launcher.ps1（**有可见窗口**：每跳都会在屏幕上闪一个窗口；服务忙时还可能误判并重启）'
+      Write-Host '       改成无窗口看门狗：powershell -ExecutionPolicy Bypass -File tools\autostart.ps1 -Install' -ForegroundColor DarkGray
+    }
   } else {
     Warn2 "未注册自启任务：$TaskName"
   }
@@ -137,24 +155,37 @@ if ($Status) {
 # ---------------------------------------------------------------- 安装（默认）
 Head '安装自启任务'
 Write-Host "  项目目录    $ROOT"
-Write-Host "  启动方式    launcher.ps1$(if ($Hidden) { ' -NoBrowser（后台静默，无窗口）' } else { '（**有窗口**，看得见启动日志与报错）' })"
-if ($Browser) { Write-Host '  界面       启动后自动打开浏览器' }
+if ($VisibleLauncher) {
+  Write-Host '  启动方式    launcher.ps1（**有窗口**，看得见启动日志与报错）' -ForegroundColor Yellow
+} else {
+  Write-Host '  启动方式    tools\ensure-service.ps1（隐藏窗口，只负责把服务拉起来）'
+}
+if ($Browser) { Write-Host '  界面       启动后自动打开浏览器（仅 -VisibleLauncher 模式有效）' }
 Write-Host "  触发时机    登录后 $DelaySec 秒"
-if ($WatchdogMinutes -gt 0) { Write-Host "  看门狗      每 $WatchdogMinutes 分钟检查一次（服务不在就拉起）" }
+if ($WatchdogMinutes -gt 0) { Write-Host "  看门狗      每 $WatchdogMinutes 分钟检查一次（服务不在就拉起，无窗口）" }
 Write-Host "  界面地址    $URL"
 Write-Host ''
 
 $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 if (-not (Test-Path -LiteralPath $ps)) { $ps = 'powershell.exe' }
 
-# 窗口可见性：默认**有窗口**（用户明确要的）——去掉 -WindowStyle Hidden 即可。
-# 仍然保留 -NoPause：报错时窗口会随手关掉，但错误全在 data\logs\launcher-console.log 里，
-# 而且任务会正常结束 → 看门狗下一跳还能把它重新拉起来。
-# （若不传 -NoPause，出错时窗口会停在"按任意键"，任务一直处于 Running，看门狗反而不重试。）
-$argLine = '-NoProfile -NoLogo{0} -ExecutionPolicy Bypass -File "{1}"{2} -NoPause' -f `
-  $(if ($Hidden) { ' -WindowStyle Hidden' } else { '' }), `
-  $launcher, `
-  $(if ($Browser) { '' } else { ' -NoBrowser' })
+# ★ 2026-10-06 改：默认不再让计划任务去跑交互式 launcher.ps1。
+#   用户报「我的切片助手在反复重启」，实测原因是：
+#     · launcher.ps1 是**给人双击的**：它创建可见窗口 → 每 10 分钟在屏幕上闪一次；
+#     · 它只用 3 秒 HTTP 探活判断"服务在不在" → 服务忙时误判成"不在" → 起第二个实例
+#       （端口被占）→ 收尾时按命令行特征把项目目录下的 node.exe 全杀掉 → 把**健康的服务**杀掉；
+#     · 它启动服务后常驻前台持有：关掉那个窗口＝服务停掉，下一跳又开一个窗口。
+#   现在动作固定为 tools\ensure-service.ps1 -WindowStyle Hidden：
+#   端口在监听就什么都不做（哪怕探活超时）、端口空闲才隐藏启动、**从不杀进程**。
+#   想要老的"看得见窗口"的行为：加 -VisibleLauncher。
+if ($VisibleLauncher) {
+  $argLine = '-NoProfile -NoLogo{0} -ExecutionPolicy Bypass -File "{1}"{2} -NoPause' -f `
+    $(if ($Hidden) { ' -WindowStyle Hidden' } else { '' }), `
+    $launcher, `
+    $(if ($Browser) { '' } else { ' -NoBrowser' })
+} else {
+  $argLine = '-NoProfile -NoLogo -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Port {1}' -f $watchdog, $port
+}
 
 try {
   $action = New-ScheduledTaskAction -Execute $ps -Argument $argLine -WorkingDirectory $ROOT
