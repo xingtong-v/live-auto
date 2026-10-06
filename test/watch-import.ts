@@ -22,6 +22,7 @@ import { WatchImporter, type WatchImportOutcome } from '../src/watch-import.ts';
 import type { RecordingCandidate } from '../src/recordings.ts';
 import type { ListRecordingsResult } from '../src/recordings.ts';
 import type { Logger } from '../src/logger.ts';
+import { ROOT_DIR } from '../src/util.ts';
 
 let pass = 0;
 let fail = 0;
@@ -553,6 +554,21 @@ async function main(): Promise<void> {
     const outs2 = await h2.importer.scanOnce();
     ok(outs2[0]?.skipped?.includes('仍在写入') === true, '整场都在录时照旧跳过并说明原因', String(outs2[0]?.skipped));
     eq('并且把它标成 possiblyRecording（界面据此显示"正在录制"）', outs2[0]?.possiblyRecording, true);
+  }
+
+  section('13. 导入对话框的清单分组（静态接线：别把"没东西可导入"做成默认样子）');
+  {
+    /* 起因是一次真事故：`1ff3899` 给导入清单加了「正在录制 / 已录制完成·未导入 / 已导入过」
+       三组折叠，但默认把 `idle` 组也收起来了 —— 于是用户打开对话框只看到两行表头，
+       真浏览器端到端用例直接抓到「清单 0 行」。而"这个对话框就是用来挑一场没导入的录播"，
+       所以未导入那组**必须默认展开**。这里静态钉住，避免以后又改回收起。 */
+    const html = fs.readFileSync(path.join(ROOT_DIR, 'public', 'ui.html'), 'utf8');
+    ok(/state\.impOpen \?\?= \{ idle: true, imported: false \}/.test(html), '「已录制完成 · 未导入」默认展开', 'idle 默认收起会让对话框看起来像坏了');
+    ok(/parts\.push\(groupHtml\('idle', '已录制完成 · 未导入'\)\)/.test(html), '未导入那组是折叠组（点表头能展收）');
+    ok(/state\.impOpen\[el\.dataset\.g\] = !state\.impOpen\[el\.dataset\.g\]/.test(html), '点表头能切换展开状态');
+    ok(/parts\.push\(b\.live\.map\(rowHtml\)\.join\(''\)\)/.test(html), '「正在录制」那组永远展开（不可折叠）');
+    ok(/c\.possiblyRecording\) buckets\.live\.push\(i\)/.test(html), '还在录的候选归到「正在录制」而不是未导入组');
+    ok(/else if \(c\.importedBy\) buckets\.imported\.push\(i\)/.test(html), '导入过的归到「已导入过」');
   }
 
   console.log('\n' + '─'.repeat(74));

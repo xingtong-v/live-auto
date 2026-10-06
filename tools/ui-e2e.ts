@@ -28,7 +28,7 @@ const HEADED = process.argv.includes('--headed');
 const BASE = 'http://127.0.0.1:3000';
 const PORT = 9333;
 const SHOT_DIR = path.join(ROOT_DIR, 'data', 'ui-shots');
-const UI_BUILD_EXPECTED = 'ui-2026-09-24-monitor-panel';
+const UI_BUILD_EXPECTED = 'ui-2026-10-06-bulk-delete-published';
 
 let pass = 0;
 let fail = 0;

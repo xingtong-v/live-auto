@@ -89,6 +89,31 @@ const html = fs.readFileSync(htmlPath, 'utf8');
   ok('按钮区分"进回收站"与"永久删除"', /删除→回收站/.test(html) && /跨盘·删除不可恢复/.test(html));
   ok('监控页签挂在 switchView 上（否则点不动）', /if \(v === 'monitor'\)/.test(html));
 
+  /* 「已投稿文件」卡片的一键删除：按钮、确认文案、接口三件套必须同时在，
+     且**只有真有可删项时才渲染按钮**（99 项那种场景，用户就是不想逐个点）。 */
+  ok('页面引用 /api/published-file/delete-all', html.includes(`'/api/published-file/delete-all'`));
+  ok('卡片头上有「一键删除」按钮', /data-act="del-published-all"/.test(html));
+  ok('按钮把"删几个"写在脸上（点了才知道删多少是不能接受的）', /data-act="del-published-all"[^>]*data-n=/.test(html));
+  ok('按钮带上体积（确认框要报出合计大小）', /data-act="del-published-all"[^>]*data-mb=/.test(html));
+  ok('★ 没有可删项时不渲染按钮（deletableCount 为 0 就没有这个按钮）', /\$\{uf\.deletableCount \?/.test(html));
+  ok('有按钮的点击处理（不是画了个摆设）', /\$\$\('\[data-act="del-published-all"\]'\)\.forEach/.test(html));
+  ok('★ 一键删除也要二次确认（不可逆操作不能点一下就没）', /一键删除全部 \$\{n\} 个可删的已投稿文件吗/.test(html));
+  ok('确认文案写明进回收站 \+ 可恢复', /移入回收站/.test(html) && /可恢复/.test(html));
+  ok('★ 确认文案写明磁盘空间要等回收站清理才释放（用户最容易误解的点）', /磁盘空间要等「回收站清理」之后才真正释放/.test(html));
+  ok('★ 确认文案写明不影响 B站 稿件', /B站 上的稿件「不会」被撤回或删除/.test(html));
+  ok('确认文案写明审核中的会自动跳过', /还在审核（没有 bvid）的项会自动跳过/.test(html));
+  /* confirm() 是纯文本弹窗：写了 HTML 标签或 markdown 星号会原样显示（真浏览器验证抓到过）。
+     必须先切到「一键删除」那段处理函数里再取 —— 直接全文找 `const okGo = confirm(`
+     会取到前面单删 / 解除墓碑那几处（本项目已踩：正则跨过了 `;` 抓到了墓碑弹窗）。 */
+  const bulkAt = html.indexOf(`$$('[data-act="del-published-all"]')`);
+  ok('能定位到一键删除的处理函数', bulkAt > 0, String(bulkAt));
+  const confirmBlock = /const okGo = confirm\(([\s\S]*?)\);/.exec(html.slice(bulkAt))?.[1] ?? '';
+  ok('取到一键删除的确认文案', confirmBlock.length > 100, `${confirmBlock.length} 字节`);
+  ok('★ 确认文案里没有 HTML 标签 / markdown 星号（confirm 不认，会原样显示）', !/<[a-z/]/.test(confirmBlock) && !/\*\*/.test(confirmBlock), confirmBlock.replace(/\n/g, ' ').slice(0, 160));
+  ok('结果 toast 里如实报出失败/跳过数量（不假装全成功）', /跳过 \$\{r\.skipped\.length\} 个/.test(html) && /失败 \$\{r\.failed\.length\} 个/.test(html));
+  ok('删除后立刻重画清单（否则行还挂在那儿，看着像没删）', /loadMonitor\(true\)/.test(html));
+  ok('按下期间按钮置灰并改文案（防连点重复提交）', /b\.disabled = true/.test(html) && /正在删除…/.test(html));
+
   /* 内联脚本必须能解析：写坏一个反引号就整页白屏，而且控制台只有一行语法错误 */
   const m = /<script>([\s\S]*?)<\/script>\s*<\/body>/.exec(html) ?? /<script>([\s\S]*)<\/script>/.exec(html);
   const script = m?.[1] ?? '';
@@ -454,6 +479,52 @@ section('⑦ 已投稿文件：审核中 / bv 号 / 只能删已投稿成功的'
   ok('★ 删掉的那条从清单里消失了', !items2.some((i) => i['key'] === `${pubTaskId}:clip:0`), JSON.stringify(items2.map((i) => i['key'])));
   ok('没被删的那条还在', items2.some((i) => i['key'] === `${pubTaskId}:clip:1`));
   ok('并给出「已删除 N 项」的计数（不是静默消失）', Number((mon2.data['uploadedFiles'] as Record<string, unknown>)['deletedCount']) >= 1, String((mon2.data['uploadedFiles'] as Record<string, unknown>)['deletedCount']));
+
+  /* ---- 一键删除全部可删项（界面上那个按钮打的就是这个接口）----
+     要点：接口必须用**同一份清单快照**判定，不能边删边重算（否则删到一半清单就变了）；
+     不可删的项一个都不能碰，且要如实报出跳过原因；重复点是幂等的而不是报错。 */
+  const beforeAll = (await fetchJson('/api/monitor')).data['uploadedFiles'] as Record<string, unknown>;
+  const beforeItems = (beforeAll['items'] ?? []) as Array<Record<string, unknown>>;
+  const stillDeletable = beforeItems.filter((i) => i['deletable'] === true);
+  const notDeletable = beforeItems.filter((i) => i['deletable'] !== true);
+  ok('前置：此时确实还有可删项（否则这条用例测了个空）', stillDeletable.length > 0, `可删 ${stillDeletable.length} / 共 ${beforeItems.length}`);
+  ok('前置：也确实还有不可删项（审核中那条）', notDeletable.length >= 1, JSON.stringify(notDeletable.map((i) => i['key'])));
+
+  const allNoConfirm = await post2('/api/published-file/delete-all', {});
+  eq('★ 不带 confirm → 400（批量删除同样要显式确认，不能只靠界面弹窗）', allNoConfirm.status, 400);
+  ok('拒绝之后一个文件都没动', stillDeletable.every((i) => fs.existsSync(String(i['filePath']))));
+
+  const allDel = await post2('/api/published-file/delete-all', { confirm: true });
+  eq('带 confirm → 200', allDel.status, 200);
+  eq('★ 删除数量 = 清单里判为可删的数量', allDel.data['deleted'], stillDeletable.length);
+  eq('没有失败项', (allDel.data['failed'] as unknown[]).length, 0);
+  eq('接口自报 ok（全成）', allDel.data['ok'], true);
+  eq('★ 不可删的项被跳过，数量对得上', (allDel.data['skipped'] as unknown[]).length, notDeletable.length);
+  ok('★ 跳过原因说的是「还没有 bvid」（不编别的理由）', /bvid/.test(String(((allDel.data['skipped'] as Array<Record<string, unknown>>)[0] ?? {})['reason'] ?? '')), JSON.stringify(allDel.data['skipped']).slice(0, 140));
+  ok('报出释放的字节数与可读体积（界面 toast 要显示）', Number(allDel.data['bytes']) > 0 && /KB|MB|GB/.test(String(allDel.data['freedText'] ?? '')), String(allDel.data['freedText']));
+  const allNote = String(allDel.data['note'] ?? '');
+  ok('说明里点出「移入回收站、可恢复」', /回收站/.test(allNote), allNote);
+  ok('★ 说明里点出「B站 稿件不受影响」（用户最怕的就是误以为会撤稿）', /不受影响/.test(allNote), allNote);
+  ok('★ 说明里点出「空间要等回收站清理才释放」（否则用户以为白删了）', /回收站清理/.test(allNote), allNote);
+
+  for (const d of stillDeletable) {
+    ok(`可删项已从磁盘消失：${String(d['fileName']).slice(0, 28)}`, !fs.existsSync(String(d['filePath'])), String(d['filePath']));
+  }
+  ok('★ 审核中那条文件原样保留（一个字节都没碰）', fs.existsSync(noBvidFile));
+
+  await sleep(1400);
+  const afterAll = (await fetchJson('/api/monitor')).data['uploadedFiles'] as Record<string, unknown>;
+  const afterItems = (afterAll['items'] ?? []) as Array<Record<string, unknown>>;
+  eq('★ 批量删完后清单里再无任何可删项', afterItems.filter((i) => i['deletable'] === true).length, 0);
+  eq('deletableCount 也归零（界面上的按钮会自己消失）', afterAll['deletableCount'], 0);
+  ok('不可删的那条仍在清单里（如实保留，不静默消失）', afterItems.some((i) => i['key'] === `${pubTaskId}:clip:1`), JSON.stringify(afterItems.map((i) => i['key'])));
+  ok('依然给出「已删除 N 项」的计数', Number(afterAll['deletedCount']) >= 1, String(afterAll['deletedCount']));
+  ok('台账没有被改动（cutOutput 仍留着"它原来在哪"）', Boolean(ledger.getClips(pubTaskId)[0]?.cutOutput), String(ledger.getClips(pubTaskId)[0]?.cutOutput));
+
+  const againAll = await post2('/api/published-file/delete-all', { confirm: true });
+  eq('★ 重复点：仍是 200 而不是报错（幂等，界面连点不会炸）', againAll.status, 200);
+  eq('重复点：删了 0 个', againAll.data['deleted'], 0);
+  eq('重复点：跳过项只剩审核中那条（如实报出，不谎报成功）', (againAll.data['skipped'] as unknown[]).length, 1);
 
   /* 收尾：把回收站里这次测试产生的条目清掉，别给用户留垃圾 */
   try {

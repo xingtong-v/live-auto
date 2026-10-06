@@ -1695,6 +1695,85 @@ export class UiServer {
       return;
     }
 
+    /* ---------------- POST /api/published-file/delete-all ----------------
+     * **一键删除所有可删的已投稿文件**（「已投稿文件」卡片上那个按钮）。
+     *
+     * 为什么单独一个接口而不是让界面循环调单删：
+     *   ① 99 个文件就是 99 次 HTTP + 99 次 `uploadedFiles()` 全量重算（每次都遍历台账与磁盘），
+     *      实测足以把界面卡住；这里只取一次快照、逐个移入回收站；
+     *   ② 界面循环调用时任何一次失败都会留下"删了一半"的中间态，用户不知道到底删了几个；
+     *   ③ 单删接口按 key 查记录，批量时必须用**同一份清单快照**，否则删到一半清单就变了。
+     *
+     * 边界（与单删完全一致，一个都不放松）：
+     *   · 只删清单里判为 `deletable` 的项（有 bvid + 文件确实存在）；
+     *   · 没 bvid（还在审核）或文件已不在的，一律跳过并如实报出原因；
+     *   · 进回收站（可恢复），不直接抹除；稿件在 B站 上不受影响。 */
+    if (p === '/api/published-file/delete-all' && method === 'POST') {
+      const body = (await this.readBody(req)) as { confirm?: boolean };
+      if (!body.confirm) throw new Error('删除文件不可逆（虽会进回收站），请求必须带 confirm: true');
+
+      const all = this.uploadedFiles().items;
+      const targets = all.filter((i) => i['deletable'] === true);
+      const skippedList = all
+        .filter((i) => i['deletable'] !== true)
+        .map((i) => ({
+          key: String(i['key'] ?? ''),
+          filePath: String(i['filePath'] ?? ''),
+          reason: !i['bvid'] ? '还没有 bvid（仍在审核/未反查到稿件）' : '文件已不在磁盘上',
+        }));
+
+      const trashRoot = path.join(path.dirname(this.orch.ledger.path), 'trash');
+      const deleted: Array<Record<string, unknown>> = [];
+      const failed: Array<{ filePath: string; error: string }> = [];
+      let bytes = 0;
+      for (const t of targets) {
+        const filePath = String(t['filePath'] ?? '');
+        const bvid = String(t['bvid'] ?? '');
+        try {
+          if (!filePath || !exists(filePath)) {
+            failed.push({ filePath, error: '文件已不存在' });
+            continue;
+          }
+          const r = moveToTrash({
+            taskId: String(t['taskId'] ?? ''),
+            title: String(t['title'] ?? ''),
+            status: 'PUBLISHED',
+            paths: [filePath],
+            reason: `投稿成功（${bvid}）后在实时监控里一键批量删除`,
+            root: trashRoot,
+            logger: this.orch.logger,
+          });
+          if (r.moved === 0) {
+            failed.push({ filePath, error: r.warnings[0] ?? '未移动任何文件' });
+            continue;
+          }
+          const freed = r.bytes || fileSize(filePath);
+          bytes += freed;
+          deleted.push({ key: t['key'], filePath, bvid, kind: t['kind'], bytes: freed, trashId: r.id });
+        } catch (e) {
+          failed.push({ filePath, error: (e as Error).message });
+        }
+      }
+
+      this.invalidateMonitor();
+      this.orch.logger.info(
+        `一键删除已投稿文件：成功 ${deleted.length} 个（${fmtBytes(bytes)}），失败 ${failed.length} 个，跳过 ${skippedList.length} 个（全部移入回收站，可恢复）`,
+        { data: { deleted: deleted.length, failed: failed.length, skipped: skippedList.length } },
+      );
+      this.sendJson(res, 200, {
+        ok: failed.length === 0,
+        deleted: deleted.length,
+        failed,
+        skipped: skippedList,
+        bytes,
+        freedText: fmtBytes(bytes),
+        note:
+          `已把 ${deleted.length} 个文件移入回收站（共 ${fmtBytes(bytes)}）—— 稿件在 B站 上不受影响，` +
+          `7 天内可从「回收站」恢复；磁盘空间要等回收站清理后才真正释放`,
+      });
+      return;
+    }
+
     if (p === '/api/import/preview' && method === 'POST') {
       const body = (await this.readBody(req)) as { videoPath?: string };
       const videoPath = String(body.videoPath ?? '').trim();

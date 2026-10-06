@@ -43,6 +43,9 @@ function ok(name: string, cond: boolean, detail?: string): void {
     console.log(`  \x1b[31m✗\x1b[0m ${name}${detail ? ` :: ${detail}` : ''}`);
   }
 }
+function eq<T>(name: string, actual: T, expected: T): void {
+  ok(name, JSON.stringify(actual) === JSON.stringify(expected), `期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`);
+}
 
 /* ---- 极简 CDP（与 verify-tombstone-ui.ts 同一套写法） ---- */
 class Cdp {
@@ -203,15 +206,20 @@ async function main(): Promise<void> {
       emptyStatus: number;
       firstRow: string;
       note: string;
+      bulkText: string;
+      bulkN: string;
+      bulkMb: string;
+      bulkBound: boolean;
     }>(`(() => {
       const box = document.getElementById('otherPage');
       const card = Array.from(box.querySelectorAll('.card')).find((c) => String(c.querySelector('h2')?.textContent || '').includes('已投稿文件'));
-      if (!card) return { rows: 0, header: '', kinds: [], withLink: 0, withoutLink: 0, withDel: 0, boundBtns: 0, emptyStatus: 0, firstRow: '', note: '' };
+      if (!card) return { rows: 0, header: '', kinds: [], withLink: 0, withoutLink: 0, withDel: 0, boundBtns: 0, emptyStatus: 0, firstRow: '', note: '', bulkText: '', bulkN: '', bulkMb: '', bulkBound: false };
       const rows = Array.from(card.querySelectorAll('tbody tr'));
       /* 逐行判定，别用全局计数 —— 第一版用 querySelectorAll('tbody .tag-mini')
          数状态标签，而「类型」列也是 .tag-mini，于是 7 行数出 14 个。 */
       const hasLink = rows.filter((r) => !!r.querySelector('a[href*="bilibili.com/video/"]'));
       const btns = Array.from(card.querySelectorAll('[data-act="del-published"]'));
+      const bulk = card.querySelector('[data-act="del-published-all"]');
       return {
         rows: rows.length,
         header: String(card.querySelector('h2')?.textContent || '').replace(/\\s+/g, ' ').trim(),
@@ -224,6 +232,10 @@ async function main(): Promise<void> {
         emptyStatus: rows.filter((r) => !String(r.children[0]?.textContent || '').trim()).length,
         firstRow: rows[0] ? String(rows[0].innerText).replace(/\\s+/g, ' ').slice(0, 110) : '',
         note: String(card.textContent || '').includes('不会') && String(card.textContent || '').includes('稿件') ? '有"不撤回稿件"说明' : '',
+        bulkText: bulk ? String(bulk.textContent || '').trim() : '',
+        bulkN: bulk ? String(bulk.dataset.n || '') : '',
+        bulkMb: bulk ? String(bulk.dataset.mb || '') : '',
+        bulkBound: bulk ? typeof bulk.onclick === 'function' : false,
       };
     })()`);
 
@@ -240,6 +252,88 @@ async function main(): Promise<void> {
     ok('卡片里说明了「不会撤回 B站 上的稿件」', view.note !== '', view.note);
     console.log(`  \x1b[90m首行：${view.firstRow}\x1b[0m`);
     console.log(`  \x1b[90m类型：${view.kinds.join(' / ')}（bv 链接 ${view.withLink}，可删 ${view.withDel}）\x1b[0m`);
+
+    /* ---------------- 一键删除：真点一遍，但**一个文件都不删** ----------------
+     *
+     * 「点一下就把 99 个文件全删了」这种按钮，验证时最忌讳的正是"真按下去"。
+     * 这里用两层桩把真实请求拦下来，同时仍然走完**页面上真实的代码路径**：
+     *   ① `window.confirm` 换成桩 —— 先返回 false 证明"取消就什么都不发生"，
+     *      再返回 true 并把确认文案抄下来，逐个核对必说的那几句；
+     *   ② `window.fetch` 只在 `/api/published-file/delete-all` 这个 URL 上换成桩
+     *      （其它请求原样透传，否则 `loadMonitor` 会被一起搞坏），
+     *      于是"按钮到底发了什么请求"是**抓下来看到的**，不是我猜的。
+     * 最后再从 Node 侧查一次 `/api/monitor`：可删项数量必须**一个没少**。 */
+    const bulkCount = Number(uf['deletableCount'] ?? 0);
+    ok('★ 卡片头上有「一键删除」按钮', view.bulkText !== '' && view.bulkBound, `${view.bulkText} / bound=${String(view.bulkBound)}`);
+    ok('★ 按钮如实报出可删数量（与接口一致）', Number(view.bulkN) === bulkCount, `按钮 ${view.bulkN} vs 接口 ${bulkCount}`);
+    ok('按钮带上合计体积（确认框要报大小）', Number(view.bulkMb) > 0, view.bulkMb);
+    ok('按钮文案里写着"一键删除"与"项"', /一键删除/.test(view.bulkText) && /项/.test(view.bulkText), view.bulkText);
+
+    /* ① 取消 → 必须什么都不发生 */
+    await cdp.evalJs(`(() => {
+      window.__cap = [];
+      window.__origFetch = window.fetch;
+      window.__origConfirm = window.confirm;
+      window.confirm = () => false;
+      window.fetch = (p, o) => {
+        const url = String(p);
+        if (url.indexOf('/api/published-file/delete-all') >= 0) { window.__cap.push({ url, method: (o && o.method) || 'GET', body: (o && o.body) || '' }); 
+          return Promise.resolve(new Response('{"deleted":0}', { status: 200, headers: { 'Content-Type': 'application/json' } })); }
+        return window.__origFetch(p, o);
+      };
+      return true;
+    })()`);
+    await cdp.evalJs(`document.querySelector('[data-act="del-published-all"]').click()`);
+    await sleep(700);
+    const afterCancel = await cdp.evalJs<{ cap: number; disabled: boolean; text: string }>(`(() => {
+      const b = document.querySelector('[data-act="del-published-all"]');
+      return { cap: (window.__cap || []).length, disabled: b ? b.disabled : true, text: b ? String(b.textContent || '').trim() : '' };
+    })()`);
+    ok('★ 确认框里点「取消」→ 一个请求都不发（未确认就不动数据）', afterCancel.cap === 0, `captured=${afterCancel.cap}`);
+    ok('取消后按钮回到可用状态（没有被卡在"正在删除…"）', afterCancel.disabled === false && !/正在删除/.test(afterCancel.text), `${afterCancel.text} disabled=${String(afterCancel.disabled)}`);
+
+    /* ② 确认 → 抓下真实请求；确认文案逐句核对 */
+    await cdp.evalJs(`window.confirm = (msg) => { window.__confirmMsg = msg; return true; }`);
+    await cdp.evalJs(`document.querySelector('[data-act="del-published-all"]').click()`);
+    await sleep(1200);
+    const afterGo = await cdp.evalJs<{ cap: Array<{ url: string; method: string; body: string }>; msg: string; toast: string }>(`(() => ({
+      cap: window.__cap || [],
+      msg: String(window.__confirmMsg || ''),
+      toast: String((document.querySelector('.toast') || {}).textContent || ''),
+    }))()`);
+    eq('★ 确认后确实发出了 1 个请求（页面接线是真的）', afterGo.cap.length, 1);
+    ok('★ 请求打的是 /api/published-file/delete-all（不是循环调单删）', String(afterGo.cap[0]?.url ?? '').includes('/api/published-file/delete-all'), String(afterGo.cap[0]?.url));
+    eq('★ 用的是 POST（不是 GET 误触发）', String(afterGo.cap[0]?.method ?? '').toUpperCase(), 'POST');
+    ok('★ 请求体带 confirm:true（后端那道闸也认这个字段）', /"confirm"\s*:\s*true/.test(String(afterGo.cap[0]?.body ?? '')), String(afterGo.cap[0]?.body));
+    const cmsg = afterGo.msg;
+    ok('★ 确认框报出要删几个', cmsg.includes(String(bulkCount)) && /可删的已投稿文件/.test(cmsg), cmsg.slice(0, 60));
+    ok('★ 确认框写明"移入回收站、可恢复"', /移入回收站/.test(cmsg) && /可恢复/.test(cmsg));
+    ok('★ 确认框写明"磁盘空间要等回收站清理才真正释放"', /回收站清理/.test(cmsg) && /真正释放/.test(cmsg));
+    ok('★ 确认框写明"B站 上的稿件不会被撤回或删除"', /(「不会」|不会)被撤回或删除/.test(cmsg), cmsg.replace(/\n/g, ' | ').slice(0, 200));
+    ok('★ 确认框写明"审核中的会被跳过"', /审核/.test(cmsg) && /跳过/.test(cmsg));
+    /* confirm() 不认 HTML/markdown：星号与标签会原样显示在弹窗里（第一版就写了 `**移入回收站**`） */
+    ok('★ 确认框里没有 HTML 标签 / markdown 星号（弹窗是纯文本）', !/<[a-z/]/.test(cmsg) && !/\*\*/.test(cmsg), cmsg.replace(/\n/g, ' | ').slice(0, 200));
+    console.log(`  \x1b[90m确认框：${cmsg.replace(/\n+/g, ' ⏎ ').slice(0, 160)}\x1b[0m`);
+    console.log(`  \x1b[90m抓到的请求：${afterGo.cap[0]?.method} ${afterGo.cap[0]?.url} body=${afterGo.cap[0]?.body}\x1b[0m`);
+    console.log(`  \x1b[90m（请求被桩拦下，未真正删除任何文件）\x1b[0m`);
+
+    /* ③ 还原桩，再从 Node 侧核对：服务端数据一个没动 */
+    await cdp.evalJs(`window.fetch = window.__origFetch; window.confirm = window.__origConfirm; true`);
+    const ufAfter = ((await (await fetch(BASE + '/api/monitor')).json()) as Record<string, unknown>)['uploadedFiles'] as Record<string, unknown>;
+    eq('★ 全程没有真删任何文件（可删数量与开始时一致）', ufAfter['deletableCount'], bulkCount);
+    eq('文件总数也没变', ufAfter['count'], uf['count']);
+
+    /* ④ 后端那道闸单独再试一次：不带 confirm 必须 400（界面拦住了不代表接口拦得住） */
+    const boot = (await (await fetch(BASE + '/api/bootstrap')).json()) as { csrf?: string };
+    const csrf = String(boot.csrf ?? '');
+    const noConfirm = await fetch(BASE + '/api/published-file/delete-all', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+      body: JSON.stringify({}),
+    });
+    eq('★ 直接打接口、不带 confirm → 400（后端独立把关，不靠界面）', noConfirm.status, 400);
+    const ufAfter2 = ((await (await fetch(BASE + '/api/monitor')).json()) as Record<string, unknown>)['uploadedFiles'] as Record<string, unknown>;
+    eq('这次也一个文件都没动', ufAfter2['deletableCount'], bulkCount);
 
     await cdp.evalJs(`(() => {
       const card = Array.from(document.getElementById('otherPage').querySelectorAll('.card'))

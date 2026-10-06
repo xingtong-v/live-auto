@@ -447,7 +447,7 @@
 const BOOT = window.__BOOT__ || { csrf: '', version: '?', roomId: '', platform: '' };
 
 /** UI 构建标记：在浏览器控制台里能看到，用来确认页面是不是最新的（避免缓存导致以为功能没做） */
-const UI_BUILD = 'ui-2026-09-24-monitor-panel';
+const UI_BUILD = 'ui-2026-10-06-bulk-delete-published';
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -2227,6 +2227,7 @@ function renderMonitor(box) {
     html += `<div class="card"><h2>已投稿文件
       ${uf.deletableCount ? badge(`${uf.deletableCount} 个可删`, 'b-run') : ''}
       ${uf.totalMB ? `<span style="font-size:12px;color:var(--text-3);font-weight:400">共 ${uf.totalMB} MB</span>` : ''}
+      ${uf.deletableCount ? `<button class="btn-sm" style="margin-left:10px;border-color:#f0c8c8;color:#c33" data-act="del-published-all" data-n="${uf.deletableCount}" data-mb="${uf.totalMB}">一键删除可删的 ${uf.deletableCount} 项</button>` : ''}
     </h2>`;
     if (uf.error) html += `<div class="hintline warn" style="margin-bottom:8px">查不到审核状态（${esc(uf.error)}）—— 下面显示的是最后一次拿到的结果</div>`;
     if (!uf.items.length) {
@@ -2343,6 +2344,40 @@ function renderMonitor(box) {
       toast(r.note || '已删除', 7000);
       await loadMonitor(true); // 立刻重画：让那一行消失
     } catch (e) { toast('删除失败：' + e.message, 6000); b.disabled = false; }
+  });
+  /* 一键删除**所有可删的**已投稿文件。
+     确认框必须把三件事说清楚（缺一条用户就会误判后果）：
+       ① 到底删几个、多大；② 进回收站可恢复、但磁盘空间要等回收站清理才释放；③ 不影响 B站 上的稿件。
+     与单删共用同一个后端判定（deletable = 有 bvid + 文件在），所以"审核中不可删"的项在批量里也会被跳过。 */
+  $$('[data-act="del-published-all"]').forEach((b) => b.onclick = async () => {
+    const n = Number(b.dataset.n || 0);
+    const mb = Number(b.dataset.mb || 0);
+    const sizeText = mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb} MB`;
+    /* 注意：`confirm()` 是**纯文本**弹窗，不认 HTML —— 这里用「」而不是 `<b>`/`**`。
+       第一版写了 `**移入回收站**`，真浏览器验证时抓到弹窗里原样显示两个星号。 */
+    const okGo = confirm(
+      `一键删除全部 ${n} 个可删的已投稿文件吗？\n\n` +
+      `合计：${sizeText}\n\n` +
+      '· 全部「移入回收站」（7 天内可恢复），不是永久删除；\n' +
+      '· 磁盘空间要等「回收站清理」之后才真正释放；\n' +
+      '· B站 上的稿件「不会」被撤回或删除；\n' +
+      '· 还在审核（没有 bvid）的项会自动跳过，不会被删。'
+    );
+    if (!okGo) return;
+    b.disabled = true;
+    b.textContent = '正在删除…';
+    try {
+      const r = await api('/api/published-file/delete-all', { method: 'POST', body: { confirm: true } });
+      const extra = [];
+      if (r.failed && r.failed.length) extra.push(`失败 ${r.failed.length} 个`);
+      if (r.skipped && r.skipped.length) extra.push(`跳过 ${r.skipped.length} 个（审核中/文件已不在）`);
+      toast(`${r.note}${extra.length ? `；${extra.join('，')}` : ''}`, 9000);
+      await loadMonitor(true);
+    } catch (e) {
+      toast('一键删除失败：' + e.message, 6000);
+      b.disabled = false;
+      b.textContent = `一键删除可删的 ${n} 项`;
+    }
   });
   $$('[data-act="mon-open"]').forEach((a) => a.onclick = (ev) => {
     ev.preventDefault();
@@ -3557,7 +3592,10 @@ $('#btnImport').onclick = () => {
         else if (c.importedBy) buckets.imported.push(i);
         else buckets.idle.push(i);
       });
-      state.impOpen ??= { idle: false, imported: false };
+      /* 展开状态：**「已录制完成 · 未导入」默认展开** —— 这个对话框就是用来挑一场录播导入的，
+         默认收起会让用户打开后只看到两行表头（实测真浏览器端到端用例抓到「清单 0 行」）。
+         「已导入过」默认收起：那是历史，点开才看。正在录制的那组永远展开、不可折叠。 */
+      state.impOpen ??= { idle: true, imported: false };
       lastList = r;
       lastBuckets = buckets;
       renderList();
