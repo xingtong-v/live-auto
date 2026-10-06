@@ -447,7 +447,7 @@
 const BOOT = window.__BOOT__ || { csrf: '', version: '?', roomId: '', platform: '' };
 
 /** UI 构建标记：在浏览器控制台里能看到，用来确认页面是不是最新的（避免缓存导致以为功能没做） */
-const UI_BUILD = 'ui-2026-10-06-bulk-delete-published-2';
+const UI_BUILD = 'ui-2026-10-06-health-imported-collapsed';
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -2189,20 +2189,39 @@ function renderMonitor(box) {
       </tbody></table>`;
   }
   if (outs.length) {
-    const show = outs.slice(0, 12);
-    html += `<h3 style="font-size:13px;margin:14px 0 8px">上一轮对每个文件的结论（共 ${outs.length} 个，其中 ${skipped.length} 个没导）</h3>
-      <table class="tbl"><thead><tr><th>文件</th><th class="num">大小</th><th>结论</th></tr></thead><tbody>
-      ${show.map((o) => {
-        const stillWriting = /仍在写入|可能仍在录制/.test(String(o.skipped || ''));
-        const verdict = o.taskId
-          ? `<span style="color:var(--green)">已导入（任务 ${esc(o.taskId)}）</span>`
-          : stillWriting
-            ? '<span style="color:#1a86c7">正在录制，等写完</span>'
-            : `<span style="color:var(--text-3)">${esc(o.skipped || o.error || '—')}</span>`;
-        return `<tr><td class="mono-sm" title="${esc(o.videoPath || '')}">${esc(o.fileName)}</td><td class="num">${o.sizeMB} MB</td><td>${verdict}</td></tr>`;
-      }).join('')}
-      </tbody></table>
-      ${outs.length > show.length ? `<div class="empty">还有 ${outs.length - show.length} 个未显示（清单太长时这里只列前 12 个）。</div>` : ''}`;
+    /* 这一块原来是一张平表：35 个文件、35 行「已导入过（任务 …；该任务已从台账删除）」+ 每行一句重跑指引。
+       用户的原话是「这里的显示的太多了 而且是导入过的 优化他」。改成两类：
+         · 需要你留意的（导入成功 / 正在录制等 / 失败 / 文件不可用）：直接列表（最多 12 行）；
+         · 「已导入过」：**默认收起**（历史，无需处理），点开才看；
+       重跑办法只写一次（原来每一行都重复一遍，35 行就是 35 遍）。 */
+    const isImportedSkip = (o) => !o.taskId && /^已导入过/.test(String(o.skipped || ''));
+    const imported = outs.filter(isImportedSkip);
+    const okCount = outs.filter((o) => o.taskId).length;
+    const noteworthy = outs.filter((o) => !isImportedSkip(o));
+    const otherCount = noteworthy.length - okCount;
+    const verdictOf = (o) => {
+      const stillWriting = /仍在写入|可能仍在录制/.test(String(o.skipped || ''));
+      if (o.taskId) return `<span style="color:var(--green)">已导入（任务 ${esc(o.taskId)}）</span>`;
+      if (stillWriting) return '<span style="color:#1a86c7">正在录制，等写完</span>';
+      return `<span style="color:var(--text-3)">${esc(o.skipped || o.error || '—')}</span>`;
+    };
+    const healthTable = (list, cap) => `<table class="tbl"><thead><tr><th>文件</th><th class="num">大小</th><th>结论</th></tr></thead><tbody>
+      ${list.slice(0, cap).map((o) => `<tr><td class="mono-sm" title="${esc(o.videoPath || '')}">${esc(o.fileName)}</td><td class="num">${o.sizeMB} MB</td><td>${verdictOf(o)}</td></tr>`).join('')}
+      </tbody></table>${list.length > cap ? `<div class="empty">还有 ${list.length - cap} 个未显示（清单太长时这里只列前 ${cap} 个）。</div>` : ''}`;
+    html += `<h3 style="font-size:13px;margin:14px 0 8px">上一轮对每个文件的结论
+      <span class="ai-tag">共 ${outs.length} 个 · 导入成功 ${okCount} · 已导入过 ${imported.length} · 其它 ${otherCount}</span></h3>`;
+    if (noteworthy.length) {
+      html += healthTable(noteworthy, 12);
+    } else {
+      html += `<div class="empty">这一轮没有需要你处理的结论（${imported.length} 个文件都是「已导入过」的历史记录）。</div>`;
+    }
+    if (imported.length) {
+      html += `<div class="impgroup" data-g="health-imported" data-n="${imported.length}" title="展开这 ${imported.length} 个已导入过的文件">
+          <span class="caret">▸</span><span>已导入过（历史，不需要处理）</span><span class="cnt">${imported.length} 个</span></div>
+        <div id="healthImported" style="display:none">${healthTable(imported, 60)}</div>
+        <p class="hintline">已导入过的文件不会被自动重导（同一个文件重复跑一遍是白花的 ASR + LLM 钱）。确实要重跑：
+          用「导入录播」手动挑那一场（那条路不受此限制），或在「设置 → 导入」里关掉目录轮询。</p>`;
+    }
   } else {
     html += `<div class="empty">上一轮没扫到任何录播。若目录里确实有文件，点上面的「立即刷新」看结论，或去「导入录播」检查扫描目录。</div>`;
   }
@@ -2291,6 +2310,22 @@ function renderMonitor(box) {
   box.innerHTML = html;
 
   /* ---- 绑定 ---- */
+  /* 「已导入过」那一组的展开/收起：只切这一块的显示，不重画整页
+     （重画会把用户滚到的位置和别的展开状态一起弄丢）。
+     ⚠️ 这段必须留在 renderMonitor 里 —— 第一版接到了 renderHealth 的末尾，
+     而 DOM 是监控页画的，于是点了没反应（真浏览器验证当场抓到：可见行 0、箭头不变）。 */
+  const impHead = $('[data-g="health-imported"]');
+  if (impHead) {
+    impHead.onclick = () => {
+      const panel = $('#healthImported');
+      if (!panel) return;
+      const open = panel.style.display !== 'none';
+      panel.style.display = open ? 'none' : '';
+      impHead.classList.toggle('open', !open);
+      impHead.querySelector('.caret').textContent = open ? '▸' : '▾';
+      impHead.title = `${open ? '展开' : '收起'}这 ${impHead.dataset.n || ''} 个已导入过的文件`;
+    };
+  }
   const sel = $('#monAuto');
   if (sel) sel.onchange = () => {
     const v = Number(sel.value);

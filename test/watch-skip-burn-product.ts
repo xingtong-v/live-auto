@@ -249,7 +249,12 @@ async function main(): Promise<void> {
     );
     const skipReason = r3.find((o) => String(o.fileName).includes('哈喽'))?.skipped ?? '';
     ok('跳过原因说明了"已导入过 + 该任务已从台账删除"', skipReason.includes('已导入过'), skipReason.slice(0, 90));
-    ok('并指引用户走「导入录播」手动重跑', skipReason.includes('导入录播'), skipReason.slice(0, 90));
+    ok('跳过原因里带上了任务号（能追到是哪一场）', skipReason.includes('任务 t-1'), skipReason.slice(0, 90));
+    /* 文案必须短：这一条会在健康面板里**逐文件**列出来（实测一次 35 行），
+       每行都重复一句"如确实要重跑…"会把真正要看的信息淹掉（用户报「显示的太多了」）。
+       重跑办法现在只在面板上写一次。 */
+    ok('★ 跳过原因保持简短（不再逐行重复"怎么重跑"的长句）', skipReason.length <= 60, `${skipReason.length} 字：${skipReason}`);
+    ok('跳过原因里没有重复的"重跑指引"长句', !skipReason.includes('如确实要重跑'), skipReason.slice(0, 90));
   }
 
   console.log(`\n\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);

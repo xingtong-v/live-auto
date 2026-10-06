@@ -17,7 +17,8 @@ import path from 'node:path';
 import { ROOT_DIR, ensureDir, sleep } from '../src/util.ts';
 
 const BASE = 'http://127.0.0.1:3000';
-const PORT = 9333;
+/* 与 tools/ui-e2e.ts（9333）错开：两个工具可能同时在跑，抢同一个调试端口会互相踢掉 */
+const PORT = 9335;
 const HEADED = process.argv.includes('--headed');
 
 let pass = 0;

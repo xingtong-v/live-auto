@@ -119,6 +119,22 @@ const html = fs.readFileSync(htmlPath, 'utf8');
   ok('删除后立刻重画清单（否则行还挂在那儿，看着像没删）', /loadMonitor\(true\)/.test(html));
   ok('按下期间按钮置灰并改文案（防连点重复提交）', /b\.disabled = true/.test(html) && /正在删除…/.test(html));
 
+  /* 实时监控 ·「目录轮询（为什么某个录播没被导入）」里的「上一轮对每个文件的结论」：
+     35 个文件全是「已导入过」时不许平铺 35 行
+     （用户截图 + 原话「这里的显示的太多了 而且是导入过的 优化他」）。
+     规则：需要留意的才直接列表，已导入过的**默认收起**，重跑办法整块只写一次。 */
+  ok('已导入过的那类被单独分出来', /const isImportedSkip = \(o\) =>/.test(html));
+  ok('★ 「已导入过」那组默认收起（display:none，点开才看）', /data-g="health-imported"[\s\S]{0,220}id="healthImported" style="display:none"/.test(html));
+  ok('可折叠表头带数量（点开前就知道有多少个）', /data-g="health-imported" data-n="\$\{imported\.length\}"/.test(html));
+  ok('★ 点了能展开（有绑定，不是画了个摆设）', /\$\('\[data-g="health-imported"\]'\)/.test(html));
+  ok('展开/收起会换箭头与 title（否则用户不知道还能收回去）', /impHead\.classList\.toggle\('open'/.test(html) && /impHead\.title = `\$\{open \? '展开' : '收起'\}/.test(html));
+  ok('★ 表头先给分类计数（共 N 个 · 导入成功 · 已导入过 · 其它）', /共 \$\{outs\.length\} 个 · 导入成功 \$\{okCount\} · 已导入过 \$\{imported\.length\} · 其它 \$\{otherCount\}/.test(html));
+  ok('没有需要处理的结论时给一句话，而不是一张空表', /这一轮没有需要你处理的结论/.test(html));
+  ok('直接列表的那部分有上限（12 行）+ 超出提示', /healthTable\(noteworthy, 12\)/.test(html) && /还有 \$\{list\.length - cap\} 个未显示/.test(html));
+  ok('★ 逐行结论里不再重复"怎么重跑"的长句（35 行 = 35 遍重复）', !html.includes('如确实要重跑'));
+  ok('重跑办法整块只写一次', /确实要重跑：/.test(html) && /用「导入录播」手动挑那一场/.test(html));
+  ok('顺带说明"不会自动重导"的原因（免得用户以为漏了）', /不会被自动重导/.test(html));
+
   /* 内联脚本必须能解析：写坏一个反引号就整页白屏，而且控制台只有一行语法错误 */
   const m = /<script>([\s\S]*?)<\/script>\s*<\/body>/.exec(html) ?? /<script>([\s\S]*)<\/script>/.exec(html);
   const script = m?.[1] ?? '';

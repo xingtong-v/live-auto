@@ -42,6 +42,7 @@
     "hotwords-ab": "node --experimental-strip-types tools/local-asr/hotwords-ab.ts",
     "asr-timing": "node --experimental-strip-types tools/local-asr/timing.ts",
     "perf-ui": "node --experimental-strip-types tools/verify-perf-ui.ts",
+    "health-ui": "node --experimental-strip-types tools/verify-health-ui.ts",
     "streamer-test": "node test/streamer.ts",
     "mcp-test": "node test/mcp.ts",
     "select-slot-test": "node --experimental-strip-types tools/local-asr/verify-select-slot.ts",

@@ -397,9 +397,12 @@ export class WatchImporter {
         {
           const prev = this.state.imported[c.videoPath];
           if (prev?.taskId) {
+            /* 文案刻意短：这一条会在健康面板里**逐文件**列出来（实测一次 35 行），
+               原来每行都拖着「如确实要重跑，请用界面『导入录播』手动导入」——
+               35 行就是 35 遍重复，把真正要看的信息淹掉了（用户原话：「显示的太多了」）。
+               重跑办法现在只在面板上写一次。 */
             skip(
-              `已导入过（任务 ${prev.taskId}，于 ${new Date(prev.at).toLocaleString()}）—— ` +
-                `该任务已从台账删除；如确实要重跑，请用界面「导入录播」手动导入`,
+              `已导入过（任务 ${prev.taskId}，于 ${new Date(prev.at).toLocaleString()}；该任务已从台账删除）`,
             );
             continue;
           }
