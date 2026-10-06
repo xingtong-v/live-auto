@@ -3584,6 +3584,18 @@ $('#btnImport').onclick = () => {
       flags.push('<span style="color:var(--blue,#00aeec)">在自动导入目录</span>');
     }
     if (c.possiblyRecording) flags.push('<span style="color:#c8811a">可能仍在录制</span>');
+    /* 碎片合并：同一场直播被 CDN 每隔几分钟断一次、落成好几个文件。
+       两个状态都要标出来，否则用户看到"3.3 分钟的一场"会以为录短了：
+         · 还在等 → 说明还剩多久（等安静后整场一起导入，不再一场拆成好几个任务）
+         · 已合并 → 说明由几段拼成（导入后就是整场） */
+    if (c.stitch && (c.stitch.fragmentCount || 1) > 1) {
+      if (c.stitchWaiting) {
+        const left = Math.max(0, Math.round((c.stitch.quietSec || 0) - (c.stitch.newestAgeSec || 0)));
+        flags.push(`<span style="color:#c8811a">已拼 ${c.stitch.fragmentCount} 段碎片，等安静 ${left} 秒</span>`);
+      } else {
+        flags.push(`<span style="color:var(--blue,#00aeec)">已合并 ${c.stitch.fragmentCount} 段碎片（整场）</span>`);
+      }
+    }
     if (c.importedBy) flags.push('<span style="color:#c8811a">已导入</span>');
     if (c.hasDanmakuInPicture) flags.push('<span style="color:#c8811a">画面已烧弹幕</span>');
     if (!c.usable) flags.push('<span style="color:#c33">文件不可用</span>');

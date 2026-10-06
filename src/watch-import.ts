@@ -417,6 +417,20 @@ export class WatchImporter {
           skip('文件仍在写入（录制可能未结束）');
           continue;
         }
+        /* ③.5 碎片合并：这一场由多个「相邻碎片」拼成（CDN 每隔几分钟断一次流），
+           还在陆续落盘 → **先等它安静**，否则现在导入只会把这一场拆成多个任务，
+           正好抵消掉碎片合并的意义（用户要的就是"一场直播一个任务"）。
+           等法：最新写入距今超过 `import.stitch.quietSec`，或这一场的跨度到了
+           `import.stitch.maxMinutes`（到顶就必须导入，否则断一整晚就永远进不来）。 */
+        if (c.stitchWaiting) {
+          const st = c.stitch;
+          skip(
+            `本场已由 ${st?.fragmentCount ?? 0} 段相邻碎片拼成，还有碎片可能落盘 —— 等安静 ` +
+              `${Math.max(0, Math.round((st?.quietSec ?? 0) - (st?.newestAgeSec ?? 0)))} 秒后整场导入` +
+              `（跨度上限 ${Math.round((st?.spanSec ?? 0) / 60)} 分钟已计入）`,
+          );
+          continue;
+        }
         // ④ 稳定性：体积连续两轮一样才算写完
         if (!this.isStable(c, now)) {
           skip(`首次发现，等下一轮确认写完（稳定 ${w.stableSec} 秒）`);

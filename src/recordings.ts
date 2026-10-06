@@ -303,6 +303,26 @@ export interface RecordingCandidate {
    * 不再产生那种跳过行。观测性不能因为修 bug 而丢掉，所以这里把名字一起带上。
    */
   pendingFiles?: Array<{ fileName: string; sizeMB: number }>;
+  /**
+   * 本场是由几个「相邻碎片」拼起来的（>1 表示合并过；见文件顶部「碎片合并」一节）。
+   */
+  fragmentCount?: number;
+  /**
+   * **还在等后续碎片**：现在导入会把这一场拆成多个任务，所以先不动。
+   *
+   * 判定 = 合并过（fragmentCount > 1）且最新写入距今 < `import.stitch.quietSec` 且跨度还没到
+   * `import.stitch.maxMinutes`。跨度到顶就 `capped=true`、不再等（否则一场断一整晚就永远不导入）。
+   */
+  stitchWaiting?: boolean;
+  /** 碎片合并的细节，给界面如实展示（等多久、跨多久、是不是被上限打断） */
+  stitch?: {
+    fragmentCount: number;
+    spanSec: number;
+    quietSec: number;
+    newestAgeSec: number;
+    gapSec: number;
+    capped: boolean;
+  };
 }
 
 /**
@@ -314,6 +334,240 @@ export interface RecordingCandidate {
  */
 export function recordingGroupKey(fileName: string): string {
   return stripRecordingSuffixes(fileName).toLowerCase();
+}
+
+/* ============================================================================
+ * 碎片合并（同一场直播被 CDN 断成多个文件）
+ * ==========================================================================
+ *
+ * 实测背景（2026-10-06 晚，用户问「为啥几分钟就中断一次录制」）：
+ *   biliLive-tools 那边每隔几分钟就 `record end, reason: ["finished"]` ——
+ *   **不是它主动停**，是这一条 FLV 拉流被 CDN 那头关掉了（ffmpeg 正常退出、
+ *   随即用一个新的 CDN 地址重连），于是同一场直播落成好几个文件：
+ *     23-25-18-143 好冷好冷！电台一下.ts   （3.3 分钟）
+ *     23-28-41-546 好冷好冷！电台一下.ts   （5.4 分钟）
+ *     23-34-10-158 …、23-39-27-041 …、23-46-05-978 …
+ *   每个文件自带一份弹幕 xml、一份封面 jpg、一份压制产物。
+ *
+ * 不合并的代价：一场直播被切成 N 个任务 → N 次转写、N 组切片、往同一个稿件里
+ * 投 N 批分P（用户看到的就是"几分钟一段、投了一堆"）。
+ *
+ * ## 与「同一文件的分段」（`X.ts` + `X-PART001.ts`）的区别 —— 这条边界必须守住
+ *
+ *   · 同分段：**基名相同**（`stripRecordingSuffixes` 之后一模一样），只是被录制器切成了
+ *     PART000/PART001…。已有逻辑允许"已闭合的那段先导入"，并报出「另有 N 段仍在写入」——
+ *     这是 2026-09-24 用户报「录播为什么没有导入」之后专门修好的，**不能因为本次改动退回**。
+ *   · 碎片：**基名不同**（开录时刻不同），是同一场直播的多次续录。
+ *   所以下面只合并"基名不同、标题相同、开录时刻相邻"的文件，同基名的一律不碰。
+ *
+ * ## 为什么「相邻」要卡得这么死
+ *
+ *   录制器会把开播时刻写进文件名，同一天不同场次的录播天然长得很像；
+ *   激进地按标题合并会把两场拼成一场（时间轴全错且极难发现）。
+ *   这里要求：同目录 + 标题**完全相同** + 紧接着上一段结束（间隔 ≤ `gapSec`，
+ *   默认 120 秒 —— 实测重连只隔 1～21 秒）。
+ */
+
+/** 一个碎片（= 一次续录）的身份 */
+export interface FragmentIdentity {
+  /** 目录（小写，用于比较） */
+  dir: string;
+  /** 标题（原样，仅去首尾空白）。空标题不参与合并 */
+  title: string;
+  /** 开录时刻（毫秒）；解析不出来就不参与合并 */
+  startMs?: number;
+  /**
+   * 去后缀后的基名（小写）。
+   * **基名相同 = 同一个文件被切成多段**（不是碎片），调用方据此区分两类。
+   */
+  baseKey: string;
+  /** 压制产物（`-弹幕版` / `-纯享版` / `-danmaku`）：不算碎片 */
+  product: boolean;
+}
+
+/** 解析一个文件属于哪个碎片 */
+export function fragmentIdentityOf(filePath: string): FragmentIdentity {
+  const fileName = path.basename(filePath);
+  const parsed = parseRecordingFileName(fileName);
+  /* ⚠️ 产物判定要看**原始基名**：`stripRecordingSuffixes` 存在的意义就是把
+     `-弹幕版`/`-纯享版` 剥掉，拿剥完的字符串去测 PRODUCT_SUFFIX 永远为 false
+     （第一版就是这么写的，`-纯享版` 直接被当成碎片）。 */
+  const rawStem = fileName.replace(/\.[^.]+$/, '');
+  const product = new RegExp(PRODUCT_SUFFIX, 'i').test(rawStem) || parsed.hasDanmakuInPicture;
+  return {
+    dir: path.dirname(filePath).toLowerCase(),
+    title: parsed.title.trim(),
+    ...(parsed.recordedAt !== undefined ? { startMs: parsed.recordedAt } : {}),
+    baseKey: recordingGroupKey(fileName),
+    product,
+  };
+}
+
+export interface StitchConfig {
+  /** 关掉就完全退回单文件行为 */
+  enabled: boolean;
+  /** 相邻碎片的最大间隔（秒）：上一段写完到下一段开录 */
+  gapSec: number;
+  /** 「安静」多久才认为这场不会再续录了（秒） */
+  quietSec: number;
+  /** 单次合并的时间跨度上限（分钟）：防止一整晚都断的时候永远不导入 */
+  maxMinutes: number;
+}
+
+export const DEFAULT_STITCH: StitchConfig = { enabled: true, gapSec: 120, quietSec: 180, maxMinutes: 30 };
+
+/** 一次「相邻碎片」串（run）：按开录时刻排好序、且两两相邻 */
+export interface FragmentRun {
+  /** 本串里所有碎片的文件（含同基名的分段），按 (开录时刻, 分段号, 路径) 排好序 */
+  files: string[];
+  /** 不同开录时刻的个数（= 碎片数）。1 表示没有可合并的对象 */
+  fragmentCount: number;
+  /** 首个碎片开录时刻 */
+  startMs?: number;
+  /** 本串最新的写入时刻（文件 mtime 的最大值） */
+  newestMtimeMs: number;
+  /** 时间跨度（秒）：从首个碎片开录到最新写入 */
+  spanSec: number;
+  /** 是否已经超过 maxMinutes（超了就"必须导入"，不再等） */
+  capped: boolean;
+}
+
+/**
+ * 找出样本文件所属的「相邻碎片串」。
+ *
+ * 返回 undefined 表示：样本的文件名解析不出开录时刻（那就不猜，按单文件处理）。
+ */
+export function stitchRunOf(
+  samplePath: string,
+  opts: { gapSec?: number; maxMinutes?: number; now?: number } = {},
+): FragmentRun | undefined {
+  const gapSec = opts.gapSec ?? DEFAULT_STITCH.gapSec;
+  const maxMinutes = opts.maxMinutes ?? DEFAULT_STITCH.maxMinutes;
+  const me = fragmentIdentityOf(samplePath);
+  if (!me.title || me.startMs === undefined) return undefined;
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(path.dirname(samplePath));
+  } catch {
+    return undefined;
+  }
+  const dir = path.dirname(samplePath);
+  interface Frag {
+    startMs: number;
+    endMs: number;
+    files: string[];
+  }
+  /* 先按「开录时刻」归并成碎片：同一时刻的多个文件（`X.ts` + `X-PART001.ts`）算同一个碎片，
+     碎片的结束时刻取它们 mtime 的最大值。 */
+  const byStart = new Map<number, Frag>();
+  for (const name of entries) {
+    if (!VIDEO_EXT.test(name)) continue;
+    const full = path.join(dir, name);
+    const id = fragmentIdentityOf(full);
+    if (id.product) continue;
+    if (id.dir !== me.dir || id.title !== me.title || id.startMs === undefined) continue;
+    let mtimeMs = 0;
+    try {
+      mtimeMs = fs.statSync(full).mtimeMs;
+    } catch {
+      continue;
+    }
+    const cur = byStart.get(id.startMs) ?? { startMs: id.startMs, endMs: 0, files: [] };
+    cur.files.push(full);
+    cur.endMs = Math.max(cur.endMs, mtimeMs);
+    byStart.set(id.startMs, cur);
+  }
+  if (byStart.size < 2) return undefined;
+
+  const frags = [...byStart.values()].sort((a, b) => a.startMs - b.startMs);
+  /* 从样本所在碎片**先退到串头**，再从串头往前扩。为什么必须以串头为锚：
+     上限（maxMinutes）会在中间截断，如果每个样本各自"以自己为中心"截，
+     同一条串会被切成互相重叠的两段（实测：A→D 一段、D→E 又一段，D 落在两段里 ——
+     两个候选都会来导它，同一段素材被转写两次）。锚定串头之后，
+     一条串只可能出现在一个候选里，要么整条、要么从串头开始的前缀。 */
+  const idx = frags.findIndex((f) => f.startMs === me.startMs);
+  if (idx < 0) return undefined;
+  const adjacent = (a: Frag, b: Frag): boolean => b.startMs >= a.startMs && b.startMs - a.endMs <= gapSec * 1000;
+
+  let lo = idx;
+  while (lo > 0 && adjacent(frags[lo - 1]!, frags[lo]!)) lo--;
+  const capMs = Math.max(1, maxMinutes) * 60_000;
+  const spanTo = (end: number): number => frags[end]!.endMs - frags[lo]!.startMs;
+  let hi = lo;
+  while (hi < frags.length - 1 && adjacent(frags[hi]!, frags[hi + 1]!) && spanTo(hi + 1) <= capMs) hi++;
+  /* 上限把串截在样本之前 → 样本不属于这条串，交给调用方按单文件处理 */
+  if (idx > hi) return undefined;
+
+  const run = frags.slice(lo, hi + 1);
+  const files = run
+    .flatMap((f) => f.files)
+    .sort((a, b) => {
+      const ai = fragmentIdentityOf(a);
+      const bi = fragmentIdentityOf(b);
+      return (ai.startMs ?? 0) - (bi.startMs ?? 0) || (parseRecordingFileName(path.basename(a)).partIndex ?? 0) - (parseRecordingFileName(path.basename(b)).partIndex ?? 0) || a.localeCompare(b);
+    });
+  const newestMtimeMs = Math.max(...run.map((f) => f.endMs));
+  const startMs = run[0]!.startMs;
+  const spanSec = Number(((newestMtimeMs - startMs) / 1000).toFixed(1));
+  return {
+    files,
+    fragmentCount: run.length,
+    startMs,
+    newestMtimeMs,
+    spanSec,
+    capped: spanSec * 1000 >= capMs,
+  };
+}
+
+/**
+ * 导入时用：把「同基名的分段」与「相邻碎片」合成一份有序文件表。
+ *
+ * 与 `discoverSegments` 的关系：先跑它（同基名分段，含第 0 段补位与"仍在写入"排除），
+ * 再用碎片串补充**其它开录时刻**的文件。两边都尊重 `skipFreshWithinSec`
+ * （仍在写的文件不进来，样本自己除外）。
+ */
+export function discoverRecordingFiles(
+  samplePath: string,
+  opts: { skipFreshWithinSec?: number; stitch?: Partial<StitchConfig>; now?: number } = {},
+): { files: string[]; fragmentCount: number; skippedFresh: string[]; notes: string[] } {
+  const stitch: StitchConfig = { ...DEFAULT_STITCH, ...(opts.stitch ?? {}) };
+  const notes: string[] = [];
+  const now = opts.now ?? Date.now();
+  const parts = discoverSegments(samplePath, {
+    ...(opts.skipFreshWithinSec !== undefined ? { skipFreshWithinSec: opts.skipFreshWithinSec } : {}),
+    now,
+  });
+  if (!stitch.enabled || stitch.gapSec <= 0) return { files: parts, fragmentCount: 1, skippedFresh: [], notes };
+
+  const run = stitchRunOf(samplePath, { gapSec: stitch.gapSec, maxMinutes: stitch.maxMinutes, now });
+  if (!run || run.fragmentCount < 2) return { files: parts, fragmentCount: 1, skippedFresh: [], notes };
+
+  const windowSec = Math.max(0, opts.skipFreshWithinSec ?? 0);
+  const isFresh = (p: string): boolean => {
+    if (windowSec <= 0 || p === samplePath) return false;
+    try {
+      return now - fs.statSync(p).mtimeMs < windowSec * 1000;
+    } catch {
+      return false;
+    }
+  };
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const f of [...parts, ...run.files]) {
+    const key = f.toLowerCase();
+    if (seen.has(key) || isFresh(f)) continue;
+    seen.add(key);
+    merged.push(f);
+  }
+  const freshSkipped = [...new Set([...parts, ...run.files])].filter((f) => isFresh(f));
+  if (merged.length < 2) return { files: parts, fragmentCount: 1, skippedFresh: freshSkipped, notes };
+
+  notes.push(
+    `把 ${run.fragmentCount} 段相邻碎片当成一场（间隔 ≤ ${stitch.gapSec} 秒，跨度 ${Math.round(run.spanSec / 60)} 分钟）：` +
+      run.files.map((f) => path.basename(f)).join('、'),
+  );
+  return { files: merged, fragmentCount: run.fragmentCount, skippedFresh: freshSkipped, notes };
 }
 
 export interface ListRecordingsOptions {
@@ -331,6 +585,11 @@ export interface ListRecordingsOptions {
   extraDirs?: string[];
   /** 递归深度上限 */
   maxDepth?: number;
+  /**
+   * 碎片合并配置（见文件顶部「碎片合并」一节）。缺省用 `DEFAULT_STITCH`。
+   * 调用方一般直接传 `cfg.import.stitch`。
+   */
+  stitch?: Partial<StitchConfig>;
   /** 小于该体积的文件直接忽略（默认 5MB） */
   minSizeMB?: number;
   limit?: number;
@@ -553,6 +812,9 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
   const maxDepth = opts.maxDepth ?? cfg.import.maxDepth;
   const minBytes = Math.max(0, (opts.minSizeMB ?? cfg.import.minSizeMB) * 1024 * 1024);
   const limit = opts.limit ?? 60;
+  /* 碎片合并配置从**配置**取（调用方不必各自传一遍）：漏传会让清单说"1 段"
+     而导入进来 5 个文件 —— 这类"两处口径不一致"的坑本项目踩过好几次。 */
+  opts = { ...opts, stitch: opts.stitch ?? cfg.import.stitch };
 
   /* ---- 1. 来源一：biliLive-tools 录制历史 ---- */
   interface HistoryEntry {
@@ -676,6 +938,7 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
   const now = Date.now();
   const recWindowMs = (opts.recordingWindowSec ?? RECORDING_WINDOW_SEC) * 1000;
   const doProbe = opts.probe !== false;
+  const stitchCfg: StitchConfig = { ...DEFAULT_STITCH, ...(opts.stitch ?? {}) };
 
   /* ---- 4a. 先按「场」归并文件 ---- */
   interface Group {
@@ -728,7 +991,116 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
     return [...files].sort((a, b) => score(a) - score(b) || (a.partIndex ?? 0) - (b.partIndex ?? 0))[0]!;
   };
 
-  for (const g of groups.values()) {
+  /* ---- 4a-2. 把「相邻碎片」并进同一场（见文件顶部「碎片合并」） ----
+   *
+   * 归并键里带开录时刻，所以今晚那种「一场直播断成 5 个文件」在 4a 之后是 5 个组。
+   * 这里把「同目录 + 同标题 + 开录时刻紧接上一段结束（≤ gapSec）」的组串成一场。
+   *
+   * ⚠️ 只并**基名不同**的组：同基名 = 同一个文件被切成多段（`X.ts` + `X-PART001.ts`），
+   *    那是 4b 里"已闭合的先导入 + pendingParts"那套逻辑的地盘，合并会把它搞乱。 */
+  interface StitchMeta {
+    fragmentCount: number;
+    startMs?: number;
+    newestMtimeMs: number;
+    spanSec: number;
+    capped: boolean;
+  }
+  const mergedEntries: Array<{ g: Group; meta?: StitchMeta; waiting?: boolean; newestAgeSec?: number }> = [];
+  if (stitchCfg.enabled && stitchCfg.gapSec > 0 && groups.size > 0) {
+    interface Chain {
+      key: string;
+      dir: string;
+      title: string;
+      baseKey: string;
+      startMs: number;
+      endMs: number;
+      files: RecordingVariant[];
+      fromHistory?: HistoryEntry;
+      fragments: number;
+    }
+    const chains: Chain[] = [];
+    for (const g of groups.values()) {
+      const first = g.files[0];
+      if (!first) continue;
+      const id = fragmentIdentityOf(first.videoPath);
+      const starts = g.files
+        .map((f) => parseRecordingFileName(f.fileName).recordedAt)
+        .filter((t): t is number => typeof t === 'number');
+      if (!id.title || starts.length === 0) {
+        // 解析不出开录时刻/标题：不参与合并，原样出去
+        mergedEntries.push({ g });
+        continue;
+      }
+      chains.push({
+        key: g.key,
+        dir: id.dir,
+        title: id.title,
+        baseKey: id.baseKey,
+        startMs: Math.min(...starts),
+        endMs: Math.max(...g.files.map((f) => f.mtimeMs)),
+        files: [...g.files],
+        ...(g.fromHistory ? { fromHistory: g.fromHistory } : {}),
+        fragments: 1,
+      });
+    }
+    chains.sort((a, b) => a.dir.localeCompare(b.dir) || a.title.localeCompare(b.title) || a.startMs - b.startMs);
+    const capMs = Math.max(1, stitchCfg.maxMinutes) * 60_000;
+    const used = new Set<number>();
+    for (let i = 0; i < chains.length; i++) {
+      if (used.has(i)) continue;
+      const head = chains[i]!;
+      const run: Chain[] = [head];
+      used.add(i);
+      let j = i + 1;
+      while (j < chains.length) {
+        const prev = run[run.length - 1]!;
+        const next = chains[j]!;
+        const sameSession = next.dir === prev.dir && next.title === prev.title && next.baseKey !== prev.baseKey;
+        if (!sameSession) break;
+        // 只看"紧挨着"的那一个：中间有别的场次时链就断了（宁可少并，不可错并）
+        const gapMs = next.startMs - prev.endMs;
+        if (gapMs > stitchCfg.gapSec * 1000) break;
+        if (next.endMs - head.startMs > capMs) break;
+        run.push(next);
+        used.add(j);
+        j++;
+      }
+      if (run.length === 1) {
+        mergedEntries.push({ g: { key: head.key, files: head.files, ...(head.fromHistory ? { fromHistory: head.fromHistory } : {}) } });
+        continue;
+      }
+      const files = run.flatMap((c) => c.files);
+      const newestMtimeMs = Math.max(...run.map((c) => c.endMs));
+      const startMs = run[0]!.startMs;
+      const spanSec = Number(((newestMtimeMs - startMs) / 1000).toFixed(1));
+      const capped = newestMtimeMs - startMs >= capMs;
+      const newestAgeSec = Math.max(0, Number(((now - newestMtimeMs) / 1000).toFixed(1)));
+      /* 还在等：最新写入距今还不够久（说明这场还会续录），且跨度没到上限。
+         跨度到顶就必须导入，否则一整晚都在断的时候这一场永远进不来。 */
+      const waiting = newestAgeSec < stitchCfg.quietSec && !capped;
+      mergedEntries.push({
+        g: {
+          key: head.key,
+          files,
+          ...(run.find((c) => c.fromHistory)?.fromHistory
+            ? { fromHistory: run.find((c) => c.fromHistory)!.fromHistory }
+            : {}),
+        },
+        meta: { fragmentCount: run.length, startMs, newestMtimeMs, spanSec, capped },
+        waiting,
+        newestAgeSec,
+      });
+      logger.debug(
+        `录播清单：把 ${run.length} 个相邻碎片并成一场「${head.title}」（${run.map((c) => path.basename(c.files[0]!.fileName)).join('、')}）` +
+          `；最新写入 ${Math.round(newestAgeSec)} 秒前，跨度 ${Math.round(spanSec / 60)} 分钟${waiting ? '，先等它安静' : ''}`,
+      );
+    }
+  } else {
+    for (const g of groups.values()) mergedEntries.push({ g });
+  }
+
+  for (const entry of mergedEntries) {
+    const g = entry.g;
     /* ★ 按**单个文件**的写入时间判断"还在录"，而不是整组一刀切。
      *
      * 实测事故（2026-09-24，用户问「录播为什么没有导入」）：甲主播那场是「一场录制分多段」的
@@ -756,7 +1128,41 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
     const usable = doProbe ? probe.exists && probe.duration > 0 : true;
     /* 列表阶段即使 ffprobe 也不能把"还在写的分段"算进来 —— 与导入时的规则保持一致，
        否则清单上写的分段数会比真正导入的多一段。 */
-    const segs = usable && doProbe ? discoverSegments(video, { skipFreshWithinSec: Math.round(recWindowMs / 1000), now }) : [video];
+    /* 分段表：同基名的分段 **+ 相邻碎片**（见文件顶部「碎片合并」一节）。
+       清单上显示的段数/弹幕有无必须与真正导入的东西一致 —— 否则用户看到"1 段"，
+       导入进来却是 5 个文件（今晚这种"几分钟断一次"的场次就是这种形态）。 */
+    const segs =
+      usable && doProbe
+        ? discoverRecordingFiles(video, {
+            skipFreshWithinSec: Math.round(recWindowMs / 1000),
+            stitch: stitchCfg,
+            now,
+          }).files
+        : [video];
+
+    /* 多段（同基名分段 / 相邻碎片）时，界面上的「时长」「体积」必须是**整场**的：
+       只报首选文件那一段会让 21 分钟的一场显示成 3 分 20 秒，ASR 预估也跟着少算 6 倍
+       （`asrPreflight(videoPath, durationSec)` 就是按这个值算窗口数的）。 */
+    let durationSec = doProbe ? probe.duration : 0;
+    let sizeBytes = preferred.sizeBytes;
+    if (doProbe && segs.length > 1) {
+      let durSum = 0;
+      let sizeSum = 0;
+      let probed = 0;
+      for (const f of segs) {
+        const p = probeMedia(f);
+        if (p.duration > 0) {
+          durSum += p.duration;
+          probed++;
+        }
+        sizeSum += fileSize(f);
+      }
+      if (probed > 0) durationSec = Number(durSum.toFixed(3));
+      if (sizeSum > 0) sizeBytes = sizeSum;
+      if (probed < segs.length) {
+        logger.debug(`录播清单：${path.basename(video)} 有 ${segs.length - probed} 段探测不到时长，整场时长偏小`);
+      }
+    }
 
     const danmaPath0 = historyDanma ?? sibling?.path;
     /* ★ 多分段录播：弹幕文件是按「**该段自己的开始时刻**」命名的，与视频分段的前缀对不上，
@@ -777,7 +1183,9 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
        这一场都算已导入。回归用例见 `test/recordings.ts` 的 4d。
 
        顺序很重要：先认首选文件自己的任务（消息里报出的是"这一场的源文件属于谁"），
-       再退到同组其它变体，最后才用归并键兜底 —— 否则报出来的任务号会随机漂移。 */
+       再退到同组其它变体，最后才用归并键兜底 —— 否则报出来的任务号会随机漂移。
+       ⚠️ 合并碎片之后这一步更关键：碎片 B 的文件名与任务里记的（A）不同，
+       只有"整组任一文件命中"这条兜底才能拦住"同一场被导入两次"。 */
     const importedHit = g.files.find((f) => importedBy.has(f.videoPath.toLowerCase()));
     const importedRec =
       importedBy.get(video.toLowerCase()) ?? (importedHit ? importedBy.get(importedHit.videoPath.toLowerCase())! : importedGroups.get(g.key));
@@ -786,8 +1194,8 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
       videoPath: video,
       fileName: preferred.fileName,
       group: path.basename(path.dirname(video)),
-      sizeBytes: preferred.sizeBytes,
-      durationSec: doProbe ? probe.duration : 0,
+      sizeBytes,
+      durationSec,
       ...(probe.width && probe.height ? { resolution: `${probe.width}x${probe.height}` } : {}),
       ...(probe.videoCodec ? { codec: `${probe.videoCodec}/${probe.audioCodec ?? '?'}` } : {}),
       ...(danmaPath ? { danmaPath } : {}),
@@ -817,6 +1225,20 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
         ? {
             pendingParts: freshFiles.length,
             pendingFiles: freshFiles.map((f) => ({ fileName: f.fileName, sizeMB: f.sizeMB })),
+          }
+        : {}),
+      ...(entry.meta
+        ? {
+            fragmentCount: entry.meta.fragmentCount,
+            stitch: {
+              fragmentCount: entry.meta.fragmentCount,
+              spanSec: entry.meta.spanSec,
+              quietSec: stitchCfg.quietSec,
+              newestAgeSec: entry.newestAgeSec ?? 0,
+              gapSec: stitchCfg.gapSec,
+              capped: entry.meta.capped,
+            },
+            ...(entry.waiting ? { stitchWaiting: true } : {}),
           }
         : {}),
     });
@@ -872,6 +1294,16 @@ export function describeCandidate(c: RecordingCandidate): string {
      但界面上"可能仍在录制"也跟着消失 —— 用户会以为系统不知道还在录。
      两个事实要同时讲清：这一段已经写完（可处理），本场还有 N 段在写（录完会自动进来）。 */
   if (c.pendingFiles?.length) parts.push(`本场另有 ${c.pendingFiles.length} 段仍在写入`);
+  /* 碎片合并的状态也要说出来：用户看到"3.3 分钟的一场"会以为录短了，
+     实际是它还在等后续碎片（CDN 每隔几分钟断一次），合并后才是整场。 */
+  if (c.stitch && c.stitch.fragmentCount > 1) {
+    const wait = c.stitchWaiting
+      ? `，等安静 ${Math.max(0, Math.round(c.stitch.quietSec - c.stitch.newestAgeSec))} 秒后整场导入`
+      : c.stitch.capped
+        ? `（跨度已达上限，先导这一段）`
+        : '';
+    parts.push(`已拼 ${c.stitch.fragmentCount} 段相邻碎片${wait}`);
+  }
   if (c.importedBy) parts.push(`已导入(${c.importedBy.status})`);
   if (!c.usable) parts.push('文件不可用');
   return parts.join(' · ');

@@ -92,6 +92,9 @@ interface CandOverrides {
   /** 本场还有分段在写入（已闭合的那段照常导入） */
   pendingParts?: number;
   pendingFiles?: Array<{ fileName: string; sizeMB: number }>;
+  /** 碎片合并：这一场由多个相邻碎片拼成、还在等安静（见 `recordings.ts` 顶部） */
+  stitchWaiting?: boolean;
+  stitch?: { fragmentCount: number; spanSec: number; quietSec: number; newestAgeSec: number; gapSec: number; capped: boolean };
 }
 
 function cand(fileName: string, over: CandOverrides = {}): RecordingCandidate {
@@ -124,6 +127,8 @@ function cand(fileName: string, over: CandOverrides = {}): RecordingCandidate {
     possiblyRecording: over.possiblyRecording ?? false,
     ...(over.pendingParts ? { pendingParts: over.pendingParts } : {}),
     ...(over.pendingFiles ? { pendingFiles: over.pendingFiles } : {}),
+    ...(over.stitchWaiting ? { stitchWaiting: true } : {}),
+    ...(over.stitch ? { fragmentCount: over.stitch.fragmentCount, stitch: over.stitch } : {}),
   };
 }
 
@@ -569,6 +574,37 @@ async function main(): Promise<void> {
     ok(/parts\.push\(b\.live\.map\(rowHtml\)\.join\(''\)\)/.test(html), '「正在录制」那组永远展开（不可折叠）');
     ok(/c\.possiblyRecording\) buckets\.live\.push\(i\)/.test(html), '还在录的候选归到「正在录制」而不是未导入组');
     ok(/else if \(c\.importedBy\) buckets\.imported\.push\(i\)/.test(html), '导入过的归到「已导入过」');
+  }
+
+  section('14. 碎片合并：还在陆续落盘时不导入（否则一场又被拆成多个任务）');
+  {
+    /* 用户 2026-10-06 的实况：一场直播被 CDN 每隔几分钟断一次，落成 5 个文件。
+       合并成一场之后，**必须等它安静**再导入 —— 否则每断一次就导一次，
+       正好把碎片合并的意义抵消掉。 */
+    const h = makeHarness([
+      cand('好冷好冷.ts', {
+        stitchWaiting: true,
+        stitch: { fragmentCount: 4, spanSec: 1266, quietSec: 180, newestAgeSec: 5, gapSec: 120, capped: false },
+      }),
+    ]);
+    await h.importer.scanOnce();
+    h.advance(31_000);
+    const outs = await h.importer.scanOnce();
+    eq('等安静期间不导入', h.imported.length, 0);
+    const row = outs.find((o) => o.fileName === '好冷好冷.ts');
+    /* ⚠️ 本文件的 `ok` 是 `(cond, msg, extra)` 顺序（与 recordings.ts 的 `(name, cond)` 相反）。 */
+    ok(String(row?.skipped ?? '').includes('相邻碎片'), '并且如实说明在等什么', String(row?.skipped));
+    ok(/等安静\s*\d+\s*秒后整场导入/.test(String(row?.skipped ?? '')), '说明里带上还剩多久（用户能预期）', String(row?.skipped));
+    ok(!String(row?.skipped ?? '').includes('文件仍在写入'), '没有做成"仍在写入"的跳过（那会让用户以为录制没结束）', String(row?.skipped));
+
+    /* 安静之后（同一个候选，去掉等待标记）就应该导入。
+       注意稳定性那关要两轮：第一轮只是登记"首次发现"，隔 31 秒的第二轮才认。 */
+    h.setCandidates([cand('好冷好冷.ts')]);
+    await h.importer.scanOnce();
+    h.advance(31_000);
+    const outs2 = await h.importer.scanOnce();
+    eq('★ 安静之后正常导入', h.imported.length, 1);
+    eq('并且不再有跳过理由', outs2.find((o) => o.fileName === '好冷好冷.ts')?.skipped, undefined);
   }
 
   console.log('\n' + '─'.repeat(74));

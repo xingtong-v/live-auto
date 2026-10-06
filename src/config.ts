@@ -9,6 +9,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { CONFIG_EXAMPLE_PATH, CONFIG_PATH, ROOT_DIR, clone, exists } from './util.ts';
+/* 类型 + 默认值都从 recordings 借：碎片合并的判定与默认值只该有一处定义
+   （`DEFAULT_STITCH`），配置层重新写一遍必然漂移。 */
+import { DEFAULT_STITCH, type StitchConfig } from './recordings.ts';
 import { log as globalLog } from './logger.ts';
 
 /* ---------------------------------------------------------------------------
@@ -251,6 +254,18 @@ export interface ImportConfig {
    * 而盘上的文件是真实存在的 —— 盯目录就一定能发现。
    */
   watch: WatchImportConfig;
+  /**
+   * 碎片合并：同一场直播被 CDN 断成多个文件时，把它们当成**一场**导入。
+   *
+   * 实测背景（2026-10-06 晚）：「我的 biliLive-tools 为啥几分钟就中断一次录制」——
+   * 不是它主动停，是拉流被 CDN 那头关掉，它随即换一个地址重连，于是同一场直播落成
+   * 23-25-18-143、23-28-41-546、23-34-10-158… 好几个文件。不合并 = 一场直播拆成
+   * N 个任务、N 次转写、N 组切片、往同一个稿件投 N 批分P。
+   *
+   * 只在「同目录 + 同标题 + 开录时刻紧接上一段结束」时合并；同基名的分段
+   * （`X.ts` + `X-PART001.ts`）不受影响，走原有逻辑。
+   */
+  stitch: StitchConfig;
 }
 
 export interface WatchImportConfig {
@@ -691,6 +706,9 @@ function builtinDefaults(): AppConfig {
         maxDepth: 3,
         minSizeMB: 5,
       },
+      /* 碎片合并默认开：实测一场直播被 CDN 断成 5 段的形态很常见
+         （biliLive-tools 历史里 38% 的录制短于 15 分钟）。 */
+      stitch: { ...DEFAULT_STITCH },
     },
     danmaku: {
       densityWindowSec: 10,

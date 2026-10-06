@@ -55,7 +55,7 @@ import {
 } from './media.ts';
 import { analyzeDanmaku } from './danmaku.ts';
 import { mergeDanmakuXmlFiles, pairSegmentDanmaku, chooseDanmaku } from './danmaku-merge.ts';
-import { findSiblingDanmaku, RECORDING_WINDOW_SEC } from './recordings.ts';
+import { discoverRecordingFiles, findSiblingDanmaku, RECORDING_WINDOW_SEC } from './recordings.ts';
 import { GlossaryStore, correctTranscript, hotWordList } from './glossary.ts';
 import { TRASH_DIR, listTrash, moveToTrash, purgeTrash, restoreFromTrash, trashStats } from './trash.ts';
 import type {
@@ -2801,12 +2801,37 @@ export class Orchestrator {
     const { title, id } = ident;
 
     // 手动导入的视频可能是一个目录里的多个分段
-    /* ⚠️ 必须排除**仍在写入**的分段：`discoverSegments` 的第 0 段补位会把
+    /* 两件事一起做（见 `recordings.ts` 顶部「碎片合并」）：
+       ① 同基名的分段（`X.ts` + `X-PART001.ts`）按原有规则认出来；
+       ② **相邻碎片**（同一场直播被 CDN 断成 `23-25-18-143 X.ts`、`23-28-41-546 X.ts`…）
+          也并进同一场 —— 否则一场直播会被拆成 N 个任务、N 次转写、N 组切片。
+       ⚠️ 必须排除**仍在写入**的分段：`discoverSegments` 的第 0 段补位会把
        `X.ts`（已闭合的第 1 段）与 `X-PART001.ts`（**正在录**的第 2 段）拼成一场，
        于是任务的总时长、切点、全局时间轴全建立在半场数据上。
        时间窗与目录轮询的"可能仍在录制"判定用同一个常量。 */
-    const segs = discoverSegments(input.videoPath, { skipFreshWithinSec: RECORDING_WINDOW_SEC });
-    const freshSkipped = discoverSegments(input.videoPath).length - segs.length;
+    const discovered = discoverRecordingFiles(input.videoPath, {
+      skipFreshWithinSec: RECORDING_WINDOW_SEC,
+      stitch: cfg.import.stitch,
+    });
+    /* ★ 碎片合并可能把"已经属于别的任务"的碎片也圈进来（用户手动导入中间那一段时尤其容易：
+       那一串里的前几段可能已经被目录轮询导过了）。不过滤的话，同一段素材会被第二次转写、
+       第二次选片、第二次投稿 —— 而日志里一切正常。样本自己不受过滤（那是用户显式指定的）。 */
+    const taken = new Set<string>();
+    for (const t of this.ledger.listTasks({ limit: 500 })) {
+      for (const f of t.source.rawFiles ?? []) taken.add(f.toLowerCase());
+    }
+    const wantKey = input.videoPath.toLowerCase();
+    const segs = discovered.files.filter((f) => f.toLowerCase() === wantKey || !taken.has(f.toLowerCase()));
+    if (segs.length < discovered.files.length) {
+      const dropped = discovered.files.filter((f) => !segs.includes(f));
+      this.logger.info(
+        `碎片合并时跳过了 ${dropped.length} 个已经属于别的任务的文件（避免同一段素材被重复转写/投稿）：` +
+          dropped.map((f) => path.basename(f)).join('、'),
+        { taskId: id, mod: 'pipeline' },
+      );
+    }
+    for (const note of discovered.notes) this.logger.info(note, { taskId: id, mod: 'pipeline' });
+    const freshSkipped = discovered.skippedFresh.length;
     if (freshSkipped > 0) {
       this.logger.info(
         `导入时跳过了 ${freshSkipped} 个仍在写入的分段（它们录完会作为独立的场次自动进来）`,

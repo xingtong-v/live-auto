@@ -30,7 +30,7 @@
     "config-test": "node test/config-checks.ts",
     "real": "node test/real-media.ts",
     "selftest": "node test/redact-selftest.ts && node test/smoke.ts",
-    "verify": "npm run typecheck && npm run text-test && npm run config-test && npm run audit && npm run redact-test && npm run subtitle-test && npm run streamer-test && npm run av-sync-test && npm run title-test && npm run clip-boundary-test && npm run delete-test && npm run trigger-scope-test && npm run recordings-test && npm run watch-test && npm run watch-skip-burn-test && npm run pending-delete-test && npm run monitor-panel-test && npm run performance-test && npm run service-watchdog-test && npm run error-report-test && npm run local-funasr-test && npm run desc-notice-test && npm run clip-actions-test && npm run import-source-test && npm run resume-target-test && npm run multipart-routing-test && npm run confirm-append-test && npm run fingerprint-dedup-test && npm run fingerprint-tombstone-test && npm run segment-danmaku-test && npm run multipart-cut-snapshot-test && npm run mcp-test && npm run trash-test && npm run config-conflict-test && npm run config-conflict-e2e && npm run select-slot-test && npm run e2e && npm run smoke && npm run real",
+    "verify": "npm run typecheck && npm run text-test && npm run config-test && npm run audit && npm run redact-test && npm run subtitle-test && npm run streamer-test && npm run av-sync-test && npm run title-test && npm run clip-boundary-test && npm run delete-test && npm run trigger-scope-test && npm run recordings-test && npm run stitch-test && npm run watch-test && npm run watch-skip-burn-test && npm run pending-delete-test && npm run monitor-panel-test && npm run performance-test && npm run service-watchdog-test && npm run error-report-test && npm run local-funasr-test && npm run desc-notice-test && npm run clip-actions-test && npm run import-source-test && npm run resume-target-test && npm run multipart-routing-test && npm run confirm-append-test && npm run fingerprint-dedup-test && npm run fingerprint-tombstone-test && npm run segment-danmaku-test && npm run multipart-cut-snapshot-test && npm run mcp-test && npm run trash-test && npm run config-conflict-test && npm run config-conflict-e2e && npm run select-slot-test && npm run e2e && npm run smoke && npm run real",
     "trash-test": "node test/trash.ts",
     "av-sync-test": "node test/av-sync.ts",
     "watch-test": "node test/watch-import.ts",
@@ -70,7 +70,8 @@
     "desc-notice-test": "node test/desc-notice.ts",
     "watch-skip-burn-test": "node test/watch-skip-burn-product.ts",
     "fingerprint-tombstone-test": "node test/fingerprint-tombstone.ts",
-    "segment-danmaku-test": "node test/segment-danmaku.ts"
+    "segment-danmaku-test": "node test/segment-danmaku.ts",
+    "stitch-test": "node test/stitch-fragments.ts"
   },
   "dependencies": {
     "fast-xml-parser": "^5.2.5",

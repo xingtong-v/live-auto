@@ -231,6 +231,14 @@
       "importExisting": false,
       "maxDepth": 3,
       "minSizeMB": 5
+    },
+
+    "$comment_stitch": "碎片合并：biliLive-tools 的拉流被 CDN 每隔几分钟关一次（日志里是 record end, reason: [\"finished\"]，它随即换地址重连），同一场直播会落成好几个文件。开启后把同目录 + 同标题 + 开录时刻紧接上一段结束的碎片当成一场导入，避免一场直播被拆成 N 个任务、往同一稿件投 N 批分P。同基名的分段（X.ts + X-PART001.ts）不受影响。",
+    "stitch": {
+      "enabled": true,
+      "gapSec": 120,
+      "quietSec": 180,
+      "maxMinutes": 30
     }
   },
 
