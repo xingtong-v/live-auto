@@ -256,6 +256,31 @@ section('4. 清单：合并成一场 + 等安静（不把一场拆成多个任�
 
   /* 排序：等安静的场次仍然会列出来（要让用户看到它在等），只是不会被自动导入 */
   ok('等安静的场次也出现在清单里（不隐藏，界面能解释原因）', res.candidates.some((c) => c.stitchWaiting === true));
+
+  /* ★ 过渡态：一场直播的碎片被**陆续导入过一部分**（今晚 B、C 就各自成了一个任务）。
+     这时合并后的候选不能被那部分记录整体挡住 —— 否则没导过的碎片再也不会被导入（素材静默丢失）。 */
+  {
+    const onlyB = path.join(folder, `${stampOf(nowMs - 34 * min)} 夜里电台.ts`);
+    const bothFiles = [path.join(folder, `${stampOf(nowMs - 40 * min)} 夜里电台.ts`), onlyB];
+    const ask = async (rawFiles: string[]) =>
+      listRecordingsDetailed(
+        { ...cfg, import: { ...cfg.import, scanDirs: [root], minSizeMB: 0, maxDepth: 4 } },
+        {
+          limit: 20,
+          includeFallbackDirs: false,
+          probe: false,
+          ledger: { listTasks: () => [{ id: 'task-1', source: { rawFiles } }] } as never,
+        },
+      );
+    const partial = await ask([onlyB]);
+    const rowA = partial.candidates.find((c) => c.title === '夜里电台');
+    eq('★ 只导过一部分碎片时，这一场仍然算"可导入"（否则没导过的那几段永远进不来）', rowA?.importedBy, undefined);
+    eq('★ 并且如实说明已导过 1/2 段（界面据此解释为什么不是全新场次）', rowA?.importedParts, { covered: 1, total: 2 });
+
+    const full = await ask(bothFiles);
+    const rowB = full.candidates.find((c) => c.title === '夜里电台');
+    ok('★ 每一段碎片都导过之后，才标成已导入（不重复转写）', rowB?.importedBy?.taskId === 'task-1', JSON.stringify(rowB?.importedBy));
+  }
 }
 
 console.log('\n' + '─'.repeat(74));

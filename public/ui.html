@@ -3596,6 +3596,11 @@ $('#btnImport').onclick = () => {
         flags.push(`<span style="color:var(--blue,#00aeec)">已合并 ${c.stitch.fragmentCount} 段碎片（整场）</span>`);
       }
     }
+    /* 合并不全：已经导过其中几段。剩下的仍会被导入（已导过的不会重复转写），
+       所以要如实说明，否则用户看到"没标已导入"会以为是全新的。 */
+    if (c.importedParts && c.importedParts.covered < c.importedParts.total) {
+      flags.push(`<span style="color:#c8811a">已导过 ${c.importedParts.covered}/${c.importedParts.total} 段</span>`);
+    }
     if (c.importedBy) flags.push('<span style="color:#c8811a">已导入</span>');
     if (c.hasDanmakuInPicture) flags.push('<span style="color:#c8811a">画面已烧弹幕</span>');
     if (!c.usable) flags.push('<span style="color:#c33">文件不可用</span>');

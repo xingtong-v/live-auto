@@ -323,6 +323,11 @@ export interface RecordingCandidate {
     gapSec: number;
     capped: boolean;
   };
+  /**
+   * 合并场次里已经导过几段（`covered < total` 时这一场仍然可导入：剩下那几段会被导进来，
+   * 已导过的不会重复转写）。界面据此解释"为什么这场没标已导入但也不是全新的"。
+   */
+  importedParts?: { covered: number; total: number };
 }
 
 /**
@@ -1184,11 +1189,24 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
 
        顺序很重要：先认首选文件自己的任务（消息里报出的是"这一场的源文件属于谁"），
        再退到同组其它变体，最后才用归并键兜底 —— 否则报出来的任务号会随机漂移。
-       ⚠️ 合并碎片之后这一步更关键：碎片 B 的文件名与任务里记的（A）不同，
-       只有"整组任一文件命中"这条兜底才能拦住"同一场被导入两次"。 */
+
+       ⚠️ **碎片合并之后要多判一层**（2026-10-06 实测的过渡态）：一场直播的碎片可能
+       被陆续导入过一部分（今晚 B、C 就各自成了一个任务）。如果还按"任一文件命中就算已导入"，
+       那么 A、C、D 会被 B 的导入记录整体挡住、再也不会被导入（素材静默丢失）。
+       所以合并场次要按**碎片**逐个判：每个碎片用自己的归并键（目录 + 去后缀基名）比台账，
+       **全部覆盖**才算这一场已导入；没覆盖的那些会在导入时被 `importLocal` 按台账过滤掉
+       （两个机制合起来：已导过的碎片不重复转写，没导过的碎片不丢）。 */
+    const fragmentKeys = new Set(g.files.map((f) => `${path.dirname(f.videoPath).toLowerCase()}|${recordingGroupKey(f.fileName)}`));
+    const coveredFragments = [...fragmentKeys].filter((k) => importedGroups.has(k)).length;
+    const allFragmentsCovered = fragmentKeys.size > 1 && coveredFragments === fragmentKeys.size;
     const importedHit = g.files.find((f) => importedBy.has(f.videoPath.toLowerCase()));
+    const anyHit = importedBy.get(video.toLowerCase()) ?? (importedHit ? importedBy.get(importedHit.videoPath.toLowerCase()) : undefined);
     const importedRec =
-      importedBy.get(video.toLowerCase()) ?? (importedHit ? importedBy.get(importedHit.videoPath.toLowerCase())! : importedGroups.get(g.key));
+      fragmentKeys.size > 1
+        ? allFragmentsCovered
+          ? (anyHit ?? importedGroups.get(g.key))
+          : undefined
+        : (anyHit ?? importedGroups.get(g.key));
 
     out.push({
       videoPath: video,
@@ -1239,6 +1257,10 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
               capped: entry.meta.capped,
             },
             ...(entry.waiting ? { stitchWaiting: true } : {}),
+            /* 合并场次里已导过几段：一部分导过时仍要放出剩下的（否则素材静默丢失） */
+            ...(fragmentKeys.size > 1 && coveredFragments > 0
+              ? { importedParts: { covered: coveredFragments, total: fragmentKeys.size } }
+              : {}),
           }
         : {}),
     });
