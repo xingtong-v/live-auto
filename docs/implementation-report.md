@@ -2589,30 +2589,61 @@ QQBrowser、Edge、Zed 等，日志里也有 `[Insufficient Permissions]` 的 GP
 > 这个回归从 `1ff3899` 起就一直躺在库里没人发现 —— 因为那次提交只跑了与 ASR 相关的套件，
 > **没跑完整 `verify`**。教训：改 `public/ui.html` 就必须跑 `ui-e2e`。
 
-### 24.6 环境侧发现（不是代码问题，但要说）
+### 24.6 用户真的按了那个按钮：13 个文件 → 回收站（21:43:27）
+
+界面刷新后用户直接在浏览器里点了它，服务端日志：
+
+```
+21:43:27 info 已移入回收站：<13 条，逐条带文件名与体积>
+21:43:27 info 一键删除已投稿文件：成功 13 个（1.7 GB），失败 0 个，跳过 0 个（全部移入回收站，可恢复）
+```
+
+之后 `/api/monitor` 的 `count` 归 0、`deletableCount` 归 0，卡片显示空态
+（「还没有已经投出去的文件…」）且**不再渲染那个按钮**。核查过：`tools/` 与 `test/` 里没有任何
+一处会对**真实服务**打 `published-file/delete-all`（`test/monitor-panel.ts` 打的是自己起的临时
+台账服务，`tools/verify-monitor-ui.ts` 把 fetch 桩掉了）—— 这一次是用户本人的点击。
+
+### 24.7 真机截图又抓到两个缺陷（都已修）
+
+验证工具收尾时截的那张图里，按钮停在**「正在删除…」**、旁边还浮着一个写着 **`undefined`** 的黑框：
+
+| 缺陷 | 根因 | 修法 |
+|---|---|---|
+| 按钮永久卡在「正在删除…」 | 删除成功后调 `loadMonitor(true)`，而它为省重画会做 `silent && sig === m.sig` 的**签名快路径**；服务端数据没变（例如本次桩返回"删了 0 个"、或另一个标签页已经删过）就直接 return，按钮的文案/禁用状态留在原处 | 处理函数改 `try/catch/**finally**`，无论成败都自己复位按钮（真删掉了的话该节点已被重画替换，写它无害）。单删那条同样的写法一并修 |
+| toast 弹出 `undefined` | `toast(\`${r.note}…\`)` —— 桩返回的 payload 没有 `note` 字段，模板字符串就把它变成字面量 `undefined` | `r.note \|\| \`已删除 ${r.deleted ?? 0} 个文件\`` 兜底 |
+
+两条都进了断言：静态（`test/monitor-panel.ts` 检查 `finally` 复位与 `r.note ||` 兜底）+
+真浏览器（`tools/verify-monitor-ui.ts` 点完按钮后断言 `disabled === false`、文案不含「正在删除」、
+toast 里没有 `undefined`）。**这两个缺陷只有截图/真机才看得见** —— Node 侧断言全绿的时候它们就在那儿。
+
+同时把验证工具改成**两种状态都能跑**：清单为空时验空态（有文案、没有按钮、没有残留标签），
+不再把"没有对象可验"报成 8 条失败（这次就发生了：刚修完工具，用户已经把 13 个文件删光了）。
+
+### 24.8 环境侧发现（不是代码问题，但要说）
 
 1. **`publish.isOnlySelf` 现在是 0**。`test/smoke.ts` 的硬约束 #10（试跑期仅自己可见）因此报红。
    今天 21:35–21:40 有若干次从界面保存配置的写入（设置面板整表保存会带上这个开关，
    `isOnlySelf: on('#c_isOnlySelf') ? 1 : 0`），但**日志里查不到它是什么时候、被谁翻过去的**
    （`decisions.jsonl` 不记这个字段）。**下一步投稿会是公开可见**，已就此单独问用户。
-2. **回收站里躺着 6.05 GB**：今天 21:27–21:28 有 14 个任务被逐个「移入回收站」（每个 2 项），
-   `data/trash` 现有 14 个条目。移入回收站**不释放磁盘空间**，要等回收站清理。
-   D 盘余量 324 GB，不紧张。
+2. **回收站里躺着 7.7 GB**（27 个条目）：21:27–21:28 有 14 个任务被逐个「移入回收站」（每个 2 项，
+   约 6.05 GB），21:43:27 那 13 个已投稿产物又加进来 1.7 GB。移入回收站**不释放磁盘空间**，
+   要等回收站清理（`cleanup.trashDays`，默认 7 天）或手动清空。D 盘余量 324 GB，不紧张。
 
-### 24.7 本轮改了什么（一览）
+### 24.9 本轮改了什么（一览）
 
 | 文件 | 改动 |
 |---|---|
 | `src/server.ts` | **新增** `POST /api/published-file/delete-all`：一份快照 + 逐个进回收站 + 跳过原因如实返回 |
-| `public/ui.html` | 卡片头「一键删除可删的 N 项」按钮（`deletableCount` 为 0 时不渲染）+ 确认框 + 结果 toast；确认文案改纯文本；`state.impOpen` 默认展开未导入组 |
-| `test/monitor-panel.ts` | 126 → **168 项**：批量接口全链路 + 界面静态接线（含"确认文案不许有 markdown/HTML"） |
+| `public/ui.html` | 卡片头「一键删除可删的 N 项」按钮（`deletableCount` 为 0 时不渲染）+ 确认框 + 结果 toast；确认文案改纯文本；`state.impOpen` 默认展开未导入组；单删/批删都用 `finally` 自己复位按钮；toast 文案兜底 |
+| `test/monitor-panel.ts` | 126 → **171 项**：批量接口全链路 + 界面静态接线（含"确认文案不许有 markdown/HTML"、"按钮必须自己复位"、"toast 必须有兜底"） |
 | `test/watch-import.ts` | 67 → **73 项**：§13 导入清单分组默认值 |
-| `tools/verify-monitor-ui.ts` | 18 → **34 项**：真浏览器点按钮（桩住 confirm/fetch，零删除） |
-| `tools/ui-e2e.ts` + `ui.html` | `UI_BUILD` → `ui-2026-10-06-bulk-delete-published`（两端同步） |
+| `tools/verify-monitor-ui.ts` | 18 → **37 项**：真浏览器点按钮（桩住 confirm/fetch，零删除）+ 返回后按钮复位/toast 兜底 + **空态分支** |
+| `tools/ui-e2e.ts` + `ui.html` | `UI_BUILD` → `ui-2026-10-06-bulk-delete-published-2`（两端同步） |
 
-`npm run verify` 的 37 步里，36 步全绿；`smoke` 只有硬约束 #10 一条报红（配置状态，见 24.6），
+`npm run verify` 的 37 步里，36 步全绿；`smoke` 只有硬约束 #10 一条报红（配置状态，见 24.8），
 它后面那步 `real`（真实素材、本地引擎真转写）因 `&&` 链中断被跳过，单独跑是 **PASS=24 FAIL=0**。
-另有真浏览器验证：`tools/ui-e2e.ts` **121/121**、`tools/verify-monitor-ui.ts` **34/34**。
+另有真浏览器验证：`tools/ui-e2e.ts` **121/121**、`tools/verify-monitor-ui.ts` 34/34（有数据时）
+与 7/7（空态时）。
 
 
 

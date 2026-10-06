@@ -210,10 +210,11 @@ async function main(): Promise<void> {
       bulkN: string;
       bulkMb: string;
       bulkBound: boolean;
+      cardText: string;
     }>(`(() => {
       const box = document.getElementById('otherPage');
       const card = Array.from(box.querySelectorAll('.card')).find((c) => String(c.querySelector('h2')?.textContent || '').includes('已投稿文件'));
-      if (!card) return { rows: 0, header: '', kinds: [], withLink: 0, withoutLink: 0, withDel: 0, boundBtns: 0, emptyStatus: 0, firstRow: '', note: '', bulkText: '', bulkN: '', bulkMb: '', bulkBound: false };
+      if (!card) return { rows: 0, header: '', kinds: [], withLink: 0, withoutLink: 0, withDel: 0, boundBtns: 0, emptyStatus: 0, firstRow: '', note: '', bulkText: '', bulkN: '', bulkMb: '', bulkBound: false, cardText: '' };
       const rows = Array.from(card.querySelectorAll('tbody tr'));
       /* 逐行判定，别用全局计数 —— 第一版用 querySelectorAll('tbody .tag-mini')
          数状态标签，而「类型」列也是 .tag-mini，于是 7 行数出 14 个。 */
@@ -236,8 +237,32 @@ async function main(): Promise<void> {
         bulkN: bulk ? String(bulk.dataset.n || '') : '',
         bulkMb: bulk ? String(bulk.dataset.mb || '') : '',
         bulkBound: bulk ? typeof bulk.onclick === 'function' : false,
+        cardText: String(card.textContent || ''),
       };
     })()`);
+
+    /* 清单为空（用户已经把可删的删光了）→ 只验空态，别把"没有对象可验"报成缺陷 */
+    if (apiItems.length === 0) {
+      await cdp.evalJs(`(() => {
+        const card = Array.from(document.getElementById('otherPage').querySelectorAll('.card'))
+          .find((c) => String(c.querySelector('h2')?.textContent || '').includes('已投稿文件'));
+        if (card) card.scrollIntoView({ block: 'start' });
+        return true;
+      })()`);
+      await sleep(500);
+      try {
+        ensureDir(SHOT_DIR);
+        const shot = (await cdp.send('Page.captureScreenshot', { format: 'png' })) as { data?: string };
+        if (shot.data) {
+          fs.writeFileSync(path.join(SHOT_DIR, '23-monitor-uploaded-files-empty.png'), Buffer.from(shot.data, 'base64'));
+          console.log('  \x1b[90m截图: data/ui-shots/23-monitor-uploaded-files-empty.png\x1b[0m');
+        }
+      } catch {
+        /* 截图失败不影响结论 */
+      }
+      await checkEmptyState(cdp, view);
+      return;
+    }
 
     const expectDeletable = apiItems.filter((i) => i['deletable'] === true).length;
     ok('卡片标题带统计（N 个可删 / 共 X MB）', /可删/.test(view.header) && /MB/.test(view.header), view.header);
@@ -278,7 +303,7 @@ async function main(): Promise<void> {
       window.fetch = (p, o) => {
         const url = String(p);
         if (url.indexOf('/api/published-file/delete-all') >= 0) { window.__cap.push({ url, method: (o && o.method) || 'GET', body: (o && o.body) || '' }); 
-          return Promise.resolve(new Response('{"deleted":0}', { status: 200, headers: { 'Content-Type': 'application/json' } })); }
+          return Promise.resolve(new Response('{"ok":true,"deleted":0,"failed":[],"skipped":[],"bytes":0,"freedText":"0 B","note":"（桩）已把 0 个文件移入回收站"}', { status: 200, headers: { 'Content-Type': 'application/json' } })); }
         return window.__origFetch(p, o);
       };
       return true;
@@ -313,6 +338,20 @@ async function main(): Promise<void> {
     ok('★ 确认框写明"审核中的会被跳过"', /审核/.test(cmsg) && /跳过/.test(cmsg));
     /* confirm() 不认 HTML/markdown：星号与标签会原样显示在弹窗里（第一版就写了 `**移入回收站**`） */
     ok('★ 确认框里没有 HTML 标签 / markdown 星号（弹窗是纯文本）', !/<[a-z/]/.test(cmsg) && !/\*\*/.test(cmsg), cmsg.replace(/\n/g, ' | ').slice(0, 200));
+
+    /* 返回后的界面状态：桩返回的是"删了 0 个"，服务端数据没变 ⇒ `loadMonitor(true)` 走
+       "签名相同就不重画"的快路径。截图里抓到过按钮就那样一直卡在「正在删除…」、
+       toast 还弹出一个写着 undefined 的黑框。 */
+    const afterGoState = await cdp.evalJs<{ disabled: boolean; text: string; toast: string }>(`(() => {
+      const b = document.querySelector('[data-act="del-published-all"]');
+      return {
+        disabled: b ? b.disabled : true,
+        text: b ? String(b.textContent || '').trim() : '',
+        toast: String((document.querySelector('.toast') || {}).textContent || ''),
+      };
+    })()`);
+    ok('★ 请求返回后按钮自己复位（数据没变就不会重画，不能指望重画）', afterGoState.disabled === false && !/正在删除/.test(afterGoState.text), `${afterGoState.text} disabled=${String(afterGoState.disabled)}`);
+    ok('★ toast 显示的是服务端给的说明，不是 "undefined"', /桩/.test(afterGoState.toast) && !/undefined/.test(afterGoState.toast), afterGoState.toast.slice(0, 120));
     console.log(`  \x1b[90m确认框：${cmsg.replace(/\n+/g, ' ⏎ ').slice(0, 160)}\x1b[0m`);
     console.log(`  \x1b[90m抓到的请求：${afterGo.cap[0]?.method} ${afterGo.cap[0]?.url} body=${afterGo.cap[0]?.body}\x1b[0m`);
     console.log(`  \x1b[90m（请求被桩拦下，未真正删除任何文件）\x1b[0m`);
@@ -377,6 +416,28 @@ async function main(): Promise<void> {
     process.exitCode = 1;
   } else {
     console.log('\x1b[32m「已投稿文件」在界面上列得出来、状态分得清、按钮点得动。\x1b[0m');
+  }
+}
+
+/** 清单为空时走的那条路（用户自己把可删的删光了）：只验空态与"没有按钮"，然后收摊。
+ *  真实发生过：2026-10-06 21:43 用户就用这个按钮把 13 个文件删进回收站，
+ *  之后行级断言全都会红 —— 那不是缺陷，是没有可验的对象，得如实区分开。 */
+async function checkEmptyState(
+  cdp: Cdp,
+  view: { cardText: string; bulkText: string; bulkBound: boolean; withDel: number; withLink: number; withoutLink: number; rows: number },
+): Promise<void> {
+  ok('清单为空时显示空态文案（不是一张空表）', /还没有已经投出去的文件/.test(view.cardText), view.cardText.replace(/\s+/g, ' ').slice(0, 100));
+  ok('★ 没有可删项时不渲染「一键删除」按钮（没东西可删就别摆按钮）', view.bulkText === '' && !view.bulkBound, `text=${view.bulkText} bound=${String(view.bulkBound)}`);
+  ok('也没有单删按钮 / bv 链接 / 「审核中」标签', view.withDel === 0 && view.withLink === 0 && view.withoutLink === 0, `del=${view.withDel} bv=${view.withLink} 审核中=${view.withoutLink} 行=${view.rows}`);
+  ok('全程页面没有未捕获异常', cdp.errors.length === 0, cdp.errors.slice(0, 2).join(' | '));
+  console.log('\n' + '─'.repeat(70));
+  console.log(`\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);
+  if (fail > 0) {
+    console.log('\n失败项：');
+    for (const f of failures) console.log(`  \x1b[31m· ${f}\x1b[0m`);
+    process.exitCode = 1;
+  } else {
+    console.log('\x1b[33m清单为空（已投出去的文件都删掉了）：本轮只验了空态，行级与"点按钮"那两段没有对象可验 —— 下次有新的已投稿文件时再跑一次。\x1b[0m');
   }
 }
 

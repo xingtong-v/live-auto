@@ -28,7 +28,7 @@ const HEADED = process.argv.includes('--headed');
 const BASE = 'http://127.0.0.1:3000';
 const PORT = 9333;
 const SHOT_DIR = path.join(ROOT_DIR, 'data', 'ui-shots');
-const UI_BUILD_EXPECTED = 'ui-2026-10-06-bulk-delete-published';
+const UI_BUILD_EXPECTED = 'ui-2026-10-06-bulk-delete-published-2';
 
 let pass = 0;
 let fail = 0;
@@ -1223,6 +1223,13 @@ async function main(): Promise<void> {
 
       /* ---- 12b. 监控面板里的待删表：真的点「立即删除」把同盘那条删掉（选择器都限定在 #otherPage 内） ---- */
       await cdp.evalJs(`$$('#tabs .tab').find((t) => t.dataset.view === 'monitor').click()`);
+      /* 夹具是**绕过接口直接写文件**的，服务端与页面都不知道数据变了 —— 只能等下一次轮询。
+         这一步曾经偶发红（监控面板的待删表整张空着，12 秒都没等到）：客户端 3~5 秒一轮、
+         服务端还有 1.2 秒缓存，两段叠起来就顶到了等待上限。所以这里**主动催一次重画**：
+         先睡过服务端缓存，再直接调页面的 `loadMonitor(true)`（它就是轮询调的那个函数），
+         不再靠"恰好轮到"的时序。 */
+      await sleep(1500);
+      await cdp.evalJs(`loadMonitor(true).then(() => true)`);
       await waitFor(`!!document.querySelector('#otherPage [data-pending-del="${sameVolId}"]')`, 12000);
       const monRow = await cdp.evalJs<{ hasDel: boolean; tag: string; hasAll: boolean }>(`(() => {
         const b = document.querySelector('#otherPage [data-pending-del="${sameVolId}"]');

@@ -447,7 +447,7 @@
 const BOOT = window.__BOOT__ || { csrf: '', version: '?', roomId: '', platform: '' };
 
 /** UI 构建标记：在浏览器控制台里能看到，用来确认页面是不是最新的（避免缓存导致以为功能没做） */
-const UI_BUILD = 'ui-2026-10-06-bulk-delete-published';
+const UI_BUILD = 'ui-2026-10-06-bulk-delete-published-2';
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1941,7 +1941,7 @@ async function renderHealth(box) {
     toast('正在拉取稿件表现数据…');
     try {
       const r = await api('/api/performance/refresh', { method: 'POST' });
-      toast(`已更新 ${r.updated}/${r.checked} 个切片${r.failed.length ? `，失败 ${r.failed.length} 个` : ''}`);
+      toast(`已更新 ${r.updated}/${r.checked} 个稿件${r.failed.length ? `，失败 ${r.failed.length} 个` : ''}`);
       renderOther('perf');
     } catch (e) { toast(e.message); }
   };
@@ -2343,7 +2343,11 @@ function renderMonitor(box) {
       const r = await api('/api/published-file/delete', { method: 'POST', body: { key: b.dataset.key, confirm: true } });
       toast(r.note || '已删除', 7000);
       await loadMonitor(true); // 立刻重画：让那一行消失
-    } catch (e) { toast('删除失败：' + e.message, 6000); b.disabled = false; }
+    } catch (e) { toast('删除失败：' + e.message, 6000); }
+    /* 自己复位，不指望重画：数据没变时 `loadMonitor(true)` 会走"签名相同就不重画"的快路径
+       （真浏览器验证的截图里抓到过按钮卡在「正在删除…」）。真删掉了的话这个节点已被重画替换，
+       写它无害。 */
+    finally { b.disabled = false; }
   });
   /* 一键删除**所有可删的**已投稿文件。
      确认框必须把三件事说清楚（缺一条用户就会误判后果）：
@@ -2371,10 +2375,16 @@ function renderMonitor(box) {
       const extra = [];
       if (r.failed && r.failed.length) extra.push(`失败 ${r.failed.length} 个`);
       if (r.skipped && r.skipped.length) extra.push(`跳过 ${r.skipped.length} 个（审核中/文件已不在）`);
-      toast(`${r.note}${extra.length ? `；${extra.join('，')}` : ''}`, 9000);
+      /* `r.note` 兜底：没有它就会弹出一个写着 "undefined" 的黑框（真浏览器验证的截图里抓到过）。
+         服务端一直返回 note，但界面不该因为一个字段缺失就显示 "undefined"。 */
+      toast(`${r.note || `已删除 ${r.deleted ?? 0} 个文件`}${extra.length ? `；${extra.join('，')}` : ''}`, 9000);
       await loadMonitor(true);
     } catch (e) {
       toast('一键删除失败：' + e.message, 6000);
+    }
+    /* 同单删：数据没变时 `loadMonitor(true)` 不重画，按钮会一直卡在「正在删除…」——
+       截图里就是那样。所以无论成败都自己复位。 */
+    finally {
       b.disabled = false;
       b.textContent = `一键删除可删的 ${n} 项`;
     }
@@ -2418,21 +2428,40 @@ async function renderCost(box) {
       </tbody></table>` : '<div class="empty">本月暂无数据</div>'}</div>`;
 }
 
+let perfAutoTried = false;
 async function renderPerf(box) {
   const p = await api('/api/performance');
+  /* 首次打开这一页、且「有稿件但一条统计都没有」时，自动跑一次回流再重画。
+     为什么要自动：这一页的全部内容都来自回流（performance.jsonl），用户打开它就是想看数据，
+     让他先去别处点「刷新稿件表现数据」等于这一页默认是坏的（实测就是这个观感）。
+     回流本身按天去重（bvidsNeedingPerformance 跳过当天已拉过的 bvid），所以自动跑一次不会反复打接口；
+     只自动尝试一次，失败/无更新就不再自动重试（避免和手动按钮打架、也避免死循环）。 */
+  const stale = !p.rows.length && Number(p.archiveTotal || 0) > 0 && !perfAutoTried;
+  if (stale) {
+    perfAutoTried = true;
+    box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">稿件表现统计（近 30 天）</h2>
+      <div class="card"><div class="empty">正在拉取 ${p.archiveTotal} 个稿件的表现数据…（首次打开这一页会自动回流一次）</div></div>`;
+    try {
+      const r = await api('/api/performance/refresh', { method: 'POST' });
+      toast(`稿件表现数据已回流：更新 ${r.updated}/${r.checked} 个稿件${r.failed?.length ? `，失败 ${r.failed.length} 个` : ''}`);
+    } catch (e) { toast('回流失败：' + e.message); }
+    return renderPerf(box);
+  }
   box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">稿件表现统计（近 30 天）</h2>
     <div class="card"><h2>LLM 评分 vs 实际播放（相关性，非因果）</h2>
-      <table class="tbl"><thead><tr><th>评分档</th><th>切片数</th><th>平均播放</th></tr></thead><tbody>
+      <table class="tbl"><thead><tr><th>评分档</th><th>稿件数</th><th>平均播放</th></tr></thead><tbody>
       ${p.correlation.map((c) => `<tr><td>${esc(c.bucket)}</td><td class="num">${c.count}</td><td class="num">${c.avgView}</td></tr>`).join('')}
       </tbody></table>
       <p class="hintline">${esc(p.note)}</p></div>
-    <div class="card"><h2>已发布切片表现（按播放降序）</h2>
+    <div class="card"><h2>已发布稿件表现（按播放降序）<span class="ai-tag">${p.archiveTotal ?? 0} 个稿件 · ${p.partTotal ?? 0} 个分P</span></h2>
       ${p.rows.length ? `<table class="tbl"><thead><tr><th>标题</th><th>评分</th><th>播放</th><th>点赞</th><th>投币</th><th>收藏</th><th>弹幕</th><th>数据日期</th></tr></thead><tbody>
-      ${p.rows.map((r) => `<tr><td><a href="${esc(r.url)}" target="_blank" rel="noreferrer">${esc(r.title)}</a>${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}</td>
+      ${p.rows.map((r) => `<tr><td><a href="${esc(r.url)}" target="_blank" rel="noreferrer">${esc(r.title)}</a>${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${Number(r.partCount) > 1 ? ` <span class="ai-tag">同一稿件 ${r.partCount} 个分P</span>` : ''}</td>
         <td class="num">${Number(r.llmScore).toFixed(1)}</td><td class="num">${r.view ?? '—'}</td><td class="num">${r.like ?? '—'}</td>
         <td class="num">${r.coin ?? '—'}</td><td class="num">${r.favorite ?? '—'}</td><td class="num">${r.danmaku ?? '—'}</td>
         <td class="mono-sm">${esc(r.statDate || '未拉取')}</td></tr>`).join('')}
-      </tbody></table>` : '<div class="empty">还没有可统计的已发布切片（需要先反查到 bvid，再跑一次表现数据回流）</div>'}</div>`;
+      </tbody></table>` : `<div class="empty">还没有可统计的稿件。${Number(p.archiveTotal || 0) > 0
+        ? '有稿件但没拉到数据：展开「健康面板 → 刷新稿件表现数据」重试，失败项会在说明里给出原因。'
+        : '切片要先投出去并拿到 bvid（多分P 续传成功后自动写入），然后才会出现在这里。'}</div>`}</div>`;
 }
 
 async function renderPrompts(box) {

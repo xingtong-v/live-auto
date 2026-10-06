@@ -111,6 +111,11 @@ const html = fs.readFileSync(htmlPath, 'utf8');
   ok('取到一键删除的确认文案', confirmBlock.length > 100, `${confirmBlock.length} 字节`);
   ok('★ 确认文案里没有 HTML 标签 / markdown 星号（confirm 不认，会原样显示）', !/<[a-z/]/.test(confirmBlock) && !/\*\*/.test(confirmBlock), confirmBlock.replace(/\n/g, ' ').slice(0, 160));
   ok('结果 toast 里如实报出失败/跳过数量（不假装全成功）', /跳过 \$\{r\.skipped\.length\} 个/.test(html) && /失败 \$\{r\.failed\.length\} 个/.test(html));
+  /* toast 拿到 undefined 会弹出一个写着 "undefined" 的黑框（真浏览器截图抓到过） */
+  ok('★ toast 文案有兜底（`r.note` 缺失时不会显示 "undefined"）', /r\.note \|\| `已删除 \$\{r\.deleted \?\? 0\} 个文件`/.test(html), (/toast\(`\$\{r\.note[^\n]*/.exec(html) ?? [''])[0]);
+  /* 数据没变时 `loadMonitor(true)` 不重画 → 按钮会一直卡在「正在删除…」，必须自己复位 */
+  ok('★ 无论成败都自己复位按钮（不指望重画）', /finally \{\s*b\.disabled = false;\s*b\.textContent = `一键删除可删的 \$\{n\} 项`;\s*\}/.test(html));
+  ok('单删也一样自己复位（同一类卡死）', /finally \{ b\.disabled = false; \}/.test(html));
   ok('删除后立刻重画清单（否则行还挂在那儿，看着像没删）', /loadMonitor\(true\)/.test(html));
   ok('按下期间按钮置灰并改文案（防连点重复提交）', /b\.disabled = true/.test(html) && /正在删除…/.test(html));
 
