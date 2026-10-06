@@ -783,7 +783,22 @@ async function main(): Promise<void> {
       ok('投稿配置的标签为数组', Array.isArray(uploadCfg['tag']), JSON.stringify(uploadCfg['tag']));
       ok('投稿配置的 tid 来自白名单', [17, 65, 21].includes(Number(uploadCfg['tid'])), String(uploadCfg['tid']));
       ok('投稿配置带 dtime 且距提交 > 7200 秒（硬约束 #4）', typeof uploadCfg['dtime'] === 'number' && Number(uploadCfg['dtime']) - Math.floor(Date.now() / 1000) > 7100, `dtime-now=${Number(uploadCfg['dtime']) - Math.floor(Date.now() / 1000)}`);
-      eq('试跑期保持仅自己可见（硬约束 #10）', Number(uploadCfg['is_only_self']), 1);
+      /* 可见性：这里要验的是**配置值真的传到了投稿载荷里**，而不是某个固定值。
+         ★ 2026-10-06 用户明确选择公开可见（真实 `config.json` 的 `publish.isOnlySelf = 0`），
+        所以"必须等于 1"不再是判定标准（那是试跑期的临时约定）。
+         注意比的是**本用例自己的夹具配置**（`tmpRoot/config.json`，见上面的 `cfg`），
+         不是仓库里那份真实 config.json —— 第一版写成 `loadConfig().config.publish...`
+         就踩了这个坑：夹具是 1、真配置是 0，于是报"期望 0，实际 1"的假失败。 */
+      ok(
+        '夹具显式声明了可见性（0/1，避免漏写导致投成公开）',
+        cfg.publish.isOnlySelf === 0 || cfg.publish.isOnlySelf === 1,
+        String(cfg.publish.isOnlySelf),
+      );
+      eq(
+        '投稿载荷的可见性与配置一致（isOnlySelf 真的传下去了）',
+        Number(uploadCfg['is_only_self']),
+        Number(cfg.publish.isOnlySelf),
+      );
       ok('未把幂等指纹写进公开字段（陷阱 #18）', !String(uploadCfg['desc'] ?? '').includes('fp') && !String(uploadCfg['dynamic'] ?? '').includes('fp'), String(uploadCfg['desc'] ?? '').slice(0, 120));
 
       // 切片产出真实存在

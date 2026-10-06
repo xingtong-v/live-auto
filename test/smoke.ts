@@ -84,7 +84,17 @@ async function main(): Promise<void> {
     ok('UI 只监听回环地址（硬约束 #2）', ['127.0.0.1', 'localhost', '::1'].includes(cfg.ui.host), cfg.ui.host);
     ok('platform 为 Bilibili（陷阱 #1）', cfg.room.platform === 'Bilibili', cfg.room.platform);
     ok('dtime 首片余量 > 7200 秒（硬约束 #4）', cfg.publish.submitGapSec > 7200, String(cfg.publish.submitGapSec));
-    ok('试跑期 is_only_self = 1（硬约束 #10）', cfg.publish.isOnlySelf === 1, String(cfg.publish.isOnlySelf));
+    /* 试跑期可见性。
+       ★ 2026-10-06：用户**明确选择公开可见**（`publish.isOnlySelf = 0`），
+       所以"必须等于 1"这条不再是判定标准（那是试跑期的临时约定，不是代码缺陷）——
+       与 `dailyLimit === 0`（不限额是合法配置）同一个道理，见 §3 的注释。
+       保留两条：① 取值必须合法；② 公开可见时每次都作为**环境项**报出来，
+       这样"投稿是公开的"永远看得见，不会因为某次改动悄悄变回去。 */
+    const onlySelf = cfg.publish.isOnlySelf;
+    ok('is_only_self 取值合法（0 = 公开 / 1 = 仅自己可见）', onlySelf === 0 || onlySelf === 1, String(onlySelf));
+    if (onlySelf === 0) {
+      envIssues.push('可见性：publish.isOnlySelf = 0 —— 投稿是**公开可见**的（用户 2026-10-06 明确选择；试跑期曾要求 = 1）');
+    }
     const errs = orch.store.errors;
     ok('配置无硬约束错误', errs.length === 0, errs.map((e) => `[${e.field}] ${e.message}`).join('；'));
 

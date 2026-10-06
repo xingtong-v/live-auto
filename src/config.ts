@@ -1108,8 +1108,14 @@ export function validateConfig(cfg: AppConfig): ConfigIssue[] {
   } else if (cfg.publish.dailyLimit > 10) {
     warn('publish.dailyLimit', `每日投稿上限 ${cfg.publish.dailyLimit} 偏高，风控角度建议 2–5`);
   }
-  if (cfg.publish.isOnlySelf !== 1) {
-    warn('publish.isOnlySelf', '试跑期应保持 isOnlySelf=1（仅自己可见，硬约束 #10）');
+  /* ★ 2026-10-06：用户**明确选择公开可见**（`publish.isOnlySelf = 0`），
+     所以这里不再把"必须是 1"当告警 —— 那是试跑期的临时约定，不是配置错误。
+     现在只拦真正的错值（不是 0/1，例如被写成字符串或 true）：
+     可见性是个**用户决定**，不该每次加载都跳一条"你应该改回去"的提示；
+     但也不能让它悄悄漂移，所以冒烟测试每次会把当前可见性作为"环境项"报一次
+     （`test/smoke.ts` 硬约束 #10 已按此改写）。 */
+  if (cfg.publish.isOnlySelf !== 0 && cfg.publish.isOnlySelf !== 1) {
+    warn('publish.isOnlySelf', `取值必须是 0（公开）或 1（仅自己可见），当前是 ${JSON.stringify(cfg.publish.isOnlySelf)}`);
   }
   if (cfg.asr.provider === 'bililive-tools' && cfg.asr.segmentMinutes > 40) {
     warn('asr.segmentMinutes', `单段 ${cfg.asr.segmentMinutes} 分钟偏长，/ai/subtitle 是同步阻塞接口，建议 30 分钟`);

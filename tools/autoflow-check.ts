@@ -157,7 +157,14 @@ section('5. 上传：投稿参数与风控');
 ok(Boolean(cfg.asr.provider), 'ASR provider', cfg.asr.provider);
 ok(cfg.asr.provider !== 'bililive-tools' || Boolean(cfg.asr.modelId) || true, '云端 ASR 用 biliLive-tools 侧模型', `项目 modelId="${cfg.asr.modelId}"（空=用上游配置）`, 'warn');
 ok(Boolean(cfg.publish.autoPublish), '自动发布已开启', cfg.publish.autoPublish ? '分析完直接排期投稿（无人值守必需）' : '半自动，需人工点发布');
-ok(cfg.publish.isOnlySelf === 1, '试跑期仅自己可见（硬约束 #10）', `isOnlySelf=${cfg.publish.isOnlySelf}`, 'warn');
+/* 可见性：用户 2026-10-06 明确选择公开可见，所以这里只如实报出当前选择，
+   不再拿"试跑期必须 =1"去提醒（那会让这份自检每次都说一句已经决定过的事）。 */
+ok(
+  cfg.publish.isOnlySelf === 0 || cfg.publish.isOnlySelf === 1,
+  '可见性取值合法',
+  cfg.publish.isOnlySelf === 1 ? 'isOnlySelf=1（仅自己可见）' : 'isOnlySelf=0（公开可见，用户选择）',
+  'warn',
+);
 ok(cfg.publish.dailyLimit > 0, '每日额度已设置', `${cfg.publish.dailyLimit} 个/天`);
 if (cfg.publish.dailyLimit > 10) {
   console.log(`  \x1b[33m  → 额度 ${cfg.publish.dailyLimit} 偏高，风控角度建议 2-5（自有配置，知悉即可）\x1b[0m`);
