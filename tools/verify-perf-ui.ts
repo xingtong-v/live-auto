@@ -33,8 +33,8 @@ function ok(name: string, cond: boolean, detail?: string): void {
     console.log(`  \x1b[31m✗\x1b[0m ${name}${detail ? ` :: ${detail}` : ''}`);
   }
 }
-function eq<T>(name: string, actual: T, expected: T): void {
-  ok(name, JSON.stringify(actual) === JSON.stringify(expected), `期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`);
+function eq<T>(name: string, actual: T, expected: T, detail?: string): void {
+  ok(name, JSON.stringify(actual) === JSON.stringify(expected), detail ?? `期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`);
 }
 
 /* ---- 极简 CDP（与 verify-monitor-ui.ts 同一套写法） ---- */

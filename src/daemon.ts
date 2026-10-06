@@ -2589,14 +2589,17 @@ export class Orchestrator {
     const failed: Array<{ bvid: string; error: string }> = [];
     let updated = 0;
 
-    /* 稿件列表：一次请求，既用于「我的稿件」枚举，也用于「详情查不到时确认是否真的没了」 */
     /* 稿件列表：一次请求，三个用途 —— 枚举我的全部稿件、给候选补标题/分P 数、
        详情取不到时**区分「被删」与「已锁定/审核中」**（实测两份 09-26 的稿件是 `state=-4 已锁定`：
        B站 侧公开接口 -404、biliLive-tools 详情 500，但它们并没有被删，不能报成「已不存在」）。 */
+    const PAGE_SIZE = 100;
     let listed: Array<{ bvid: string; title?: string; ctime?: number; state?: number; stateDesc?: string }> = [];
     let listOk = false;
+    /* ★ 列表拿满了（返回条数 == 页大小）说明后面还有页 —— 这时**不能**用"列表里没有"推断"稿件没了"：
+       稿件数超过 100 时，第 101 个往后的稿件每次都会被误判成"已删"并写进台账。 */
+    let listComplete = false;
     try {
-      const archives = await this.client.biliArchives({ page: 1, pageSize: 100 });
+      const archives = await this.client.biliArchives({ page: 1, pageSize: PAGE_SIZE });
       listed = archives
         .map((a) => ({
           bvid: String(a.bvid ?? '').trim(),
@@ -2607,6 +2610,7 @@ export class Orchestrator {
         }))
         .filter((a) => a.bvid.length > 0);
       listOk = true;
+      listComplete = archives.length < PAGE_SIZE;
     } catch (e) {
       notes.push(`读取我的稿件列表失败（只影响「完整版稿件」的枚举与稿件状态判定）：${(e as Error).message.slice(0, 80)}`);
     }
@@ -2652,7 +2656,7 @@ export class Orchestrator {
         // 单个稿件查询失败不影响其它（可能是稿件被删、被锁定或接口限流）
         if (isArchiveGoneError(msg)) {
           const meta = listOk ? listedMap.get(item.bvid) : undefined;
-          if (listOk && !meta) {
+          if (listOk && listComplete && !meta) {
             /* 列表里没有 → 确实没了（用户删稿 / 下架）。再拉没有意义。 */
             this.markPerformanceGone(item, today, '已不在稿件列表（被删或下架）');
             notes.push(`稿件 ${item.bvid} 已不在稿件列表（被删或下架），已标记，页面会显示「稿件已不存在」`);
@@ -2672,8 +2676,12 @@ export class Orchestrator {
             });
             notes.push(`稿件 ${item.bvid} 当前状态是「${meta.stateDesc ?? `state=${meta.state}`}」，取不到统计（页面标为不可用，不写 0）`);
           } else {
-            /* 开放浏览却查不到：多半是审核/转码/缓存延迟，保留后续重试，不落行（也不写 0） */
-            this.logger.debug(`稿件 ${item.bvid} 详情暂不可用但仍在稿件列表中（审核/转码中？），保留后续重试`);
+            /* 两种"说不清"的情况都保留后续重试、**不落行也不写 0**：
+               ① 开放浏览却查不到（审核/转码/缓存延迟）；
+               ② 稿件列表没拿全（>100 条）时，"列表里没有"不足以推断"稿件没了"。 */
+            this.logger.debug(
+              `稿件 ${item.bvid} 详情暂不可用（${listComplete ? '列表里仍在，可能审核/转码中' : '稿件列表未取全，不能判定已删'}），保留后续重试`,
+            );
           }
         } else {
           this.logger.debug(`拉取 ${item.bvid} 表现数据失败：${msg}`);
