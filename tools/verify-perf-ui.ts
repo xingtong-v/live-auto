@@ -38,6 +38,24 @@ function eq<T>(name: string, actual: T, expected: T, detail?: string): void {
   ok(name, JSON.stringify(actual) === JSON.stringify(expected), detail ?? `期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`);
 }
 
+/**
+ * 等页面把某个条件变成真（默认最多 8 秒）。
+ *
+ * 为什么必须有它（2026-10-08 实测的假红）：这个页面是**异步渲染**的 —— 切页签后要等
+ * `/api/performance` 回来才画卡片，之后还会因为数据刷新整块重画。旧写法在 `html` 快照上
+ * 判断完就直接 `document.getElementById('perfGoneToggle').click()`：只要那一下赶在渲染之前
+ * （或夹在两次重画之间），按钮要么还不存在、要么刚点完就被重画覆盖，
+ * 于是后面四条断言一起红 —— 而重跑一次又全绿。所有交互前都要先等元素真的在。
+ */
+async function waitFor(cond: () => Promise<boolean>, timeoutMs = 8000, stepMs = 250): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await cond().catch(() => false)) return true;
+    if (Date.now() > deadline) return false;
+    await sleep(stepMs);
+  }
+}
+
 /* ---- 极简 CDP（与 verify-monitor-ui.ts 同一套写法） ---- */
 class Cdp {
   private ws: WebSocket;
@@ -240,10 +258,17 @@ async function main(): Promise<void> {
         html.includes(`已隐藏 ${goneRows.length} 个`),
         html.slice(-320),
       );
-      const clicked = await cdp.evalJs<boolean>(
-        `(() => { const b = document.getElementById('perfGoneToggle'); if (!b) return false; b.click(); return true; })()`,
+      /* ⚠️ 先等按钮真的渲染出来再点（旧写法直接 getElementById('perfGoneToggle').click()，
+         一旦赶在渲染之前就是"点了没反应"，后面四条断言连坐）。 */
+      const toggleReady = await waitFor(async () =>
+        cdp!.evalJs<boolean>(`!!document.getElementById('perfGoneToggle')`).catch(() => false),
       );
-      ok('有「显示它们」按钮且点得动', clicked);
+      const clicked =
+        toggleReady &&
+        (await cdp.evalJs<boolean>(
+          `(() => { const b = document.getElementById('perfGoneToggle'); if (!b) return false; b.click(); return true; })()`,
+        ));
+      ok('有「显示它们」按钮且点得动', clicked, toggleReady ? '按钮在，但点击返回 false' : '等了 8 秒也没等到按钮渲染出来');
       let shownText = '';
       for (let i = 0; i < 30; i++) {
         shownText = await cdp.evalJs<string>(
@@ -255,6 +280,7 @@ async function main(): Promise<void> {
       ok('★ 展开后能看到它，并标出「稿件已不存在」', shownText.includes('稿件已不存在'), shownText.slice(0, 120));
       ok('展开后「数据日期」写的是「已删除」而不是数字', shownText.includes('已删除'), shownText.slice(0, 160));
       /* 再点一次要能收回去：展开是一次性的开关，不能只出不进（也顺便把页面恢复成默认样子） */
+      await waitFor(async () => cdp!.evalJs<boolean>(`!!document.getElementById('perfGoneToggle')`).catch(() => false));
       await cdp.evalJs<boolean>(`(() => { const b = document.getElementById('perfGoneToggle'); if (!b) return false; b.click(); return true; })()`);
       let backHidden = false;
       for (let i = 0; i < 30; i++) {
@@ -270,10 +296,18 @@ async function main(): Promise<void> {
     /* 多分P 标注：分P 数 > 1 的行要标出规模 */
     const multi = rows.find((r) => Number(r['partCount'] ?? 1) > 1);
     if (multi) {
-      const t = await cdp.evalJs<string>(
-        `(() => { const a = document.querySelector('#otherPage a[href="https://www.bilibili.com/video/${String(multi['bvid'])}"]'); return a ? a.closest('tr').textContent : ''; })()`,
-      );
-      ok(`多分P 稿件标出「同一稿件 ${Number(multi['partCount'])} 个分P」`, t.includes(`同一稿件 ${Number(multi['partCount'])} 个分P`), t.slice(0, 140));
+      /* 上一次刚点过"收回隐藏行"，页面会整块重画 —— 等到这一行回来再断言（否则读到空字符串） */
+      const want = `同一稿件 ${Number(multi['partCount'])} 个分P`;
+      let t = '';
+      await waitFor(async () => {
+        t = await cdp!
+          .evalJs<string>(
+            `(() => { const a = document.querySelector('#otherPage a[href="https://www.bilibili.com/video/${String(multi['bvid'])}"]'); return a ? a.closest('tr').textContent : ''; })()`,
+          )
+          .catch(() => '');
+        return t.includes(want);
+      });
+      ok(`多分P 稿件标出「${want}」`, t.includes(want), t.slice(0, 140));
     }
 
     /* ★ 排序可选（用户 2026-10-08：「这里的排序 可以改成可选的吗 比如稿件时间 播放 点赞 等」）：
@@ -287,22 +321,57 @@ async function main(): Promise<void> {
         .catch(() => '');
       return href ? href.split('/').pop()! : '';
     };
-    const hasSort = await cdp.evalJs<boolean>(`!!document.getElementById('perfSortKey') && !!document.getElementById('perfSortDir')`);
+    /* 排序控件同样要等它渲染出来（页面重画期间它可能短暂不在 DOM 里） */
+    const hasSort = await waitFor(async () =>
+      cdp!.evalJs<boolean>(`!!document.getElementById('perfSortKey') && !!document.getElementById('perfSortDir')`).catch(() => false),
+    );
     ok('★ 表现列表有排序选择器与方向按钮', hasSort);
-    if (withLike.length >= 2) {
+    /* 切排序前再确认一次控件可用（重画会把 <select> 换掉，绑在旧节点上的操作会静默失效） */
+    if (hasSort) await waitFor(async () => cdp!.evalJs<boolean>(`!!document.getElementById('perfSortKey')`).catch(() => false));
+    /* 换排序后页面要重排：**别拿固定 sleep 去赌**（1.2 秒是猜的），等到期望的那一行出现再断言 */
+    const waitFirstBvid = async (want: string): Promise<string> => {
+      let seen = '';
+      await waitFor(async () => {
+        seen = await firstBvid();
+        return seen === want;
+      });
+      return seen;
+    };
+    const waitDir = async (wantAsc: boolean): Promise<string> => {
+      let text = '';
+      await waitFor(async () => {
+        text = await cdp!
+          .evalJs<string>(`String((document.getElementById('perfSortDir') || {}).textContent || '')`)
+          .catch(() => '');
+        return wantAsc ? /升序/.test(text) : /降序/.test(text);
+      });
+      return text;
+    };
+    if (withLike.length >= 2 && hasSort) {
       const topLike = [...withLike].sort((a, b) => Number(b['like']) - Number(a['like']))[0]!;
       const bottomLike = [...withLike].sort((a, b) => Number(a['like']) - Number(b['like']))[0]!;
       await cdp.evalJs(
         `(() => { const s = document.getElementById('perfSortKey'); s.value = 'like'; s.dispatchEvent(new Event('change')); return true; })()`,
       );
-      await sleep(1200);
-      eq(`★ 切到「点赞」后第一行是点赞最多的（${String(topLike['bvid'])} ${String(topLike['like'])} 赞）`, await firstBvid(), String(topLike['bvid']));
-      const dirText = await cdp.evalJs<string>(`String(document.getElementById('perfSortDir').textContent)`);
+      eq(
+        `★ 切到「点赞」后第一行是点赞最多的（${String(topLike['bvid'])} ${String(topLike['like'])} 赞）`,
+        await waitFirstBvid(String(topLike['bvid'])),
+        String(topLike['bvid']),
+      );
+      const dirText = await waitDir(false);
       ok('方向按钮显示「↓ 降序」', /降序/.test(dirText), dirText);
       await cdp.evalJs(`document.getElementById('perfSortDir').click()`);
-      await sleep(1200);
-      eq(`★ 切成升序后第一行变成点赞最少的（${String(bottomLike['bvid'])} ${String(bottomLike['like'])} 赞）`, await firstBvid(), String(bottomLike['bvid']));
-      ok('抬头文案跟着排序走', /按点赞升序/.test(await cdp.evalJs<string>('String(document.getElementById("otherPage").innerHTML)')), '');
+      eq(
+        `★ 切成升序后第一行变成点赞最少的（${String(bottomLike['bvid'])} ${String(bottomLike['like'])} 赞）`,
+        await waitFirstBvid(String(bottomLike['bvid'])),
+        String(bottomLike['bvid']),
+      );
+      let headText = '';
+      await waitFor(async () => {
+        headText = await cdp!.evalJs<string>('String(document.getElementById("otherPage").innerHTML)').catch(() => '');
+        return /按点赞升序/.test(headText);
+      });
+      ok('抬头文案跟着排序走', /按点赞升序/.test(headText), headText.slice(-160));
 
       /* ★ 2026-10-08 用户报「发布时间时 没有正确排序」：那是接口那一列**恒为空**（只有 1 行有值），
          不是排序逻辑的问题。修完接口后再锁一条端到端的：切「发布时间」行序要真的跟着变。 */
@@ -320,19 +389,19 @@ async function main(): Promise<void> {
           await cdp!.evalJs(
             `(() => { const b = document.getElementById('perfSortDir'); if (!b) return false; const isAsc = /升序/.test(String(b.textContent)); if (isAsc !== ${wantAsc}) b.click(); return true; })()`,
           );
-          await sleep(1200);
+          await waitDir(wantAsc);
         };
         await dirTo(false);
         eq(
           `★ 切「发布时间」降序后第一行是最新的（${String(newest['bvid'])} ${String(newest['publishedAt'])}）`,
-          await firstBvid(),
+          await waitFirstBvid(String(newest['bvid'])),
           String(newest['bvid']),
         );
         /* 升序：该是最早的那条（没有发布时间的行会沉底，正好不会干扰第一行） */
         await dirTo(true);
         eq(
           `★ 升序后第一行是最早的（${String(oldest['bvid'])} ${String(oldest['publishedAt'])}）`,
-          await firstBvid(),
+          await waitFirstBvid(String(oldest['bvid'])),
           String(oldest['bvid']),
         );
         const pubCol = await cdp.evalJs<string>(
@@ -347,8 +416,12 @@ async function main(): Promise<void> {
       await cdp.evalJs(
         `(() => { const s = document.getElementById('perfSortKey'); s.value = 'view'; s.dispatchEvent(new Event('change')); const b = document.getElementById('perfSortDir'); if (b && /升序/.test(String(b.textContent))) b.click(); return true; })()`,
       );
-      await sleep(1200);
-      ok('收尾切回播放降序', /按播放降序/.test(await cdp.evalJs<string>('String(document.getElementById("otherPage").innerHTML)')), '');
+      let resetHtml = '';
+      await waitFor(async () => {
+        resetHtml = await cdp!.evalJs<string>('String(document.getElementById("otherPage").innerHTML)').catch(() => '');
+        return /按播放降序/.test(resetHtml);
+      });
+      ok('收尾切回播放降序', /按播放降序/.test(resetHtml), resetHtml.slice(-160));
     } else {
       console.log('  \x1b[90m（有播放数据的稿件不足 2 个，跳过排序这一组）\x1b[0m');
     }
