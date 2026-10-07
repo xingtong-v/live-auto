@@ -2740,8 +2740,22 @@ export class Publisher {
   }
 
   /**
-   * 为已提交（SUBMITTED）的切片反查 bvid。
-   * 这是 SUBMITTED → PUBLISHED 的唯一合法依据（上传接口只返回 taskId）。
+   * 为已提交（SUBMITTED）的切片反查 bvid / 确认落地。
+   *
+   * 两条路，缺一不可：
+   *  · **没有 bvid**（新建稿件那条路）：按稿件标题在 `/bili/archives` 里反查 —— 这是 bvid 的唯一来源
+   *    （上传接口只返回 taskId，陷阱 #11、硬约束 #17）；
+   *  · **已有 bvid**（多分P 续传那条路）：这个切片是**别人稿件的分P**，它的标题永远不会作为
+   *    稿件标题出现在 `/bili/archives` 里 —— 按标题反查一辈子也查不到。要确认它落地，
+   *    只能读那个稿件的**分P 标题列表**（`View.pages`）。
+   *
+   * ★★ 第二条是 2026-10-07 用户报「这个怎么一直是 已提交待确认」时补上的（实测 13 个切片就这么卡着）：
+   *    续传的落地确认窗口只有 5 分钟，而 B站 分P 列表的可见延迟实测可达 20 分钟 ⇒
+   *    窗口内没确认到就记成 SUBMITTED（这是诚实的设计，不能改成谎报成功），
+   *    但**之后没人再确认** —— 于是永远停在「已提交待确认」，连带三个后果：
+   *      ① 界面永远显示待确认，用户不知道到底投出去没有；
+   *      ② `allDone` 永远不成立 ⇒ 场级状态到不了 PUBLISHED ⇒ **「用完即删」不触发，源录播一直占盘**；
+   *      ③ 表现回流只认 PUBLISHED ⇒ 这些切片的播放数据永远不回流。
    */
   async confirmPublished(taskId: string, opts: { uid?: number | string } = {}): Promise<{
     confirmed: Array<{ clipIndex: number; bvid: string; title: string }>;
@@ -2751,12 +2765,71 @@ export class Publisher {
     if (!task) return { confirmed: [], pending: [] };
     const clips = this.ledger.getClips(taskId).filter((c) => c.status === 'SUBMITTED');
     if (clips.length === 0) return { confirmed: [], pending: [] };
-
-    const archives = await this.client.biliArchives({ page: 1, pageSize: 100 });
+    const log = this.logger;
     const confirmed: Array<{ clipIndex: number; bvid: string; title: string }> = [];
     const pending: number[] = [];
+    const norm = (s: string): string => s.replace(/\s+/g, '').trim();
 
-    for (const clip of clips) {
+    /* ---- 路径一：已经有 bvid（多分P 续传）→ 按**分P 标题**确认落地 ---- */
+    const withBvid = clips.filter((c) => Boolean(c.bvid));
+    const byBvid = new Map<string, typeof clips>();
+    for (const c of withBvid) {
+      const key = String(c.bvid);
+      byBvid.set(key, [...(byBvid.get(key) ?? []), c]);
+    }
+    for (const [bvid, list] of byBvid) {
+      let titles: string[] | undefined;
+      try {
+        /* `fresh: true`：必须看到**最新**的分P 列表，命中缓存等于看追加前的快照（那正是要判的东西） */
+        const detail = await this.fetchArchiveDetailCached(bvid, log, { fresh: true });
+        titles = archivePartTitles(detail);
+      } catch (e) {
+        log.debug(`续传落地反查：读稿件 ${bvid} 分P 列表失败（下轮再试）：${(e as Error).message.slice(0, 100)}`, { taskId });
+      }
+      if (!titles) {
+        pending.push(...list.map((c) => c.index));
+        continue;
+      }
+      const have = new Set(titles.map(norm));
+      for (const clip of list) {
+        if (!have.has(norm(clip.title))) {
+          pending.push(clip.index);
+          continue;
+        }
+        this.ledger.setClipStatus(taskId, clip.index, 'PUBLISHED', { bvid, publishedAt: nowIso() });
+        this.ledger.registerFingerprint(
+          clip.fingerprint ??
+            clipFingerprint({ sourceVideoId: task.recordingId ?? task.id, start: clip.start, end: clip.end, title: clip.title }),
+          { taskId, clipIndex: clip.index, bvid },
+        );
+        this.ledger.logPublish({
+          taskId,
+          clipIndex: clip.index,
+          action: 'confirm',
+          bvid,
+          title: clip.title,
+          ...(clip.uploadTaskId ? { uploadTaskId: clip.uploadTaskId } : {}),
+          ...(clip.dtime !== undefined ? { dtime: clip.dtime } : {}),
+        });
+        confirmed.push({ clipIndex: clip.index, bvid, title: clip.title });
+      }
+      if (list.length > 0) {
+        log.info(
+          `续传落地反查：稿件 ${bvid} 现有 ${titles.length} 个分P，其中 ${list.filter((c) => have.has(norm(c.title))).length}/${list.length} ` +
+            `个待确认切片已确认落地`,
+          { taskId },
+        );
+      }
+    }
+
+    /* ---- 路径二：没有 bvid（新建稿件）→ 按稿件标题反查 ---- */
+    const noBvid = clips.filter((c) => !c.bvid);
+    if (noBvid.length === 0) {
+      if (confirmed.length) log.info(`反查确认 ${confirmed.length} 个切片（多分P 续传，按分P 标题确认）`, { taskId });
+      return { confirmed, pending };
+    }
+    const archives = await this.client.biliArchives({ page: 1, pageSize: 100 });
+    for (const clip of noBvid) {
       const m = matchArchive(archives, clip.title, {
         ...(clip.submitTime ? { sinceMs: clip.submitTime - 3600_000 } : {}),
       }).filter((x) => x.exact)[0];

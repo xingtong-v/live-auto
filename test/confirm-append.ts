@@ -36,6 +36,9 @@ function ok(name: string, cond: boolean, detail?: string): void {
     console.log(`  \x1b[31m✗\x1b[0m ${name}${detail ? ` :: ${detail}` : ''}`);
   }
 }
+function eq<T>(name: string, actual: T, expected: T): void {
+  ok(name, JSON.stringify(actual) === JSON.stringify(expected), `期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`);
+}
 function section(t: string): void {
   console.log(`\n\x1b[1m${t}\x1b[0m`);
 }
@@ -157,6 +160,126 @@ async function main(): Promise<void> {
     const have = new Set((got ?? []).map(norm));
     ok('能识别出「新切片A」已存在（会被去重跳过）', have.has(norm('新切片A')), JSON.stringify([...have]));
     ok('未存在的标题不会被误判为已存在', !have.has(norm('新切片B')), JSON.stringify([...have]));
+  }
+
+  section('7. 「已提交待确认」的迟到确认：按**分P 标题**把它捞回来（2026-10-07 用户报的问题）');
+  {
+    /* 背景：多分P 续传给的是**别人稿件的分P**，它的标题永远不会作为稿件标题出现在
+       `/bili/archives` 里 —— 按标题反查一辈子也查不到。而续传的落地确认窗口只有 5 分钟，
+       B站 分P 列表的可见延迟实测可达 20 分钟 ⇒ 窗口内没确认到就记成 SUBMITTED，
+       **之后再没人确认** → 界面永远显示「已提交待确认」，且场级状态到不了 PUBLISHED
+       ⇒「用完即删」不触发、表现回流拿不到数据（实测 13 个切片就这么卡着）。
+       修法：反查循环对**已经有 bvid** 的 SUBMITTED 切片，改读那个稿件的分P 标题列表确认。 */
+
+    /** 造一个带「已提交待确认」切片的台账，并统计各接口调用次数 */
+    const setup = (
+      pages: Array<{ part: string; duration: number }> | 'no-list' | 'throw',
+      opts: { second?: { title: string; bvid?: string } } = {},
+    ): { pub: Publisher; taskId: string; calls: { archives: number; detail: number } } => {
+      const calls = { archives: 0, detail: 0 };
+      const client = {
+        biliArchives: async () => {
+          calls.archives++;
+          return [{ bvid: 'BV1FAKE00001', aid: 999, title: '别人的稿件', duration: 100 }];
+        },
+        biliArchiveDetail: async () => {
+          calls.detail++;
+          if (pages === 'throw') throw new Error('接口挂了');
+          if (pages === 'no-list') return { View: { bvid: 'BV1FAKE00001', videos: 1 } };
+          return { View: { bvid: 'BV1FAKE00001', videos: pages.length, pages } };
+        },
+      };
+      const ledger = new Ledger({ path: path.join(tmpRoot, `ledger-c-${Math.random().toString(36).slice(2)}.json`) });
+      const taskId = `t-${Math.random().toString(36).slice(2)}`;
+      ledger.createTask({
+        id: taskId,
+        roomId: '1',
+        platform: 'Bilibili',
+        title: '测试场次',
+        status: 'CLIPPED',
+        stage: 'CLIPPED',
+        source: { segments: [], totalDuration: 600, rawFiles: [], fullVideoHasDanmaku: false },
+        fullUpload: 'NOT_APPLICABLE',
+        cost: { asrEstimate: 0, asrAudioSeconds: 0, llmActual: 0, llmPromptTokens: 0, llmCompletionTokens: 0, llmCalls: 0, updatedAt: new Date().toISOString() },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      ledger.setClips(taskId, [
+        {
+          index: 0,
+          start: 0,
+          end: 60,
+          title: '切片甲：已经在稿件里了',
+          desc: '',
+          tags: [],
+          category: '虚拟主播/虚拟主播',
+          score: 8,
+          reason: '测试',
+          selected: true,
+          status: 'SUBMITTED',
+          degraded: false,
+          createdAt: new Date().toISOString(),
+          uploadTaskId: 'up-1',
+          bvid: 'BV1FAKE00001',
+        },
+        {
+          index: 1,
+          start: 60,
+          end: 120,
+          title: opts.second?.title ?? '切片乙：还没落地',
+          desc: '',
+          tags: [],
+          category: '虚拟主播/虚拟主播',
+          score: 8,
+          reason: '测试',
+          selected: true,
+          status: 'SUBMITTED',
+          degraded: false,
+          createdAt: new Date().toISOString(),
+          uploadTaskId: 'up-1',
+          ...(opts.second?.bvid ? { bvid: opts.second.bvid } : {}),
+        },
+      ]);
+      const pub = new Publisher({ client: client as never, config: cfg, ledger, logger: silentLog as never });
+      return { pub, taskId, calls };
+    };
+
+    const bothHaveBvid = { second: { title: '切片乙：还没落地', bvid: 'BV1FAKE00001' } };
+    const a = setup(
+      [
+        { part: '完整版', duration: 10 },
+        { part: '切片甲：已经在稿件里了', duration: 10 },
+      ],
+      bothHaveBvid,
+    );
+    const r1 = await a.pub.confirmPublished(a.taskId);
+    const c0 = a.pub['ledger'].getClip(a.taskId, 0);
+    const c1 = a.pub['ledger'].getClip(a.taskId, 1);
+    ok('★ 分P 列表里能看到的那个切片 → 确认为 PUBLISHED', c0?.status === 'PUBLISHED' && c0?.publishedAt !== undefined, `status=${c0?.status} publishedAt=${c0?.publishedAt ?? '(空)'}`);
+    eq('确认到的 bvid 就是它所在的稿件', c0?.bvid, 'BV1FAKE00001');
+    ok('★ 还没落地的那个仍然是 SUBMITTED（不谎报成功）', c1?.status === 'SUBMITTED', `status=${c1?.status}`);
+    eq('返回值里 confirmed / pending 分得清', [r1.confirmed.length, r1.pending.length], [1, 1]);
+    eq('★ 全程没有去查 /bili/archives（有 bvid 的切片走分P 标题那条路）', a.calls.archives, 0);
+    ok('确实读了稿件详情', a.calls.detail >= 1, String(a.calls.detail));
+
+    const b = setup('no-list', bothHaveBvid);
+    const r2 = await b.pub.confirmPublished(b.taskId);
+    const c2 = b.pub['ledger'].getClip(b.taskId, 0);
+    ok('读不到分P 列表时保持 SUBMITTED（下轮再试，不猜）', c2?.status === 'SUBMITTED' && r2.confirmed.length === 0, `status=${c2?.status}`);
+
+    const c = setup('throw', bothHaveBvid);
+    const r3 = await c.pub.confirmPublished(c.taskId);
+    ok('接口抛错时不崩、且不改状态', r3.confirmed.length === 0 && c.pub['ledger'].getClip(c.taskId, 0)?.status === 'SUBMITTED');
+
+    /* 混合场景：一个已有 bvid（分P）、一个没有 bvid（新建稿件，靠 /bili/archives 反查）。
+       两条路必须都走到 —— 早期实现只认后者，前者永远捞不回来。 */
+    const d = setup(
+      [{ part: '完整版', duration: 10 }, { part: '切片甲：已经在稿件里了', duration: 10 }],
+      { second: { title: '别人的稿件' } },
+    );
+    const r4 = await d.pub.confirmPublished(d.taskId);
+    ok('混合场景：两条路都走到（有 bvid 的按分P 标题、没 bvid 的按稿件标题）', r4.confirmed.length === 2, JSON.stringify(r4.confirmed));
+    ok('混合场景确实查了 /bili/archives', d.calls.archives === 1, String(d.calls.archives));
   }
 
   console.log(`\n\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);
