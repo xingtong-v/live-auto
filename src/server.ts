@@ -21,7 +21,7 @@ import { URL } from 'node:url';
 import type { Orchestrator } from './daemon.ts';
 import { APP_VERSION, retentionNote, summarizeTask } from './daemon.ts';
 import type { ClipRecord, Stage, TaskRecord } from './types.ts';
-import { loadErrorReport, loadErrorReportOrEvent, readErrorEvents, renderErrorTimeline, listErrorReports } from './errors.ts';
+import { loadErrorReport, loadErrorReportOrEvent, readErrorEvents, renderErrorTimeline, listErrorReports, clearErrorEvents } from './errors.ts';
 import { resolveCover, validateDtime, describeDtimePlan, parseUserDtime } from './publish.ts';
 import { sanitizeTitle, sanitizeDesc, sanitizeTags, mapCategoryToTid, transcriptPreview } from './analyze.ts';
 import { PromptStore } from './analyze.ts';
@@ -995,9 +995,32 @@ export class UiServer {
 
       // 硬约束检查：标题/简介/标签合规 + 时间范围合法
       const problems: string[] = [];
-      const indices = body.indices ?? clips.filter((c) => c.selected).map((c) => c.index);
-      // ★ 标题体检：长度只是其中一项。占位标题、术语表错词残留、无意义标记、
-      //   同场重名等都会在这里被拦下（详见 title-check.ts 的说明）。
+      const requested = body.indices ?? clips.filter((c) => c.selected).map((c) => c.index);
+      /* ★ 2026-10-07：「已经投过」的切片**不再进这次投稿**（用户报「勾了想投稿但没有投稿选项」时查出的隐患）。
+         判据用台账状态（本地、无延迟），**不看 B站 分P 列表** —— 后者有约 20 分钟延迟，
+         延迟窗口内重投会把已经投过的分P 再投一遍，在同一稿件里留下重复分P（publish.ts 里记过这次事故）。
+         SUBMITTED（已提交待确认）也算投过：上传接口已经受理，只是还没落地。 */
+      const DONE_STATUSES: string[] = ['PUBLISHED', 'SUBMITTED', 'SUBMITTING', 'SKIPPED'];
+      const indices = requested.filter((i) => {
+        const c = clips[i];
+        return c !== undefined && !DONE_STATUSES.includes(c.status);
+      });
+      const alreadyDone = requested.length - indices.length;
+      if (indices.length === 0) {
+        this.sendJson(res, 400, {
+          error: '没有需要投稿的切片',
+          problems: [
+            alreadyDone > 0
+              ? `你勾选的 ${alreadyDone} 个切片都已经投过了（已提交/已发布），不会重复投。要重投请先在 B站 创作中心删掉对应分P（或解除墓碑后重跑本场）`
+              : '没有勾选任何切片',
+          ],
+        });
+        return;
+      }
+      /* ★ 标题体检：长度只是其中一项。占位标题、术语表错词残留、无意义标记、
+         同场重名等都会在这里被拦下（详见 title-check.ts 的说明）。
+         **只体检这次真的要投的**：已投过的分P 标题在 B站 侧已定稿，拿它拦住新切片毫无意义
+         （实测：一场里 6 个已投 + 1 个新切片，旧写法会把 6 个旧标题一起体检，任一不合规就整批 400）。 */
       const titleReport = checkClipTitles(
         clips.map((c) => ({ index: c.index, title: c.title, ...(c.degraded !== undefined ? { degraded: c.degraded } : {}) })),
         {
@@ -1020,7 +1043,7 @@ export class UiServer {
         if (c.tags.length < 1 || c.tags.length > 10) problems.push(`片段 #${i} 标签 ${c.tags.length} 个，必须在 1–10 之间`);
         if (!(c.end > c.start)) problems.push(`片段 #${i} 起止时间非法`);
       }
-      // 片段重叠检查
+      // 片段重叠检查（同样只看这次要投的：已投过的区间不该妨碍补投一片新的）
       const sorted = indices.map((i) => clips[i]).filter((c): c is ClipRecord => Boolean(c)).sort((a, b) => a.start - b.start);
       for (let i = 1; i < sorted.length; i++) {
         if (sorted[i]!.start < sorted[i - 1]!.end) {
@@ -1030,13 +1053,16 @@ export class UiServer {
       if (problems.length) {
         this.sendJson(res, 400, { error: '发布前校验未通过', problems });
         return;
-      }      if (indices.length === 0) {
-        this.sendJson(res, 400, { error: '没有勾选任何切片' });
-        return;
       }
 
       const result = await orch.publishStage(id, orch.logger);
-      this.sendJson(res, 200, { ok: result.ok, stoppedAt: result.stoppedAt, error: result.error, count: indices.length });
+      this.sendJson(res, 200, {
+        ok: result.ok,
+        stoppedAt: result.stoppedAt,
+        error: result.error,
+        count: indices.length,
+        ...(alreadyDone > 0 ? { skippedAlreadyPublished: alreadyDone } : {}),
+      });
       return;
     }
 
@@ -1902,7 +1928,11 @@ export class UiServer {
      * 这两个接口就是让用户**看得见、并能推翻**它：
      *   GET  /api/tombstones        → 列表（含为什么立碑、原任务、bvid）
      *   POST /api/tombstone/release → 人工解除（确认 B站 上那个稿件确实没了之后）
-     * 解除必须带 confirm:true —— 它是「允许同一内容再投一次」的唯一开关。 */
+     * 解除必须带 confirm:true —— 它是「允许同一内容再投一次」的唯一开关。
+     *
+     *   POST /api/tombstones/reconcile → **自动核对：查不到的自动解除**（2026-10-07 用户要求）。
+     *     不用 confirm：它只解除"**确实查不到**"的（有 bvid 的按列表+详情核，没 bvid 的按分P 标题扫），
+     *     证据不足一律保留；每天也会自动跑一次（见 daemon 的 perfTick）。body 可带 dryRun:true 预演。 */
     if (p === '/api/tombstones' && method === 'GET') {
       const rows = orch.ledger.listTombstones();
       this.sendJson(res, 200, {
@@ -1914,6 +1944,19 @@ export class UiServer {
             ? '暂无墓碑：所有已发布切片的任务都还在台账里'
             : `有 ${rows.length} 条墓碑在生效。它们代表「这段内容以前投过 B站，而当时的任务已被删除」，` +
               `重新投稿时会被自动跳过。确认对应稿件确实不存在后再解除。`,
+      });
+      return;
+    }
+    if (p === '/api/tombstones/reconcile' && method === 'POST') {
+      const body = (await this.readBody(req)) as { dryRun?: boolean };
+      const r = await orch.reconcileTombstones({ ...(body.dryRun !== undefined ? { dryRun: body.dryRun } : {}) });
+      this.sendJson(res, 200, {
+        ok: true,
+        ...r,
+        note:
+          `${r.notes[0] ?? ''}` +
+          (r.released ? ` 已解除：${r.releasedList.map((x) => `「${x.title ?? '(无标题)'}」`).join('、')}` : '') +
+          (r.unverified ? `；另有 ${r.unverified} 条证据不足，保留待下次核对` : ''),
       });
       return;
     }
@@ -1934,6 +1977,28 @@ export class UiServer {
         ok: true,
         released: r.released,
         note: `已解除墓碑「${r.released?.title ?? '(无标题)'}」——该录制区间现在可以重新投稿。请确认 B站 上确实没有旧稿件。`,
+      });
+      return;
+    }
+
+    /* ---------------- POST /api/errors/clear ----------------
+     *
+     * 清掉**历史**错误事件（`data/errors.jsonl`）。用户 2026-10-07 看到健康面板里躺着
+     * 12 条两周前（还没切本地 ASR 时）的付费闸门/云端接口错误，要求清掉。
+     * 默认**先留档再清**（搬到 `data/error-archive/`），所以必须带 confirm:true；
+     * body 可以给 `archive:false` 表示真的不要留档（谨慎用）。 */
+    if (p === '/api/errors/clear' && method === 'POST') {
+      const body = (await this.readBody(req)) as { confirm?: boolean; archive?: boolean };
+      if (!body.confirm) throw new Error('清空错误事件需要 confirm: true（默认会先留档到 data/error-archive/）');
+      const r = clearErrorEvents({ ...(body.archive !== undefined ? { archive: body.archive } : {}) });
+      this.sendJson(res, 200, {
+        ok: true,
+        ...r,
+        note:
+          r.removed === 0
+            ? '本来就没有历史错误事件，无需清理'
+            : `已清空 ${r.removed} 条历史错误事件${r.archivedTo ? `，原文留档在 ${r.archivedTo}` : '（本次未留档）'}；` +
+              `之后的错误照常记录，`+"`error-report/` 里已生成的报告文件也没动",
       });
       return;
     }
@@ -3146,7 +3211,22 @@ export class UiServer {
           可稿件还在 B站 上、数据还在变。现在只要历史里有这个 bvid 就照样出页面。
        ③ **按稿件去重**：多分P 模式下同一稿件的各分P 共享稿件总播放，逐个分P 出一行会把同一份
           播放数重复 N 次 —— 相关性表的"稿件数"会被分P 多的稿件带偏。 */
-    type LedgerAgg = { titles: string[]; scores: number[]; parts: number; degraded: boolean; dtime?: number; taskId: string; index: number };
+    /* ★ 2026-10-08 用户报「发布时间时 没有正确排序」：查下来是**这一列恒为空** ——
+       旧写法取的是 `dtime`（**计划**发布时间），而 `publish.immediatePublish=true` 时投稿不带 dtime，
+       实测 26 条已投出切片里 **0 条有 dtime、26 条有 publishedAt**（真实投出时间）。
+       于是全表 publishedAt 都是 undefined，前端按它排序自然一动不动。
+       现在优先用真实的 `publishedAt`，没有才退回 dtime；同稿件的多分P 取**最近一次**投出时间
+       （刚追加过新分P 的稿件会排到前面，这比"首次投出"更符合"最近更新"的直觉）。 */
+    type LedgerAgg = {
+      titles: string[];
+      scores: number[];
+      parts: number;
+      degraded: boolean;
+      dtime?: number;
+      publishedAt?: string;
+      taskId: string;
+      index: number;
+    };
     const byBvid = new Map<string, LedgerAgg>();
     for (const t of tasks) {
       for (const c of this.orch.ledger.getClips(t.id)) {
@@ -3157,6 +3237,8 @@ export class UiServer {
           cur.parts++;
           cur.titles.push(c.title);
           cur.scores.push(c.score);
+          if (c.publishedAt && (!cur.publishedAt || c.publishedAt > cur.publishedAt)) cur.publishedAt = c.publishedAt;
+          if (cur.dtime === undefined && c.dtime !== undefined) cur.dtime = c.dtime;
         } else {
           byBvid.set(c.bvid, {
             titles: [c.title],
@@ -3164,6 +3246,7 @@ export class UiServer {
             parts: 1,
             degraded: c.degraded,
             ...(c.dtime !== undefined ? { dtime: c.dtime } : {}),
+            ...(c.publishedAt ? { publishedAt: c.publishedAt } : {}),
             taskId: t.id,
             index: c.index,
           });
@@ -3185,9 +3268,19 @@ export class UiServer {
       title?: string;
       score?: number;
       parts?: number;
+      /** 稿件发布时间（B站 `View.pubdate`，unix 秒）—— 由回流写进 performance.jsonl */
+      pubdate?: number;
       gone?: boolean;
       unavailable?: string;
     };
+    /* 墓碑：任务被删掉之后，切片记录与统计都可能拿不到"发布时间"，
+       而墓碑的 `at` 正是那次投稿指纹的登记时刻（≈投出当天）—— 至少让这一行可排序。 */
+    const tombByBvid = new Map(
+      this.orch.ledger
+        .listTombstones()
+        .filter((t) => Boolean(t.bvid))
+        .map((t) => [String(t.bvid), t] as const),
+    );
     const latest = new Map<string, PerfRow>();
     for (const raw of perf) {
       const r = raw as PerfRow;
@@ -3213,7 +3306,26 @@ export class UiServer {
         llmScore: best ?? p?.score,
         degraded: agg?.degraded ?? false,
         partCount: agg?.parts ?? p?.parts ?? 1,
-        publishedAt: agg?.dtime ? fmtLocal(agg.dtime * 1000) : undefined,
+        /* 发布时间：① 台账切片里**真实投出**的时间（publishedAt，同稿件取最近一次）
+           → ② 回流记下的 B站 稿件发布时间（pubdate，任务被删也还在）
+           → ③ 墓碑的登记时刻（≈投出当天，兜住"任务删了又还没回流过"的行）
+           → ④ 早期的计划发布时间 dtime。
+           实测教训（2026-10-08 用户报「发布时间时 没有正确排序」）：旧写法只有 ④，
+           而即时发布模式下 dtime 恒为空 —— 23 行里 0 行有时间，排序自然一动不动。 */
+        publishedAt: (() => {
+          const iso = agg?.publishedAt;
+          if (iso) {
+            const t = Date.parse(iso);
+            if (Number.isFinite(t)) return fmtLocal(t);
+          }
+          if (typeof p?.pubdate === 'number' && p.pubdate > 0) return fmtLocal(p.pubdate * 1000);
+          const tombAt = tombByBvid.get(bvid)?.at;
+          if (tombAt) {
+            const t = Date.parse(tombAt);
+            if (Number.isFinite(t)) return fmtLocal(t);
+          }
+          return agg?.dtime ? fmtLocal(agg.dtime * 1000) : undefined;
+        })(),
         view: p?.view,
         like: p?.like,
         coin: p?.coin,

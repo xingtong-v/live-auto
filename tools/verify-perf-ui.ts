@@ -193,11 +193,13 @@ async function main(): Promise<void> {
     ok('渲染出了「已发布稿件表现」卡片（不是停在加载中）', html.includes('已发布稿件表现'), html.slice(0, 160));
     ok('★ 页面没有白屏：相关性与列表两张卡都在', html.includes('LLM 评分 vs 实际播放') && html.includes('稿件数'), html.slice(0, 200));
 
-    /* 行数：接口的 rows 都应该渲染出来（含未拉取/已删除的行） */
+    /* 行数：接口给的「在库」稿件都要渲染出来；「稿件已不存在」的行默认不显示（用户 2026-10-07 的要求） */
+    const liveRows = rows.filter((r) => r['gone'] !== true);
+    const goneRows = rows.filter((r) => r['gone'] === true);
     const trCount = await cdp.evalJs<number>(
       `(() => { const card = [...document.querySelectorAll('#otherPage .card')].find((c) => String(c.innerHTML).includes('已发布稿件表现')); if (!card) return -1; return card.querySelectorAll('tbody tr').length; })()`,
     );
-    eq('★ 渲染的行数 = 接口给的稿件数', trCount, Math.min(rows.length, 100));
+    eq('★ 渲染的行数 = 接口给的「在库」稿件数（已删除的默认不显示）', trCount, Math.min(liveRows.length, 100));
 
     /* 逐个抽查：有播放数据的行必须显示出数字，且标题与接口一致 */
     for (const r of withView.slice(0, 3)) {
@@ -229,10 +231,38 @@ async function main(): Promise<void> {
     }
     const gone = rows.find((r) => r['gone'] === true);
     if (gone) {
-      const t = await cdp.evalJs<string>(
-        `(() => { const a = document.querySelector('#otherPage a[href="https://www.bilibili.com/video/${String(gone['bvid'])}"]'); return a ? a.closest('tr').textContent : ''; })()`,
+      const bvid = String(gone['bvid']);
+      const inDom = async () =>
+        cdp!.evalJs<boolean>(`!!document.querySelector('#otherPage a[href="https://www.bilibili.com/video/${bvid}"]')`);
+      ok('★ 已删除稿件默认不显示（用户要求「已删除的文件 不进行显示」）', (await inDom()) === false);
+      ok(
+        `★ 但给出「已隐藏 ${goneRows.length} 个」的说明，不是静默消失`,
+        html.includes(`已隐藏 ${goneRows.length} 个`),
+        html.slice(-320),
       );
-      ok('已删除稿件标出「稿件已不存在」', t.includes('稿件已不存在'), t.slice(0, 120));
+      const clicked = await cdp.evalJs<boolean>(
+        `(() => { const b = document.getElementById('perfGoneToggle'); if (!b) return false; b.click(); return true; })()`,
+      );
+      ok('有「显示它们」按钮且点得动', clicked);
+      let shownText = '';
+      for (let i = 0; i < 30; i++) {
+        shownText = await cdp.evalJs<string>(
+          `(() => { const a = document.querySelector('#otherPage a[href="https://www.bilibili.com/video/${bvid}"]'); return a ? a.closest('tr').textContent : ''; })()`,
+        ).catch(() => '');
+        if (shownText) break;
+        await sleep(300);
+      }
+      ok('★ 展开后能看到它，并标出「稿件已不存在」', shownText.includes('稿件已不存在'), shownText.slice(0, 120));
+      ok('展开后「数据日期」写的是「已删除」而不是数字', shownText.includes('已删除'), shownText.slice(0, 160));
+      /* 再点一次要能收回去：展开是一次性的开关，不能只出不进（也顺便把页面恢复成默认样子） */
+      await cdp.evalJs<boolean>(`(() => { const b = document.getElementById('perfGoneToggle'); if (!b) return false; b.click(); return true; })()`);
+      let backHidden = false;
+      for (let i = 0; i < 30; i++) {
+        if ((await inDom().catch(() => true)) === false) { backHidden = true; break; }
+        await sleep(300);
+      }
+      ok('★ 再点一次能收回去（回到默认的隐藏状态）', backHidden);
+      html = await cdp.evalJs<string>('String(document.getElementById("otherPage").innerHTML)').catch(() => '');
     } else {
       console.log('  \x1b[90m（本次没有已删除稿件，跳过这一组）\x1b[0m');
     }
@@ -244,6 +274,83 @@ async function main(): Promise<void> {
         `(() => { const a = document.querySelector('#otherPage a[href="https://www.bilibili.com/video/${String(multi['bvid'])}"]'); return a ? a.closest('tr').textContent : ''; })()`,
       );
       ok(`多分P 稿件标出「同一稿件 ${Number(multi['partCount'])} 个分P」`, t.includes(`同一稿件 ${Number(multi['partCount'])} 个分P`), t.slice(0, 140));
+    }
+
+    /* ★ 排序可选（用户 2026-10-08：「这里的排序 可以改成可选的吗 比如稿件时间 播放 点赞 等」）：
+       切到「点赞 → 降序」后，**第一行必须是接口数据里点赞最多的那个稿件**（行序由页面重排，
+       不是接口给的顺序 —— 接口一直按播放降序）。再切升序验证方向生效，最后切回播放降序，
+       免得把用户的选择留在点赞上（选择会记进 localStorage）。 */
+    const withLike = rows.filter((r) => typeof r['like'] === 'number');
+    const firstBvid = async (): Promise<string> => {
+      const href = await cdp!
+        .evalJs<string>(`(() => { const a = document.querySelector('#otherPage .card a[href^="https://www.bilibili.com/video/"]'); return a ? String(a.getAttribute('href')) : ''; })()`)
+        .catch(() => '');
+      return href ? href.split('/').pop()! : '';
+    };
+    const hasSort = await cdp.evalJs<boolean>(`!!document.getElementById('perfSortKey') && !!document.getElementById('perfSortDir')`);
+    ok('★ 表现列表有排序选择器与方向按钮', hasSort);
+    if (withLike.length >= 2) {
+      const topLike = [...withLike].sort((a, b) => Number(b['like']) - Number(a['like']))[0]!;
+      const bottomLike = [...withLike].sort((a, b) => Number(a['like']) - Number(b['like']))[0]!;
+      await cdp.evalJs(
+        `(() => { const s = document.getElementById('perfSortKey'); s.value = 'like'; s.dispatchEvent(new Event('change')); return true; })()`,
+      );
+      await sleep(1200);
+      eq(`★ 切到「点赞」后第一行是点赞最多的（${String(topLike['bvid'])} ${String(topLike['like'])} 赞）`, await firstBvid(), String(topLike['bvid']));
+      const dirText = await cdp.evalJs<string>(`String(document.getElementById('perfSortDir').textContent)`);
+      ok('方向按钮显示「↓ 降序」', /降序/.test(dirText), dirText);
+      await cdp.evalJs(`document.getElementById('perfSortDir').click()`);
+      await sleep(1200);
+      eq(`★ 切成升序后第一行变成点赞最少的（${String(bottomLike['bvid'])} ${String(bottomLike['like'])} 赞）`, await firstBvid(), String(bottomLike['bvid']));
+      ok('抬头文案跟着排序走', /按点赞升序/.test(await cdp.evalJs<string>('String(document.getElementById("otherPage").innerHTML)')), '');
+
+      /* ★ 2026-10-08 用户报「发布时间时 没有正确排序」：那是接口那一列**恒为空**（只有 1 行有值），
+         不是排序逻辑的问题。修完接口后再锁一条端到端的：切「发布时间」行序要真的跟着变。 */
+      const withPub = rows.filter((r) => typeof r['publishedAt'] === 'string');
+      if (withPub.length >= 2) {
+        const newest = [...withPub].sort((a, b) => String(b['publishedAt']).localeCompare(String(a['publishedAt'])))[0]!;
+        const oldest = [...withPub].sort((a, b) => String(a['publishedAt']).localeCompare(String(b['publishedAt'])))[0]!;
+        await cdp.evalJs(
+          `(() => { const s = document.getElementById('perfSortKey'); s.value = 'publishedAt'; s.dispatchEvent(new Event('change')); return true; })()`,
+        );
+        await sleep(1200);
+        /* ⚠️ 方向要**显式摆到降序**：上一组（点赞）把方向留在了升序，不能假设默认值 ——
+           第一版就是漏了这句，于是拿"升序的结果"去比"降序的期望"，两条断言全红（页面其实是对的）。 */
+        const dirTo = async (wantAsc: boolean): Promise<void> => {
+          await cdp!.evalJs(
+            `(() => { const b = document.getElementById('perfSortDir'); if (!b) return false; const isAsc = /升序/.test(String(b.textContent)); if (isAsc !== ${wantAsc}) b.click(); return true; })()`,
+          );
+          await sleep(1200);
+        };
+        await dirTo(false);
+        eq(
+          `★ 切「发布时间」降序后第一行是最新的（${String(newest['bvid'])} ${String(newest['publishedAt'])}）`,
+          await firstBvid(),
+          String(newest['bvid']),
+        );
+        /* 升序：该是最早的那条（没有发布时间的行会沉底，正好不会干扰第一行） */
+        await dirTo(true);
+        eq(
+          `★ 升序后第一行是最早的（${String(oldest['bvid'])} ${String(oldest['publishedAt'])}）`,
+          await firstBvid(),
+          String(oldest['bvid']),
+        );
+        const pubCol = await cdp.evalJs<string>(
+          `(() => { const h = [...document.querySelectorAll('#otherPage .card th')].find((x) => /发布时间/.test(String(x.textContent))); return h ? String(h.textContent) : ''; })()`,
+        );
+        ok('表里有「发布时间」这一列（排序依据看得见）', /发布时间/.test(pubCol), pubCol);
+      } else {
+        console.log('  \x1b[90m（有发布时间的稿件不足 2 个，跳过「发布时间」这一组）\x1b[0m');
+      }
+
+      /* 收尾：切回「播放 · 降序」，避免影响用户下次打开（localStorage 记住了选择） */
+      await cdp.evalJs(
+        `(() => { const s = document.getElementById('perfSortKey'); s.value = 'view'; s.dispatchEvent(new Event('change')); const b = document.getElementById('perfSortDir'); if (b && /升序/.test(String(b.textContent))) b.click(); return true; })()`,
+      );
+      await sleep(1200);
+      ok('收尾切回播放降序', /按播放降序/.test(await cdp.evalJs<string>('String(document.getElementById("otherPage").innerHTML)')), '');
+    } else {
+      console.log('  \x1b[90m（有播放数据的稿件不足 2 个，跳过排序这一组）\x1b[0m');
     }
 
     /* 相关性表：没有可统计项时必须是解释文案，不能是一张全 0 的表（用户就是因为全 0 才报障的） */

@@ -44,7 +44,7 @@ import type { CutAndUploadResult } from './publish.ts';
 import { Trigger, WebhookRelay } from './trigger.ts';
 import { WatchImporter } from './watch-import.ts';
 import { detectStreamer } from './streamer.ts';
-import { runDueDeletions, scheduleDelete } from './pending-delete.ts';
+import { closeMissingPending, runDueDeletions, scheduleDelete } from './pending-delete.ts';
 import {
   buildSegmentMap,
   buildSourceMedia,
@@ -632,6 +632,14 @@ export class Orchestrator {
         await this.refreshPerformance({ days: 30 });
       } catch (e) {
         this.logger.warn('稿件表现数据回流异常（明日再试）', { data: { error: (e as Error).message } });
+      }
+      /* 墓碑自动核对（用户要求「查不到的 自动解除」）：与回流同频（每日一次）。
+         为什么放在回流后面：同一趟里稿件列表/详情都是热的，能省一半只读请求；
+         而且回流刚把「稿件已不存在」判过一遍，结论一致，不会互相打架。 */
+      try {
+        await this.reconcileTombstones();
+      } catch (e) {
+        this.logger.warn('墓碑自动核对异常（明日再试）', { data: { error: (e as Error).message } });
       }
       // 顺带清理过期的回收站条目：唯一会真正抹掉数据的地方，必须自动化但有明确期限
       try {
@@ -1854,19 +1862,57 @@ export class Orchestrator {
       );
     }
 
-    if (cutOk.length === 0) {
-      /* 切片全失败：做不出来，重跑也一样 ⇒ 标记 stuck 让本场终止，
+    /* ★★ 只投**还没投过**的切片（2026-10-07 用户报「勾了想投稿，但没有投稿选项」时查出的隐患）。
+       场景：本场先投过一批（状态 SUBMITTED/PUBLISHED），用户又勾了一片新的想补投。
+       旧写法把**所有选中**的切片都塞进 publishAsMultiPart，靠它内部的「按目标稿件已有分P 标题去重」
+       兜底 —— 而 B站 分P 列表有约 20 分钟延迟（见上面那段注释与真实事故），
+       在延迟窗口内重跑就会把已投过的分P 再投一遍，在**同一个稿件里留下内容重复的分P**。
+       这里改用**本地台账状态**判断（无延迟、不依赖 B站 查询），把已投过的先摘出去；
+       它们仍会进 results（标 skipped），这样调用方的计数与终端判定口径不变。 */
+    const DONE_STATUSES = ['PUBLISHED', 'SUBMITTED', 'SUBMITTING'];
+    const alreadyPublished = selectedAfterCut.filter((c) => DONE_STATUSES.includes(c.status));
+    const fresh = selectedAfterCut.filter((c) => !DONE_STATUSES.includes(c.status));
+    if (alreadyPublished.length) {
+      log.info(
+        `多分P：跳过 ${alreadyPublished.length} 个已经投过的切片（#${alreadyPublished.map((c) => c.index).join('、')}）` +
+          `，本次只投 ${fresh.length} 个新的 —— 判据是台账状态，不看 B站 分P 列表的延迟`,
+        { taskId, data: { alreadyPublished: alreadyPublished.length, fresh: fresh.length } },
+      );
+    }
+    if (fresh.length === 0) {
+      log.info('多分P：本次勾选的切片都已经投过，没有需要新投的（不重复追加分P）');
+      return {
+        results: selectedAfterCut.map((c) => ({
+          clipIndex: c.index,
+          ok: false,
+          skipped: '该切片已经投过，未重复投',
+          warnings: ['该切片已经投过，未重复投'],
+        })),
+        submitted: 0,
+        skipped: selectedAfterCut.length,
+        failed: 0,
+        multipart: true,
+      };
+    }
+
+    /* ★ "切不出东西"≠"切片全失败"：等待完整版稿件的**重查**进来时，切片早就切好了（状态 CUT、
+       cutOutput 在盘上），而 `publishClips` 的取片判据只认 CANDIDATE/PENDING_UPLOAD/FAILED
+       （publish.ts 里那条 filter），于是它返回空 results —— 旧代码据此判成"切片全失败 ⇒ stuck"，
+       本场就再也追加不成了（等待重查形同虚设）。所以判据改成**看有没有可用的产物**，
+       而不是看这一轮切了几个。 */
+    const ready = fresh.filter((c) => c.cutOutput && exists(c.cutOutput));
+    if (ready.length === 0) {
+      /* 真的一个产物都没有（切片全失败）：做不出来，重跑也一样 ⇒ 标记 stuck 让本场终止，
          而不是让任务永远卡在 CLIPPED（更不是标成 PUBLISHED 谎报成功）。 */
       return {
         results: cutRes.results,
         submitted: 0,
         skipped: 0,
-        failed: cutFailed.length,
+        failed: Math.max(cutFailed.length, fresh.length),
         stuck: true,
         multipart: true,
       };
     }
-
     /* ---- 第二步：确定 P1 完整版 / P2 纯享版 ----
        完整版来自 biliLive-tools 的压制产物（`source.fullVideoPath`）。
        纯享版是 remux 出来的无弹幕原片，落在任务目录 `full/` 下（对齐 tools/publish-multipart.ts 的查找规则）。 */
@@ -1945,8 +1991,9 @@ export class Orchestrator {
     const r = await this.publisher.publishAsMultiPart({
       task,
       uid,
-      /* ★ 用**切片后重读**的列表（含 cutOutput），不是切片前的 selected —— 见上面那段说明 */
-      clips: selectedAfterCut,
+      /* ★ 用**切片后重读**的列表（含 cutOutput），不是切片前的 selected —— 见上面那段说明；
+         并且**只送还没投过的**（fresh）：已投过的分P 再追加一次会在同一稿件里留下重复分P。 */
+      clips: fresh,
       ...(fullVideoPath ? { fullVideoPath } : {}),
       ...(pureVideoPath ? { pureVideoPath } : {}),
       ...(resumeAid ? { resumeAid } : {}),
@@ -1982,9 +2029,18 @@ export class Orchestrator {
           填错会让调用方的终态判定永远不成立（实测任务卡在 CLIPPED）。 */
     const clipParts = r.parts.filter((p) => p.kind === 'clip').length;
     return {
-      results: cutRes.results,
+      /* 已投过的那些也要如实回报成 skipped（不报的话调用方会以为"少投了几个"而重跑本场） */
+      results: [
+        ...cutRes.results,
+        ...alreadyPublished.map((c) => ({
+          clipIndex: c.index,
+          ok: false,
+          skipped: '该切片已经投过，未重复投',
+          warnings: ['该切片已经投过，未重复投'],
+        })),
+      ],
       submitted: r.skipped ? 0 : clipParts,
-      skipped: r.skipped ? selected.length : 0,
+      skipped: (r.skipped ? fresh.length : 0) + alreadyPublished.length,
       failed: cutFailed.length,
       multipart: true,
     };
@@ -2768,6 +2824,12 @@ export class Orchestrator {
         const stat = (detail.View?.stat ?? detail.stat ?? {}) as Record<string, number | undefined>;
         const title = detail.View?.title ?? detail.title ?? item.title;
         const parts = typeof detail.View?.videos === 'number' ? detail.View.videos : item.parts;
+        /* 稿件发布时间（B站 侧的客观事实）：`View.pubdate` 没有就用 `View.ctime`。
+           必须落进 performance.jsonl —— 表现页的「发布时间」原来只从**台账切片**取，
+           而任务被删掉后切片记录就没了（用户 2026-10-08 报「按发布时间排序不动」就是这个原因：
+           23 行里只有 1 行拿得到时间）。 */
+        const pubRaw = detail.View?.pubdate ?? detail.View?.ctime;
+        const pubdate = typeof pubRaw === 'number' && pubRaw > 0 ? pubRaw : undefined;
         this.ledger.recordPerformance({
           bvid: item.bvid,
           ...(item.taskId !== undefined ? { taskId: item.taskId } : {}),
@@ -2783,6 +2845,7 @@ export class Orchestrator {
           ...(title !== undefined ? { title } : {}),
           ...(item.score !== undefined ? { score: item.score } : {}),
           ...(parts !== undefined ? { parts } : {}),
+          ...(pubdate !== undefined ? { pubdate } : {}),
         });
         updated++;
       } catch (e) {
@@ -2830,6 +2893,21 @@ export class Orchestrator {
     );
     this.logger.info(notes[notes.length - 1]!);
     return { checked: pending.length, updated, failed, notes };
+  }
+
+  /**
+   * 墓碑自动核对：**查不到的自动解除**（2026-10-07 用户要求）。
+   *
+   * 真正的判定逻辑放在 `src/tombstone-reconcile.ts`（纯函数 + 注入 client，便于无网络自测），
+   * 这里只是把本进程的 client / ledger / logger 接上去，供定时任务、HTTP 接口与 MCP 共用。
+   */
+  async reconcileTombstones(opts: { dryRun?: boolean } = {}): Promise<Awaited<ReturnType<typeof reconcileTombstones>>> {
+    return reconcileTombstones({
+      ledger: this.ledger,
+      client: this.client,
+      logger: this.logger,
+      ...(opts.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
+    });
   }
 
   /**

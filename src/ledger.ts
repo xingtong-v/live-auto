@@ -1490,6 +1490,27 @@ export class Ledger {
   }
 
   /**
+   * 给墓碑**补记 bvid**（自动核对时按「分P 标题」认出旧稿件后调用）。
+   *
+   * 为什么值得补：`bvid` 未知的墓碑在界面上只能提示「未反查到 bvid（当时只走到「已提交」）」，
+   * 用户得自己去创作中心翻；补上之后，后续核对可以直接查它、界面也能给出打开稿件的入口。
+   */
+  setTombstoneBvid(fp: string, bvid: string): boolean {
+    this.load();
+    const map = this.tombstoneMap();
+    const t = map[fp];
+    if (!t || !bvid || t.bvid === bvid) return false;
+    t.bvid = bvid;
+    this.persistStrict();
+    this.logger.info(`墓碑补记 bvid（自动核对时按分P 标题认出旧稿件）：${t.title ?? '(无标题)'} → ${bvid}`, {
+      taskId: t.taskId,
+      mod: 'ledger',
+      data: { fp },
+    });
+    return true;
+  }
+
+  /**
    * **人工解除**墓碑 —— 允许同一区间重新投稿。
    *
    * 只在用户确认「B站 上那个稿件确实已经不存在了」之后才该调用。
@@ -1822,6 +1843,15 @@ export class Ledger {
     score?: number;
     /** 分P 数（多分P 模式下 ≥2） */
     parts?: number;
+    /**
+     * 稿件的**发布时间**（B站 `View.pubdate`，unix 秒；没有就用 `View.ctime`）。
+     *
+     * 为什么必须落进历史（2026-10-08 用户报「发布时间时 没有正确排序」）：
+     * 表现页的「发布时间」原本只从**台账切片**里取，而任务被删掉之后切片记录就没了 ——
+     * 实测 23 行里只有 1 行拿得到时间，按它排序自然一动不动。
+     * 稿件的时间是 B站 上的客观事实，跟"本地任务还在不在"无关，所以随统计一起存进 performance.jsonl。
+     */
+    pubdate?: number;
     /** 稿件已确认不存在（被删/下架）：之后不再请求，页面上明确标出来 */
     gone?: boolean;
     /** 稿件存在但取不到统计（实测 `state=-4 已锁定`）：如实标出来，**不写 0 冒充数据** */
@@ -1845,6 +1875,7 @@ export class Ledger {
       'title',
       'score',
       'parts',
+      'pubdate',
       'gone',
       'unavailable',
     ] as const;
@@ -1911,7 +1942,18 @@ export class Ledger {
       const bvid = typeof row['bvid'] === 'string' ? row['bvid'] : '';
       if (!bvid) continue;
       const date = String(row['date'] ?? '');
-      if (date === today) pulledToday.add(bvid);
+      /* ★ 2026-10-08：`pubdate`（稿件发布时间）是新增字段，老记录里没有 ——
+         若照旧按"今天拉过就不再拉"，表现页的「发布时间」会一直空到明天（用户当天就报了"排序不对"）。
+         所以"今天拉过、但缺 pubdate"的**正常稿件**允许再拉一次补齐；补齐后有了 pubdate 就照常跳过。
+         已消失 / 已锁定的稿件本来就没有可见的发布时间，不参与这条补齐，免得天天白拉。 */
+      const lacksPubdate =
+        row['pubdate'] === undefined && row['gone'] !== true && typeof row['unavailable'] !== 'string';
+      /* 一天里可能有多行（回流重跑、老格式行…）：**以最后一行为准**（与上面 carried 的口径一致）——
+         最后一行缺 pubdate 就撤销"今天拉过"的标记，让它被再拉一次补齐。 */
+      if (date === today) {
+        if (lacksPubdate) pulledToday.delete(bvid);
+        else pulledToday.add(bvid);
+      }
       if (row['gone'] === true) goneLatest.add(bvid);
       else goneLatest.delete(bvid); // 后来的行说它又在了 → 撤销标记
       // 历史行只在窗口内参与「沿用」；文件本身是追加写的，后面的行更新，直接覆盖

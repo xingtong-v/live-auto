@@ -106,15 +106,20 @@ function makeEnv(
   const fakePublisher = {
     publishClips: async (opts: Record<string, unknown>) => {
       calls['publishClips']!.push(opts);
-      // 模拟切片产物写回
-      const out = (orch.ledger.getClips(taskId)).filter((c) => c.selected).map((c) => ({
-        clipIndex: c.index,
-        ok: true,
-        output: path.join(dataDir, 'clips', taskId, `${c.index}.mp4`),
-        warnings: [] as string[],
-      }));
-      for (const c of orch.ledger.getClips(taskId)) {
-        if (c.selected) orch.ledger.setClipStatus(taskId, c.index, 'CUT', { cutOutput: path.join(dataDir, 'clips', taskId, `${c.index}.mp4`) });
+      /* ★ 与真实 publish.ts 的切片判据保持一致：只切 CANDIDATE / PENDING_UPLOAD / FAILED。
+         旧替身把**所有选中**的切片都标成 CUT —— 于是"已投过的切片"在替身里会被抹掉状态，
+         第 10/11 节要验的"不重复投"就永远测不到（真实代码不会重切已投过的，见 publish.ts 的过滤）。 */
+      const cuttable = (s: string): boolean => s === 'CANDIDATE' || s === 'PENDING_UPLOAD' || s === 'FAILED';
+      const targets = orch.ledger.getClips(taskId).filter((c) => c.selected && cuttable(c.status));
+      const out = targets.map((c) => {
+        const p = path.join(dataDir, 'clips', taskId, `${c.index}.mp4`);
+        /* ★ 真写一个产物文件：`publishMultiPartStage` 会用 exists(cutOutput) 判断"有没有可用产物"
+           （等待完整版的重查那次不会重切，全靠这个判断），不写文件的话它会被误判成"切片全失败"。 */
+        fs.writeFileSync(p, 'x');
+        return { clipIndex: c.index, ok: true, output: p, warnings: [] as string[] };
+      });
+      for (const c of targets) {
+        orch.ledger.setClipStatus(taskId, c.index, 'CUT', { cutOutput: path.join(dataDir, 'clips', taskId, `${c.index}.mp4`) });
       }
       return { results: out, submitted: 0, skipped: 0, failed: 0, quota: { todayCount: 0, remain: 10, requested: out.length } };
     },
@@ -443,6 +448,58 @@ async function main(): Promise<void> {
       } as typeof base),
       '2026-09-21',
     );
+  }
+
+  /* ==========================================================================
+   * ★ 2026-10-07 用户报「7.2 分这个是我自己觉得不错，点的对号想投稿，但是没有进行投稿的选项」
+   *   查下来两件事叠在一起：
+   *     ① 界面上没有"单片投稿"入口（他自己勾的那一片找不到投的地方）；
+   *     ② 更要命的是**批量投稿会把已经投过的分P 再投一遍** —— 旧写法把所有选中切片都塞进
+   *        publishAsMultiPart，靠它内部"按目标稿件已有分P 标题去重"兜底，而 B站 分P 列表
+   *        有约 20 分钟延迟，延迟窗口内重跑就会在同一稿件里留下内容重复的分P。
+   *   修法：追加前用**本地台账状态**（无延迟）把已投过的摘出去。这一节锁住它。
+   * ========================================================================== */
+  section('10. 已投过的切片不会被重复追加（只有新的进投稿批次）');
+  {
+    const { orch, taskId, calls } = makeEnv(path.join(tmpRoot, 'j'), true, { fullVideoBy: 'assistant' });
+    const clips = orch.ledger.getClips(taskId).sort((a, b) => a.index - b.index);
+    /* 前两片当成已经投出去过（SUBMITTED = 上传接口已受理、只等落地），第三片是新的候选 */
+    orch.ledger.setClipStatus(taskId, clips[0]!.index, 'SUBMITTED', { bvid: 'BV1ALREADY01', uploadTaskId: 't-a' });
+    orch.ledger.setClipStatus(taskId, clips[1]!.index, 'SUBMITTED', { bvid: 'BV1ALREADY01', uploadTaskId: 't-b' });
+
+    const r = (await invokeMultiPart(orch, taskId, silentLog)) as {
+      results: Array<{ clipIndex: number; skipped?: string }>;
+      skipped: number;
+      submitted: number;
+    };
+    const mp = calls['publishAsMultiPart']![0] as Record<string, unknown> | undefined;
+    const sent = ((mp?.['clips'] as Array<{ index: number }> | undefined) ?? []).map((c) => c.index);
+    eq('★ 只把还没投过的那一片送进投稿批次', JSON.stringify(sent), JSON.stringify([clips[2]!.index]));
+    eq('★ 真正投出去的切片数 = 1（不是 3）', r.submitted, 1);
+    eq(
+      '已投过的两片在 results 里如实报 skipped（不报的话调用方会以为少投了而重跑本场）',
+      r.results.filter((x) => x.skipped === '该切片已经投过，未重复投').length,
+      2,
+    );
+    eq('skipped 计数把已投过的也算进去', r.skipped, 2);
+    ok(
+      '日志说明了为什么跳过（依据是台账状态，不看 B站 列表延迟）',
+      true,
+      '（日志走 silentLog，这里只锁行为）',
+    );
+  }
+
+  section('11. 全选中的都已投过：一次追加都不做，也不谎报成功');
+  {
+    const { orch, taskId, calls } = makeEnv(path.join(tmpRoot, 'k'), true, { fullVideoBy: 'assistant' });
+    for (const c of orch.ledger.getClips(taskId)) {
+      if (c.selected) orch.ledger.setClipStatus(taskId, c.index, 'PUBLISHED', { bvid: 'BV1ALLDONE01' });
+    }
+    const r = (await invokeMultiPart(orch, taskId, silentLog)) as { skipped: number; submitted: number; failed: number };
+    eq('★ 全都投过 ⇒ 不调用 publishAsMultiPart（不追加分P、也不新建稿件）', calls['publishAsMultiPart']!.length, 0);
+    eq('submitted = 0（不谎报）', r.submitted, 0);
+    eq('failed = 0（这不是失败）', r.failed, 0);
+    ok('全部报成 skipped', r.skipped >= 3, String(r.skipped));
   }
 
   console.log(`\n\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);

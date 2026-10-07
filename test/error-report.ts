@@ -27,7 +27,10 @@ import type { AppConfig } from '../src/config.ts';
 import { ROOT_DIR, ensureDir } from '../src/util.ts';
 import { log as globalLog } from '../src/logger.ts';
 import {
+  clearErrorEvents,
+  errorCountLastHours,
   findErrorEvent,
+  getErrorsPath,
   loadErrorReportOrEvent,
   readErrorEvents,
   renderErrorTimeline,
@@ -417,6 +420,45 @@ section('⑤c 源码接线核对（防止以后又退回 UNKNOWN / internal）')
   const asr = fs.readFileSync(path.join(ROOT_DIR, 'src', 'asr.ts'), 'utf8');
   ok('asr 层从 ApiError 取请求上下文', /e instanceof ApiError \? e\.request : undefined/.test(asr));
   ok('asr 层把 lastFailure 写进 transcript', /transcript\.lastFailure = \{/.test(asr));
+}
+
+/* ==========================================================================
+ * ⑥ 清空历史错误事件（用户 2026-10-07：「清掉这 12 条历史错误」）
+ *   要点：① 默认**先留档再清**（可回溯）；② 只清历史，之后的错误照常记录；
+ *         ③ 没有文件时是安全的 no-op。
+ * ========================================================================== */
+section('⑥ 清空历史错误事件：留档 + 截断，且只清历史');
+{
+  const before = readErrorEvents({});
+  ok('清空前确实攒着历史事件（本套件跑出来的）', before.length > 0, String(before.length));
+
+  const archiveDir = path.join(tmp, 'error-archive');
+  const r = clearErrorEvents({ archiveDir });
+  eq('★ 返回清掉的条数与文件里的条数一致', r.removed, before.length);
+  ok('给出了留档路径', typeof r.archivedTo === 'string' && r.archivedTo.length > 0, String(r.archivedTo));
+  ok('★ 留档文件真的存在且包含原文', Boolean(r.archivedTo && fs.existsSync(r.archivedTo)), String(r.archivedTo));
+  const archived = r.archivedTo ? fs.readFileSync(r.archivedTo, 'utf8') : '';
+  eq('留档内容行数与清掉条数一致', archived.split(/\r?\n/).filter((l) => l.trim()).length, r.removed);
+  ok('留档里能 grep 到原来的错误类型', archived.includes('"type"'), archived.slice(0, 120));
+
+  eq('★ 清空后事件流为空（面板那张表会消失）', readErrorEvents({}).length, 0);
+  eq('★ 「近 24h 错误」也跟着归零', errorCountLastHours(24), 0);
+  eq('再次清空是安全的 no-op（removed=0）', clearErrorEvents({ archiveDir }).removed, 0);
+
+  /* 只清历史：清空之后新报的错误必须照常落进同一个文件 */
+  writeErrorReport({ taskId: 'after-clear-1', stage: 'CLIPPED', type: 'internal', error: new Error('清空之后的新错误'), appVersion: 'test' });
+  const after = readErrorEvents({});
+  eq('★ 清空只影响历史：新错误照常记录', after.length, 1);
+  eq('新错误就是刚写的那条', after[0]?.taskId, 'after-clear-1');
+
+  const r2 = clearErrorEvents({ archiveDir, archive: false });
+  eq('archive:false 时也能清（removed 如实报）', r2.removed, 1);
+  ok('archive:false 时不留档', r2.archivedTo === undefined, String(r2.archivedTo));
+
+  /* 源文件被删掉（或从没写过）时不许抛 */
+  fs.rmSync(getErrorsPath(), { force: true });
+  const r3 = clearErrorEvents({ archiveDir });
+  eq('文件不存在时返回 removed=0（不抛）', r3.removed, 0);
 }
 
 ui.stop();

@@ -460,7 +460,7 @@
 const BOOT = window.__BOOT__ || { csrf: '', version: '?', roomId: '', platform: '' };
 
 /** UI 构建标记：在浏览器控制台里能看到，用来确认页面是不是最新的（避免缓存导致以为功能没做） */
-const UI_BUILD = 'ui-2026-10-07-task-multiselect';
+const UI_BUILD = 'ui-2026-10-08-perf-pubdate';
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1222,11 +1222,21 @@ function renderDetail() {
     html += `<div class="clips-head"><h3>候选切片 ${d.clips.length} 个</h3>
       <span class="hint">勾选要发布的 · 标题与时间范围都可直接修改（修改自动保存）</span></div>`;
     html += d.clips.map(clipHTML).join('');
-    const publishable = d.clips.filter((c) => c.selected && c.status !== 'PUBLISHED').length;
+    /* ★ 批量按钮的判据必须与卡片上的「投稿这一片」、服务端 approve、publish.ts 的切片段一致：
+       只算**还没投过**的（CANDIDATE/CUT/FAILED…）。旧写法用 `status !== 'PUBLISHED'`，
+       把「已提交待确认」也算成可投 —— 点下去要靠 B站 分P 列表（约 20 分钟延迟）去重，
+       延迟窗口内重跑就会在同一稿件里留下重复分P。用户 2026-10-07 的报障就出在这条路径上。 */
+    const DONE = ['PUBLISHED', 'SUBMITTED', 'SUBMITTING', 'SKIPPED'];
+    const publishable = d.clips.filter((c) => c.selected && !DONE.includes(c.status));
+    const alreadyDone = d.clips.filter((c) => c.selected && ['PUBLISHED', 'SUBMITTED', 'SUBMITTING'].includes(c.status));
     html += `<div class="actionbar">
-      <span class="info">已选 <b id="cntSelected">${checked}</b> / ${d.clips.length} 个切片　·　定时发布间隔 ${fmtSpan(state.bootstrap.config.publish.clipGapSec)}</span>
+      <span class="info">已选 <b id="cntSelected">${checked}</b> / ${d.clips.length} 个切片　·　定时发布间隔 ${fmtSpan(state.bootstrap.config.publish.clipGapSec)}${
+        alreadyDone.length ? `　·　<span style="color:var(--text-3)">其中 ${alreadyDone.length} 个已投过，不会重复投</span>` : ''
+      }</span>
       <span id="publishHint" style="font-size:12px;color:var(--text-3)"></span>
-      <button class="primary" id="publishBtn" ${publishable ? '' : 'disabled'}>加入排期并发布</button></div>`;
+      <button class="primary" id="publishBtn" ${publishable.length ? '' : 'disabled'} title="${
+        publishable.length ? '把选中的、还没投过的切片投出去' : alreadyDone.length ? '选中的切片都已经投过了' : '先勾选要投稿的切片'
+      }">投稿选中的 ${publishable.length} 个切片</button></div>`;
   } else {
     const msg = d.status === 'FAILED' ? '等待重跑后产出候选切片。'
       : ['TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING'].includes(d.status) ? '正在处理中，完成后会自动进入内容分析。'
@@ -1276,6 +1286,13 @@ function clipHTML(c) {
        后者是切片上持久化的历史标记，解除墓碑之后它不会自己消失（要靠服务端清理）。
        若用标记判断，解除完界面还会挂着墓碑说明，看起来像"解除没生效"。 */
   const tomb = c.tombstone || null;
+  /* ★ 2026-10-07 用户报「勾了想投稿，但没有投稿的选项」：他勾的正是**单片**，
+     于是去找"这一片怎么投"。所以每张卡片直接给一个「投稿这一片」——
+     判据与批量按钮、服务端、publish.ts 的切片段完全一致：勾了、没被墓碑拦、且**还没投过**。
+     「已提交待确认（SUBMITTED）」也算投过（B站 分P 列表有约 20 分钟延迟，不能靠它去重，
+     否则延迟窗口内重投会在同一稿件里留下重复分P）。 */
+  const DONE_STATUSES = ['PUBLISHED', 'SUBMITTED', 'SUBMITTING', 'SKIPPED'];
+  const canPublishThis = !!c.selected && !tomb && !DONE_STATUSES.includes(c.status);
   const statusPill = tomb ? `<span class="pill tomb">🪦 墓碑拦截</span>`
     : c.status === 'PUBLISHED' ? `<span class="pill">已发布${c.bvid ? ' ' + esc(c.bvid) : ''}</span>`
     : failed ? `<span class="pill fail">失败</span>`
@@ -1317,6 +1334,7 @@ function clipHTML(c) {
     <div class="clip-foot">
       <button class="linkbtn" data-act="preview-cut">试看</button>
       <button class="linkbtn" data-act="open-llc">在 biliLive-tools 中编辑</button>
+      ${canPublishThis ? '<button class="linkbtn" data-act="publish-this" style="color:var(--pink);font-weight:600">投稿这一片</button>' : ''}
       ${c.dtime ? `<span style="color:var(--text-3)">排期 ${esc(fmtTime(c.dtime * 1000))}</span>` : ''}
       ${statusPill}
       ${c.bvid ? `<a href="https://www.bilibili.com/video/${esc(c.bvid)}" target="_blank" rel="noreferrer" style="font-size:12px">查看稿件</a>` : ''}
@@ -1726,6 +1744,26 @@ function bindDetail() {
            <p style="color:var(--text-3);font-size:12.5px">任务目录：data/tasks/${esc(d.id)}/</p>`
         : '<p>尚未生成 .llc 项目文件（分析完成后会生成；若失败请看日志）。</p>');
     };
+    /* 单片投稿：与下面批量按钮走**同一个** approve 接口，只是 indices 只有一个。
+       先 patch selected=true（勾选状态是权威输入，别依赖界面上的勾），再提交。 */
+    const pub1 = card.querySelector('[data-act="publish-this"]');
+    if (pub1) pub1.onclick = async () => {
+      pub1.disabled = true;
+      const old = pub1.textContent;
+      pub1.textContent = '提交中…';
+      try {
+        await patchClip(d.id, idx, { selected: true });
+        const r = await api(`/api/task/${encodeURIComponent(d.id)}/approve`, { method: 'POST', body: { indices: [idx] } });
+        const c0 = d.clips.find((x) => x.index === idx) || {};
+        toast(`已提交「${String(c0.title || '').slice(0, 16)}」（${r.count ?? 1} 个切片）——过审后公开`, 7000);
+        setTimeout(() => refreshAll(true), 1500);
+      } catch (e) {
+        const problems = e.payload && e.payload.problems;
+        toast('投稿失败：' + (problems && problems.length ? problems.join('；') : e.message), 9000);
+        pub1.disabled = false;
+        pub1.textContent = old;
+      }
+    };
     const recut = card.querySelector('[data-act="recut"]');
     if (recut) recut.onclick = async () => {
       recut.disabled = true;
@@ -1763,13 +1801,18 @@ function bindDetail() {
 
   const btn = $('#publishBtn');
   if (btn) btn.onclick = async () => {
-    const indices = state.detail.clips.filter((c) => c.selected && c.status !== 'PUBLISHED').map((c) => c.index);
-    if (!indices.length) return;
+    /* 只提交**还没投过**的：与卡片上的「投稿这一片」、服务端 approve、publish.ts 的切片段同一判据 */
+    const DONE = ['PUBLISHED', 'SUBMITTED', 'SUBMITTING', 'SKIPPED'];
+    const indices = state.detail.clips.filter((c) => c.selected && !DONE.includes(c.status)).map((c) => c.index);
+    if (!indices.length) {
+      toast('选中的切片都已经投过了 —— 没有需要新投的（要重投得先在 B站 删除对应分P）', 8000);
+      return;
+    }
     btn.disabled = true; btn.textContent = '提交中…';
     try {
       const r = await api(`/api/task/${encodeURIComponent(state.activeId)}/approve`, { method: 'POST', body: { indices } });
       const mode = state.bootstrap.mode.isOnlySelf ? '（仅自己可见）' : '';
-      toast(`已提交 ${r.count} 个切片${mode}，按 ${fmtSpan(state.bootstrap.config.publish.clipGapSec)}间隔加入排期`, 5000);
+      toast(`已提交 ${r.count ?? indices.length} 个切片${mode}，按 ${fmtSpan(state.bootstrap.config.publish.clipGapSec)}间隔加入排期`, 5000);
       setTimeout(() => refreshAll(true), 1500);
     } catch (e) {
       const problems = e.payload && e.payload.problems;
@@ -1778,11 +1821,11 @@ function bindDetail() {
         toast('发布前校验未通过：' + problems.join('；'), 10000);
       } else if (e.csrfFailure) {
         // api() 已经自动换过 token 并重试过一次，仍失败说明服务刚重启
-        toast('服务刚重启，安全令牌已自动更新 —— 请再点一次「加入排期并发布」', 6000);
+        toast('服务刚重启，安全令牌已自动更新 —— 请再点一次投稿按钮', 6000);
       } else {
         toast('发布失败：' + e.message, 8000);
       }
-      btn.disabled = false; btn.textContent = '加入排期并发布';
+      btn.disabled = false; btn.textContent = `投稿选中的 ${indices.length} 个切片`;
     }
   };
   updateSelectedCount();
@@ -2139,6 +2182,22 @@ function tombstoneDetails(tombstones) {
       state.lastCopy = r.timeline;
     } catch (e) { toast('读取报告失败：' + e.message); }
   });
+  /* 清空历史错误事件：只清 errors.jsonl 的历史（默认先留档），不影响后续记录，也不动报告文件。
+     二次确认要把这两点讲清楚 —— 否则用户会以为"清空 = 以后再出错也不报了"。 */
+  $$('[data-act="clear-errors"]').forEach((b) => b.onclick = async () => {
+    const okGo = confirm(
+      '清空历史错误事件（errors.jsonl）吗？\n\n' +
+      '· 原文会先留档到 data/error-archive/，需要时仍可 grep 出来；\n' +
+      '· 只清历史：之后的错误照常记录，error-report/ 里已生成的报告文件也不动。'
+    );
+    if (!okGo) return;
+    b.disabled = true;
+    try {
+      const r = await api('/api/errors/clear', { method: 'POST', body: { confirm: true } });
+      toast(r.note || `已清空 ${r.removed} 条历史错误`, 9000);
+      setTimeout(() => renderHealth(box), 400);
+    } catch (e) { toast('清空失败：' + e.message, 8000); b.disabled = false; }
+  });
   /* 解除墓碑：这是「允许同一内容再投一次」的唯一开关，必须二次确认，
      且确认文案要把不可逆的后果讲清楚（本地解除不会让旧稿件消失）。 */
   $$('[data-act="releasetomb"]').forEach((b) => b.onclick = async () => {
@@ -2156,6 +2215,19 @@ function tombstoneDetails(tombstones) {
       setTimeout(() => renderHealth(box), 400);
     } catch (e) { toast('解除失败：' + e.message, 6000); b.disabled = false; }
   });
+
+  /* 立即跑一次自动核对（每天也会自动跑，这里是"等不及/想立刻看结果"的入口）。
+     不需要二次确认：它只解除**确实查不到**的（含已锁定读不到的），证据不足的一律保留。 */
+  $('[data-act="reconciletomb"]').onclick = async () => {
+    const b = $('[data-act="reconciletomb"]');
+    b.disabled = true;
+    toast('正在核对墓碑（要拉几份稿件详情，稍等）…', 8000);
+    try {
+      const r = await api('/api/tombstones/reconcile', { method: 'POST' });
+      toast(r.note || '核对完成', 12000);
+      setTimeout(() => renderHealth(box), 500);
+    } catch (e) { toast('核对失败：' + e.message, 8000); b.disabled = false; }
+  };
 }
 
 /* ============================================================================
@@ -2651,6 +2723,62 @@ async function renderCost(box) {
 
 let perfAutoTried = false;
 let perfLastRefresh = null;
+/* 「稿件已不存在」的行默认不显示；用户想核对时可以展开（见 renderPerf 里的说明） */
+let perfShowGone = false;
+/* ★ 2026-10-08 用户要求：「这里的排序 可以改成可选的吗 比如稿件时间 播放 点赞 等」。
+   字段与方向都记进 localStorage，刷新后保持（取不到就当默认"播放降序"，绝不因为存储异常而白屏）。 */
+const PERF_SORTS = [
+  { key: 'view', label: '播放' },
+  { key: 'like', label: '点赞' },
+  { key: 'coin', label: '投币' },
+  { key: 'favorite', label: '收藏' },
+  { key: 'danmaku', label: '弹幕' },
+  { key: 'llmScore', label: 'LLM 评分' },
+  { key: 'publishedAt', label: '发布时间' },
+  { key: 'statDate', label: '数据日期' },
+];
+const perfStore = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* 隐私模式等，忽略 */ } },
+};
+let perfSort = (() => {
+  const v = perfStore.get('liveauto.perfSort', 'view');
+  return PERF_SORTS.some((s) => s.key === v) ? v : 'view';
+})();
+let perfSortAsc = perfStore.get('liveauto.perfSortAsc', '0') === '1';
+
+/** 时间字段解析：接口给的是本地时间字符串（`YYYY-MM-DD HH:MM:SS` 或 `YYYY-MM-DD`）。
+ *  直接 `Date.parse('2026-10-07 23:33:13')` 在部分环境下不可靠，统一把空格换成 `T` 再解析；
+ *  解析不出来就当"没有这个字段"（排序时沉底），绝不因为一条脏数据把整列排序搞乱。 */
+function perfTimeMs(v) {
+  const s = String(v ?? '').trim();
+  if (!s || s === '—') return undefined;
+  const t = Date.parse(s.includes('T') ? s : s.replace(' ', 'T'));
+  return Number.isFinite(t) ? t : undefined;
+}
+
+/** 按当前选择给行排序。
+ *  两条规矩：① **没有该字段的行永远沉底**（未拉取/取不到的行在升序时会跑到最上面，
+ *  把真正有数据的稿件盖住）；② 同值时用播放兜底，保证顺序稳定、不会每次重画都跳。 */
+function sortPerfRows(rows) {
+  const key = perfSort;
+  const dir = perfSortAsc ? 1 : -1;
+  const valueOf = (r) => {
+    const raw = r[key];
+    if (key === 'publishedAt' || key === 'statDate') return perfTimeMs(raw);
+    return typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined;
+  };
+  return [...rows].sort((a, b) => {
+    const va = valueOf(a);
+    const vb = valueOf(b);
+    if (va === undefined && vb === undefined) return 0;
+    if (va === undefined) return 1;
+    if (vb === undefined) return -1;
+    if (va === vb) return (Number(b.view) || 0) - (Number(a.view) || 0);
+    return (va - vb) * dir;
+  });
+}
+const perfSortLabel = () => PERF_SORTS.find((s) => s.key === perfSort)?.label ?? '播放';
 async function renderPerf(box) {
   const p = await api('/api/performance');
   /* 首次打开这一页、且「知道有稿件但一条统计都没拉到」时，自动跑一次回流再重画。
@@ -2672,6 +2800,15 @@ async function renderPerf(box) {
   }
   const failed = (perfLastRefresh && perfLastRefresh.failed) || [];
   const corrTotal = p.correlation.reduce((a, c) => a + Number(c.count || 0), 0);
+  /* ★ 2026-10-07 用户报「已删除的文件 不进行显示」：B站 上已经不存在的稿件（接口的 gone 标记）
+     默认不出现在列表里。为什么不一删了之：这种行会堆满整张表（实测一次列出十几条
+     「稿件已不存在」），把真正有数据的稿件全挤到下面；但也不能静默吞掉 —— 计数、说明与
+     「显示它们」按钮都留着，想核对时一键展开。判据只用接口给的 gone（多分P 中任一P 回流到
+     「稿件已不存在」就会带上），UI 不自己猜。 */
+  const live = p.rows.filter((r) => !r.gone);
+  const goneRows = p.rows.filter((r) => r.gone);
+  const shown = sortPerfRows(perfShowGone ? p.rows : live);
+  const livePartTotal = live.reduce((a, r) => a + (Number(r.partCount) || 1), 0);
   box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">稿件表现统计（近 30 天）</h2>
     <div class="card"><h2>LLM 评分 vs 实际播放（相关性，非因果）</h2>
       ${corrTotal ? `<table class="tbl"><thead><tr><th>评分档</th><th>稿件数</th><th>平均播放</th></tr></thead><tbody>
@@ -2679,17 +2816,43 @@ async function renderPerf(box) {
       </tbody></table>` : `<div class="empty">这一档还统计不了：需要「既有 LLM 评分、又拉到了播放数据」的稿件。
         ${Number(p.pulledTotal || 0) > 0 ? `现在有 ${p.pulledTotal} 个稿件有播放数据，但它们的分P 任务是早期投的（评分没有落进表现数据）；新投的稿件会自动带上评分。` : '先让一场直播跑完投稿，再回来刷新。'}</div>`}
       <p class="hintline">${esc(p.note)}</p></div>
-    <div class="card"><h2>已发布稿件表现（按播放降序）<span class="ai-tag">${p.archiveTotal ?? 0} 个稿件 · ${p.partTotal ?? 0} 个分P · 已拉到数据 ${p.pulledTotal ?? 0} 个</span></h2>
-      ${p.rows.length ? `<table class="tbl"><thead><tr><th>标题</th><th>评分</th><th>播放</th><th>点赞</th><th>投币</th><th>收藏</th><th>弹幕</th><th>数据日期</th></tr></thead><tbody>
-      ${p.rows.map((r) => `<tr><td><a href="${esc(r.url)}" target="_blank" rel="noreferrer">${esc(r.title)}</a>${r.gone ? ' <span class="tag-mini">稿件已不存在</span>' : ''}${r.unavailable ? ` <span class="tag-mini">${esc(r.unavailable)}</span>` : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${Number(r.partCount) > 1 ? ` <span class="ai-tag">同一稿件 ${r.partCount} 个分P</span>` : ''}</td>
+    <div class="card"><h2>已发布稿件表现（按${perfSortLabel()}${perfSortAsc ? '升序' : '降序'}）<span class="ai-tag">${live.length} 个在库稿件 · ${livePartTotal} 个分P · 已拉到数据 ${p.pulledTotal ?? 0} 个${goneRows.length ? ` · ${perfShowGone ? `含 ${goneRows.length} 个已删除` : `已隐藏 ${goneRows.length} 个已删除`}` : ''}</span>
+      <span style="margin-left:auto;font-weight:400;font-size:12.5px;color:var(--text-2);display:inline-flex;align-items:center;gap:6px">排序
+        <select id="perfSortKey" class="inp" style="width:auto;padding:3px 8px;font-size:12.5px">
+          ${PERF_SORTS.map((s) => `<option value="${s.key}"${s.key === perfSort ? ' selected' : ''}>${esc(s.label)}</option>`).join('')}
+        </select>
+        <button class="btn-sm" id="perfSortDir" title="切换升序/降序">${perfSortAsc ? '↑ 升序' : '↓ 降序'}</button>
+      </span></h2>
+      ${shown.length ? `<table class="tbl"><thead><tr><th>标题</th><th>评分</th><th>播放</th><th>点赞</th><th>投币</th><th>收藏</th><th>弹幕</th><th title="这个稿件最近一次投出切片的时间（同稿件多分P 取最近）">发布时间</th><th>数据日期</th></tr></thead><tbody>
+      ${shown.map((r) => `<tr><td><a href="${esc(r.url)}" target="_blank" rel="noreferrer">${esc(r.title)}</a>${r.gone ? ' <span class="tag-mini">稿件已不存在</span>' : ''}${r.unavailable ? ` <span class="tag-mini">${esc(r.unavailable)}</span>` : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${Number(r.partCount) > 1 ? ` <span class="ai-tag">同一稿件 ${r.partCount} 个分P</span>` : ''}</td>
         <td class="num">${r.llmScore === undefined ? '—' : Number(r.llmScore).toFixed(1)}</td><td class="num">${r.view ?? '—'}</td><td class="num">${r.like ?? '—'}</td>
         <td class="num">${r.coin ?? '—'}</td><td class="num">${r.favorite ?? '—'}</td><td class="num">${r.danmaku ?? '—'}</td>
+        <td class="mono-sm">${esc(r.publishedAt || '—')}</td>
         <td class="mono-sm">${esc(r.statDate || (r.gone ? '已删除' : r.unavailable ? '取不到' : '未拉取'))}</td></tr>`).join('')}
       </tbody></table>
-      <p class="hintline">多分P 模式下同一稿件的各分P 共享稿件总播放，所以按稿件（bvid）列一行；「同一稿件 N 个分P」标出它的规模。播放数为 0 以前是「接口没取到」，现在只有真取到才写数字，取不到会标出原因。</p>` : `<div class="empty">还没有可统计的稿件。${Number(p.archiveTotal || 0) > 0
-        ? '有稿件但一条都没拉到：展开「健康面板 → 刷新稿件表现数据」重试。'
-        : '切片要先投出去并拿到 bvid（多分P 续传成功后自动写入），然后才会出现在这里。'}</div>`}
+      <p class="hintline">多分P 模式下同一稿件的各分P 共享稿件总播放，所以按稿件（bvid）列一行；「同一稿件 N 个分P」标出它的规模。播放数为 0 以前是「接口没取到」，现在只有真取到才写数字，取不到会标出原因。</p>` : `<div class="empty">还没有可统计的稿件。${goneRows.length && !live.length
+        ? `现存的稿件一个都没有 —— 已隐藏 ${goneRows.length} 个在 B站 上已不存在的（点下面的「显示它们」可核对）。`
+        : Number(p.archiveTotal || 0) > 0
+          ? '有稿件但一条都没拉到：展开「健康面板 → 刷新稿件表现数据」重试。'
+          : '切片要先投出去并拿到 bvid（多分P 续传成功后自动写入），然后才会出现在这里。'}</div>`}
+      ${goneRows.length ? `<p class="hintline">已隐藏 ${goneRows.length} 个 B站 上已不存在的稿件（被删或下架，取不到任何数据）：<button class="linkbtn" id="perfGoneToggle">${perfShowGone ? '收起它们' : '显示它们'}</button></p>` : ''}
       ${failed.length ? `<p class="hintline">上次回流有 ${failed.length} 个稿件取不到统计：${failed.map((f) => `${esc(f.bvid)}（${esc(String(f.error).slice(0, 60))}）`).join('、')}</p>` : ''}</div>`;
+  /* 「显示它们 / 收起它们」与排序选择器是这张卡里的两个事件，就地绑定（与其它卡片的写法一致）。
+     排序改完**整页重画**：只是重新排一遍，API 数据没变（多一次本地 GET，可忽略）。 */
+  const goneToggle = box.querySelector('#perfGoneToggle');
+  if (goneToggle) goneToggle.addEventListener('click', () => { perfShowGone = !perfShowGone; renderPerf(box); });
+  const sortSel = box.querySelector('#perfSortKey');
+  if (sortSel) sortSel.onchange = () => {
+    perfSort = PERF_SORTS.some((s) => s.key === sortSel.value) ? sortSel.value : 'view';
+    perfStore.set('liveauto.perfSort', perfSort);
+    renderPerf(box);
+  };
+  const sortDir = box.querySelector('#perfSortDir');
+  if (sortDir) sortDir.onclick = () => {
+    perfSortAsc = !perfSortAsc;
+    perfStore.set('liveauto.perfSortAsc', perfSortAsc ? '1' : '0');
+    renderPerf(box);
+  };
 }
 
 async function renderPrompts(box) {

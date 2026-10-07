@@ -28,7 +28,7 @@ const HEADED = process.argv.includes('--headed');
 const BASE = 'http://127.0.0.1:3000';
 const PORT = 9333;
 const SHOT_DIR = path.join(ROOT_DIR, 'data', 'ui-shots');
-const UI_BUILD_EXPECTED = 'ui-2026-10-07-task-multiselect';
+const UI_BUILD_EXPECTED = 'ui-2026-10-08-perf-pubdate';
 
 let pass = 0;
 let fail = 0;
@@ -1156,8 +1156,16 @@ async function main(): Promise<void> {
         other: sameVolume(otherVolFile, path.join(ROOT_DIR, 'data', 'trash')),
       };
       ok('夹具分流正确（同盘夹具真的同盘、异盘夹具真的异盘）', vol.same === true && vol.other === false, JSON.stringify(vol));
-      const dueAt = new Date(Date.now() + 30 * 60_000).toISOString(); // 排在真实条目**前面**，才能进监控面板的前 5 行
       const rawPd = fs.existsSync(pdPath) ? JSON.parse(fs.readFileSync(pdPath, 'utf8')) : { version: 1, entries: [] };
+      /* ★ dueAt 必须排在**所有真实条目**前面：监控面板的待删表只渲染前 5 行，
+         而清单里随时可能有真实条目（实测 2026-10-07 深夜：刚投出来的成片也进了清单，
+         它的 dueAt 比"now+30 分钟"早，于是把夹具挤出前 5 行 → 本节整段红）。
+         取"现有条目里最早的 dueAt 再早 1 分钟"，清单为空时才用 now+30 分钟。 */
+      const existingDue = (rawPd.entries ?? [])
+        .map((e: { dueAt?: string }) => Date.parse(String(e.dueAt ?? '')))
+        .filter((n: number) => Number.isFinite(n));
+      const earliestDue = existingDue.length ? Math.min(...existingDue) : Date.now() + 30 * 60_000;
+      const dueAt = new Date(Math.min(earliestDue - 60_000, Date.now() - 60_000)).toISOString();
       sameVolId = `pd-uie2e-same-${Date.now()}`;
       const otherVolId = `pd-uie2e-other-${Date.now()}`;
       rawPd.entries = (rawPd.entries ?? []).concat([
@@ -1199,7 +1207,10 @@ async function main(): Promise<void> {
           const rows = await cdp.evalJs<{ total: number; withDel: number; hasAll: boolean; firstTag: string }>(`(() => {
             const body = document.querySelector('#infoBody');
             const btns = body ? body.querySelectorAll('[data-pending-del]') : [];
-            const row = btns[0] ? btns[0].closest('.row') : null;
+            /* 认**自己那条夹具**而不是"第一行"：清单里随时有真实条目（刚投出来的成片也会进），
+               按位置取会把真实条目当成夹具去断言它的删法标注。 */
+            const own = body ? body.querySelector('[data-pending-del="${sameVolId}"]') : null;
+            const row = own ? own.closest('.row') : (btns[0] ? btns[0].closest('.row') : null);
             return {
               total: body ? body.querySelectorAll('.timeline .row').length : 0,
               withDel: btns.length,

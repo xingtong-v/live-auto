@@ -208,7 +208,16 @@ async function main(): Promise<void> {
       const visibleRows = await cdp.evalJs<number>(
         `(() => [...document.querySelectorAll('#otherPage .tbl tbody tr')].filter((tr) => tr.offsetParent !== null).length)()`,
       );
-      ok(`★ 一眼能看到的表格行数很少（实际 ${visibleRows} 行）`, visibleRows <= 12, `可见 ${visibleRows} 行`);
+      /* ★ 这条断言原本数的是**整页**的表格行，随着面板长出别的表（正在录制、依赖、墓碑清单…）
+         就变成了"数据一变就红"的脆弱断言 —— 实测 2026-10-07 报了 17 行，其中 12 行是这张表、
+         其余是别的卡片。所以拆成两条：这张表的 12 行上限（设计意图）+ 整页别太离谱（防噪音）。 */
+      const notableRows = await cdp.evalJs<number>(
+        `(() => { const h = [...document.querySelectorAll('#otherPage h3')].find((x) => String(x.textContent).includes('上一轮对每个文件的结论'));
+           if (!h) return -1; const t = h.nextElementSibling; if (!t || t.tagName !== 'TABLE') return 0;
+           return [...t.querySelectorAll('tbody tr')].filter((tr) => tr.offsetParent !== null).length; })()`,
+      );
+      ok(`★ 「上一轮结论」那张表最多 12 行（实际 ${notableRows} 行）`, notableRows >= 0 && notableRows <= 12, `实际 ${notableRows} 行`);
+      ok(`整页可见表格行数不至于成为一堵墙（实际 ${visibleRows} 行）`, visibleRows <= 24, `可见 ${visibleRows} 行`);
 
       const headerText = await cdp.evalJs<string>(
         `(() => { const h = document.querySelector('[data-g="health-imported"]'); return h ? h.textContent.replace(/\\s+/g, ' ').trim() : ''; })()`,

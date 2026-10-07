@@ -830,6 +830,43 @@ export function errorCountLastHours(hours: number, now: number = Date.now()): nu
   return readErrorEvents({ sinceMs: since }).length;
 }
 
+/**
+ * 清空**历史**错误事件（`data/errors.jsonl`）。
+ *
+ * 为什么需要它：这份文件是同步追加、几乎不会丢的（见 `writeErrorReport` 的说明），
+ * 所以它会一直攒着 —— 实测 2026-10-07 健康面板的「最近错误事件」里躺着 **12 条两周前**
+ * （09-22/23）的记录，全是当时还没切到本地 ASR 时的付费闸门与云端接口错误，与现状无关，纯占版面。
+ *
+ * 两条边界：
+ *  1. **默认留档再清**：现有内容原样搬到 `data/error-archive/errors-<时间戳>.jsonl` 再截断，
+ *     所以"清空"永远可回溯（事后仍能 grep 出当初发生了什么）；
+ *  2. **只清历史**：不影响之后新产生的错误，也不动 `error-report/` 里已生成的报告文件。
+ */
+export function clearErrorEvents(opts: { archive?: boolean; archiveDir?: string } = {}): {
+  removed: number;
+  bytes: number;
+  archivedTo?: string;
+} {
+  const file = getErrorsPath();
+  if (!fs.existsSync(file)) return { removed: 0, bytes: 0 };
+  const raw = fs.readFileSync(file, 'utf8');
+  const removed = raw.split(/\r?\n/).filter((l) => l.trim()).length;
+  const bytes = Buffer.byteLength(raw, 'utf8');
+  let archivedTo: string | undefined;
+  if (opts.archive !== false && removed > 0) {
+    const dir = opts.archiveDir ?? path.join(path.dirname(file), 'error-archive');
+    fs.mkdirSync(dir, { recursive: true });
+    archivedTo = path.join(dir, `errors-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
+    fs.writeFileSync(archivedTo, raw, 'utf8');
+  }
+  fs.writeFileSync(file, '', 'utf8');
+  globalLog.warn(`已清空历史错误事件：${removed} 条（${bytes} 字节）${archivedTo ? `，已留档 ${archivedTo}` : '，未留档'}`, {
+    mod: 'errors',
+    data: { removed, bytes, ...(archivedTo ? { archivedTo } : {}) },
+  });
+  return { removed, bytes, ...(archivedTo ? { archivedTo } : {}) };
+}
+
 /** reportId → 报告文件绝对路径（只允许安全字符，防目录穿越） */
 export function reportPathOf(reportId: string): string {
   const safe = String(reportId)

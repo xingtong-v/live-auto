@@ -160,6 +160,71 @@ const html = fs.readFileSync(htmlPath, 'utf8');
   ok('★ 工具条有「全选已发布」（用户点名要删的就是这类）', /data-multi="pub"/.test(html) && /全选已发布/.test(html));
   ok('★ 删除按钮把"删几个"写在脸上', /data-multi="del"[^>]*>删除选中（\$\{n\}）/.test(html));
   ok('选择状态只在当前可见列表里维护（切筛选不会误删看不见的）', /visible\.has\(id\)[\s\S]{0,80}state\.multi\.sel\.delete\(id\)/.test(html));
+
+  /* 单片投稿（用户原话「7.2 分的这个 是我自己觉得不错 点的对号 想投稿 但是没有进行投稿的选项」）。
+     规则：① 每张候选卡片上有「投稿这一片」；② 批量按钮把"还能投几个"写在脸上；
+           ③ 判据与 server/publish.ts 一致 —— 已投过的（含「已提交待确认」）不再进批次，
+              否则会靠 B站 分P 列表（约 20 分钟延迟）去重，延迟窗口内重投就留下重复分P。 */
+  ok('★ 候选卡片上有「投稿这一片」按钮', /data-act="publish-this"/.test(html) && /投稿这一片/.test(html));
+  ok(
+    '★ 只有"选了 + 没被墓碑拦 + 还没投过"的卡片才给这个按钮',
+    /const canPublishThis = !!c\.selected && !tomb && !DONE_STATUSES\.includes\(c\.status\)/.test(html),
+  );
+  ok(
+    '★ 判据把「已提交待确认」也算投过（不靠 B站 列表延迟去重）',
+    /const DONE_STATUSES = \['PUBLISHED', 'SUBMITTED', 'SUBMITTING', 'SKIPPED'\]/.test(html) &&
+      /const DONE = \['PUBLISHED', 'SUBMITTED', 'SUBMITTING', 'SKIPPED'\]/.test(html),
+  );
+  ok('★ 批量按钮把"还能投几个"写在文案里', /投稿选中的 \$\{publishable\.length\} 个切片/.test(html));
+  ok('★ 已投过的数量单独说明（免得用户以为漏投了）', /其中 \$\{alreadyDone\.length\} 个已投过，不会重复投/.test(html));
+  ok(
+    '★ 提交时只带"还没投过"的索引（单片与批量同一条路径）',
+    /const indices = state\.detail\.clips\.filter\(\(c\) => c\.selected && !DONE\.includes\(c\.status\)\)\.map\(\(c\) => c\.index\)/.test(html),
+  );
+  ok('一个都不剩时给出人话提示（而不是静默什么都不做）', /选中的切片都已经投过了/.test(html));
+
+  /* 清空历史错误事件（用户 2026-10-07：「清掉这 12 条历史错误」）。规则：
+     ① 卡片头给「清空历史错误」入口 + 超过 7 天的条数；② 二次确认必须讲清"先留档 / 只清历史"。 */
+  ok('★ 错误卡片有「清空历史错误」按钮', /data-act="clear-errors"/.test(html) && /清空历史错误/.test(html));
+  ok('卡片头标出"超过 7 天"的条数（让人知道这是陈年旧账）', /其中 \$\{old\} 条超过 7 天/.test(html));
+  ok(
+    '★ 二次确认讲清了"先留档 + 只清历史"',
+    /原文会先留档到 data\/error-archive\//.test(html) && /之后的错误照常记录/.test(html),
+  );
+  ok('走的是带 confirm 的接口', /api\/errors\/clear'[\s\S]{0,60}confirm: true/.test(html));
+
+  /* 稿件表现列表的排序可选（用户 2026-10-08：「这里的排序 可以改成可选的吗 比如稿件时间 播放 点赞 等」）。
+     规则：① 选择器列出播放/点赞/投币/收藏/弹幕/评分/发布时间/数据日期；② 方向可切；
+           ③ **缺失该字段的行永远沉底**（否则升序时"未拉取/取不到"会顶到最上面，把有数据的盖住）；
+           ④ 选择记进 localStorage；⑤ 抬头文案跟着变。 */
+  ok('★ 表现列表有排序选择器', /id="perfSortKey"/.test(html) && /PERF_SORTS\.map/.test(html));
+  ok(
+    '可选字段含播放/点赞/投币/收藏/弹幕/评分/发布时间/数据日期',
+    ['播放', '点赞', '投币', '收藏', '弹幕', 'LLM 评分', '发布时间', '数据日期'].every((t) => html.includes(`label: '${t}'`)),
+  );
+  ok('★ 缺失该字段的行永远沉底（升序也不许把"未拉取"顶到最上面）', /if \(va === undefined\) return 1;/.test(html) && /if \(vb === undefined\) return -1;/.test(html));
+  ok('同值时用播放兜底（顺序稳定，不来回跳）', /if \(va === vb\) return \(Number\(b\.view\) \|\| 0\) - \(Number\(a\.view\) \|\| 0\)/.test(html));
+  ok('方向可切换', /id="perfSortDir"/.test(html) && /perfSortAsc = !perfSortAsc/.test(html));
+  ok('★ 选择有记忆（localStorage，刷新后保持）', /liveauto\.perfSort/.test(html) && /liveauto\.perfSortAsc/.test(html));
+  ok('存储读不到时安全回退（隐私模式不白屏）', /catch \{ return d; \}/.test(html));
+  ok('抬头文案跟着选择走', /已发布稿件表现（按\$\{perfSortLabel\(\)\}/.test(html));
+  /* ★ 2026-10-08 用户报「发布时间时 没有正确排序」：根因是**这一列在接口里恒为空**
+     （旧代码只从台账切片取，任务一删切片记录就没了；实测 23 行 0 行有值）。
+     所以除了排序逻辑本身，还要锁住"列能看见 + 服务端读的是真实时间 + 回流把它落进历史"。 */
+  ok('★ 表现表里有「发布时间」列（否则按它排序等于看不见）', /<th title="这个稿件最近一次投出切片的时间（同稿件多分P 取最近）">发布时间<\/th>/.test(html));
+  ok('表格渲染了发布时间单元格', /<td class="mono-sm">\$\{esc\(r\.publishedAt \|\| '—'\)\}<\/td>/.test(html));
+  ok('时间解析统一（空格换 T，解析不出来当没有）', /function perfTimeMs\(/.test(html) && /s\.replace\(' ', 'T'\)/.test(html));
+  const serverSrc = fs.readFileSync(path.join(ROOT_DIR, 'src', 'server.ts'), 'utf8');
+  ok(
+    '★ 服务端优先用真实投出时间 publishedAt，没有才退回计划时间 dtime',
+    /const iso = agg\?\.publishedAt;/.test(serverSrc) && /return agg\?\.dtime \? fmtLocal\(agg\.dtime \* 1000\) : undefined;/.test(serverSrc),
+  );
+  const daemonSrc = fs.readFileSync(path.join(ROOT_DIR, 'src', 'daemon.ts'), 'utf8');
+  ok('回流取的是 B站 的 View.pubdate（没有才用 ctime）', /detail\.View\?\.pubdate \?\? detail\.View\?\.ctime/.test(daemonSrc));
+  ok('★ 任务被删也不丢：回流把 pubdate 写进 performance.jsonl', /\.\.\.\(pubdate !== undefined \? \{ pubdate \} : \{\}\)/.test(daemonSrc));
+  const ledgerSrc = fs.readFileSync(path.join(ROOT_DIR, 'src', 'ledger.ts'), 'utf8');
+  ok('台账把 pubdate 存进表现历史', /'pubdate',/.test(ledgerSrc));
+  ok('★ 缺 pubdate 的当日记录允许再拉一次（新增字段的一次性补齐）', /const lacksPubdate =/.test(ledgerSrc));
   ok('引用了批量删除接口', html.includes(`'/api/task/delete-batch'`));
   /* confirm() 是纯文本弹窗：HTML 标签与 markdown 星号会原样显示（踩过） */
   const batchAt = html.indexOf("async function openBatchDeleteDialog");

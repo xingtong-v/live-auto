@@ -27,6 +27,7 @@ import { Orchestrator } from '../src/daemon.ts';
 import { UiServer } from '../src/server.ts';
 import { Publisher } from '../src/publish.ts';
 import { loadConfig } from '../src/config.ts';
+import { ROOT_DIR } from '../src/util.ts';
 import type { ClipRecord, TaskRecord } from '../src/types.ts';
 
 let pass = 0;
@@ -68,6 +69,10 @@ const cfg = loadConfig('config.json').config;
 const now = new Date().toISOString();
 const nowMs = Date.now();
 const today = new Date().toLocaleDateString('sv-SE'); // YYYY-MM-DD（与台账 fmtDate 同口径）
+/** 稿件发布时间（unix 秒）：2026-09-24 20:00 本地（固定值，断言好写）。真实 B站 详情里有 `View.pubdate`。 */
+const PUBDATE = Math.floor(Date.parse('2026-09-24T20:00:00+08:00') / 1000);
+/** 让它返回的详情**不带** pubdate（复现"老记录缺这个字段"的一次性补齐） */
+let omitPubdateBvid = '';
 const yesterday = new Date(Date.now() - 86400_000).toLocaleDateString('sv-SE');
 const longAgo = new Date(Date.now() - 40 * 86400_000).toLocaleDateString('sv-SE');
 
@@ -146,9 +151,26 @@ section('① 回流候选判据：只要「投出去了且知道 bvid」就该�
   ok('已判定稿件不存在（archiveGoneAt）的跳过', !got.includes('BV1PERF00003'), JSON.stringify(got));
   ok('超出近 30 天窗口的不拉', !got.includes('BV1PERF00009'), JSON.stringify(got));
 
-  /* 当天已拉过的 bvid 不再拉（每天一次，只读接口也要省着打） */
-  ledger.recordPerformance({ bvid: 'BV1PERF00001', date: today, view: 111 });
+  /* 当天已拉过的 bvid 不再拉（每天一次，只读接口也要省着打）。
+     ★ 记录要写**完整**（带上 pubdate）：从 2026-10-08 起"今天拉过但缺 pubdate"的行允许再拉一次
+     （新增字段的一次性补齐，见 ledger.bvidsNeedingPerformance），缺字段的记录不算"拉过"。 */
+  ledger.recordPerformance({ bvid: 'BV1PERF00001', date: today, view: 111, pubdate: PUBDATE });
   eq('当天已回流过的 bvid 被跳过', ledger.bvidsNeedingPerformance(30).map((x) => x.bvid), ['BV1PERF00002']);
+  /* 反过来：今天拉过、但**缺 pubdate** 的记录要被再拉一次（否则表现页的「发布时间」会一直空到明天） */
+  ledger.recordPerformance({ bvid: 'BV1PERF00002', date: today, view: 222 });
+  eq(
+    '★ 缺 pubdate 的当日记录会被再拉一次（一次性补齐）',
+    ledger.bvidsNeedingPerformance(30).map((x) => x.bvid),
+    ['BV1PERF00002'],
+  );
+  /* 已消失（gone）/ 已锁定（unavailable）的稿件不参与补齐：它们本来就没有可见的发布时间，
+     免得天天白拉。写一条 gone 记录，它照旧被"已判定不存在"这条规则跳过。 */
+  ledger.recordPerformance({ bvid: 'BV1PERF00002', date: today, gone: true });
+  eq(
+    '已消失的稿件不因为"缺 pubdate"而反复重拉',
+    ledger.bvidsNeedingPerformance(30).map((x) => x.bvid),
+    [],
+  );
 
   /* 历史行不该挡住今天的回流：换一本干净台账，只写一条很早以前的记录 */
   const ledgerHist = new Ledger({ path: path.join(mkDir('l1b'), 'ledger.json') });
@@ -238,7 +260,9 @@ section('② 真 Publisher：续传成功 ⇒ 切片记 PUBLISHED（否则回流
         detailCalls++;
         const base = [{ part: '完整版', duration: 100 }, { part: '纯享版', duration: 100 }];
         const parts = detailCalls === 1 ? base : [...base, { part: '表现测试切片 0', duration: 60 }, { part: '表现测试切片 1', duration: 60 }];
-        return { View: { bvid: 'BV1RESUME001', videos: parts.length, pages: parts } };
+        /* 真实详情里带 `View.pubdate`（稿件发布时间）：表现页的「发布时间」列靠它，
+           桩也要给 —— 不给的话这条记录会被判成"缺字段"，下次回流又拉一遍（见 ledger 的补齐规则）。 */
+        return { View: { bvid: 'BV1RESUME001', videos: parts.length, pages: parts, pubdate: PUBDATE } };
       },
     };
     return new Publisher({ client: client as never, config: cfg, ledger, logger: silentLog as never });
@@ -334,12 +358,15 @@ const MP_STAT = { view: 12345, like: 678, coin: 90, favorite: 123, danmaku: 45, 
       throw new Error('biliLive-tools 内部错误（HTTP 500） —— 啥都木有');
     }
     if (bvid === 'BV1PERFTOP01') {
-      // 兼容路径：万一某个版本把统计挪回顶层，也得能读出来
-      return { stat: { view: 777, like: 7, coin: 0, favorite: 0, danmaku: 0, reply: 0, share: 0 }, View: { bvid } };
+      // 兼容路径：万一某个版本把统计挪回顶层，也得能读出来（pubdate 同样要给，理由见下）
+      return { stat: { view: 777, like: 7, coin: 0, favorite: 0, danmaku: 0, reply: 0, share: 0 }, View: { bvid, pubdate: PUBDATE } };
     }
     const stat = bvid === 'BV1PERFMP001' ? MP_STAT : { view: 500, like: 10, coin: 1, favorite: 2, danmaku: 3, reply: 1, share: 0 };
     const title = bvid === 'BV1PERFMP001' ? '多分P场 稿件标题' : `稿件 ${bvid}`;
-    return { View: { bvid, videos: bvid === 'BV1PERFMP001' ? 6 : 2, title, stat } };
+    /* 真实 B站 详情里**有** `View.pubdate`（稿件发布时间）—— 表现页的「发布时间」列靠它，
+       所以桩也要给；`omitPubdateBvid` 用来复现"老记录缺这个字段"的一次性补齐。 */
+    const pubRaw = bvid === omitPubdateBvid ? undefined : PUBDATE;
+    return { View: { bvid, videos: bvid === 'BV1PERFMP001' ? 6 : 2, title, stat, ...(pubRaw ? { pubdate: pubRaw } : {}) } };
   },
 };
 
@@ -444,6 +471,24 @@ const get = async (p: string): Promise<Record<string, unknown>> => {
     jsonl.join(' | ').slice(0, 400),
   );
   ok('消失稿件落的是 gone:true', jsonl.some((l) => l.includes('BV1PERFGONE1') && l.includes('"gone":true')), jsonl.join(' | ').slice(0, 400));
+  /* ★ 2026-10-08 用户报「发布时间时 没有正确排序」：根因是这一列**在接口里恒为空**
+     （旧代码只从台账切片取，而任务一删切片记录就没了）。修法：把 B站 的稿件发布时间
+     随统计一起落进 performance.jsonl。 */
+  ok('★ 落盘行带上了稿件发布时间 pubdate', jsonl.some((l) => l.includes('BV1PERFMP001') && l.includes('"pubdate"')), jsonl.join(' | ').slice(0, 300));
+  ok('页面行也给出可排序的 publishedAt（本地时间串）', typeof rows.find((x) => x['bvid'] === 'BV1PERFMP001')?.['publishedAt'] === 'string', JSON.stringify(rows[0]).slice(0, 200));
+
+  /* ★ 一次性自愈：**当天已拉过、但缺 pubdate** 的正常稿件允许再拉一次
+     （新增字段要补齐，否则"发布时间"会一直空到明天）。
+     模拟方式：直接写一条**老格式**的当日记录（没有 pubdate）—— 判据看的是落盘记录，不是桩。 */
+  ledger.recordPerformance({ bvid: 'BV1PERFSG001', date: today, view: 1 });
+  const rBackfill = await post('/api/performance/refresh');
+  eq('★ 缺 pubdate 的当日记录会被再拉一次（不是被"今天拉过"挡住）', rBackfill['checked'], 1);
+  eq('它确实打了一次详情接口', detailCalls, 7);
+  const afterBackfill = await get('/api/performance');
+  const sg = (afterBackfill['rows'] as Array<Record<string, unknown>>).find((x) => x['bvid'] === 'BV1PERFSG001');
+  ok('★ 补齐后这一行就有发布时间可排序了', typeof sg?.['publishedAt'] === 'string', JSON.stringify(sg).slice(0, 200));
+  const rBackfill2 = await post('/api/performance/refresh');
+  eq('补齐后立刻回到"当天不再重复拉"', rBackfill2['checked'], 0);
 
   /* ★ 台账被清空之后，页面仍然出得来（这就是用户当天批量删任务后的场景） */
   for (const t of ['perf-t3-mp', 'perf-t3-single', 'perf-t3-top', 'perf-t3-lock', 'perf-t3-gone', 'perf-t3-old']) {
@@ -457,6 +502,29 @@ const get = async (p: string): Promise<Record<string, unknown>> => {
   eq('评分也仍在（相关性表不至于因为删任务而空掉）', rowsDelete.find((x) => x['bvid'] === 'BV1PERFMP001')?.['llmScore'], 9.3);
   const r3 = await post('/api/performance/refresh');
   eq('删任务后同一天不重复拉：候选仍为 0', r3['checked'], 0);
+}
+
+/* ★ 2026-10-07 用户要求「已删除的文件 不进行显示」：B站 上已不存在的稿件默认不出现在表现列表里。
+   为什么在无浏览器的自测里也断言一次：这条规则是**纯前端**的（服务端照旧返回那些行，
+   好让 MCP 等消费者仍拿得到），而真浏览器脚本要开 Edge、改页面时最容易漏掉它。 */
+{
+  const ui = fs.readFileSync(path.join(ROOT_DIR, 'public', 'ui.html'), 'utf8');
+  ok('★ 表现页按 gone 过滤：默认不显示「稿件已不存在」的行', /const live = p\.rows\.filter\(\(r\) => !r\.gone\)/.test(ui));
+  ok('默认是隐藏，不是默认展开', /let perfShowGone = false;/.test(ui));
+  ok(
+    '表格渲染的是过滤后的行（不再直接用 p.rows）',
+    /\$\{shown\.map\(\(r\) =>/.test(ui) && !/\$\{p\.rows\.map\(/.test(ui),
+  );
+  ok('给出「已隐藏 N 个」的计数，不静默吞掉', /已隐藏 \$\{goneRows\.length\} 个/.test(ui));
+  ok('展开时计数文案跟着变（不写「已隐藏」却把行摆出来）', /含 \$\{goneRows\.length\} 个已删除/.test(ui));
+  ok(
+    '提供「显示它们」按钮并可切回',
+    /id="perfGoneToggle"/.test(ui) && /perfShowGone = !perfShowGone; renderPerf\(box\)/.test(ui),
+  );
+  ok('卡片计数改用在库稿件数（列表与计数不打架）', /个在库稿件/.test(ui));
+  /* 隐藏只发生在显示层：服务端照旧把 gone 行交给接口（上面的行为断言已经验过一遍） */
+  const serverSrc = fs.readFileSync(path.join(ROOT_DIR, 'src', 'server.ts'), 'utf8');
+  ok('服务端照旧返回 gone 行（不是靠删数据来隐藏）', /p\?\.gone \? \{ gone: true \}/.test(serverSrc));
 }
 
 ui.stop();
