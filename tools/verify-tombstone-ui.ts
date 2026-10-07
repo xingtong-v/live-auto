@@ -449,8 +449,10 @@ async function main(): Promise<void> {
         .find((c) => String(c.querySelector('h2')?.textContent || '').includes('墓碑'));
       const d = card ? card.querySelector('details') : null;
       if (d) d.open = false;
+      if (card) card.scrollIntoView({ block: 'start' });
       return true;
     })()`);
+    await sleep(300);
     await shot(cdp, '21-tombstone-health-panel');
 
     /* ---- 2b. 自动核对入口（2026-10-07 用户要求「查不到的 自动解除」）----
