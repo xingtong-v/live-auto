@@ -126,6 +126,14 @@ const html = fs.readFileSync(htmlPath, 'utf8');
   ok('★ 仍失败时给人话，而不是英文 fetch 原文', /服务不可达（多半正在重启）/.test(html));
   ok('并把这类错误标出来（network 标记，调用方可区分处理）', /err\.network = true/.test(html));
 
+  /* ★ 墓碑清单默认收起（用户原话「显示的太多了」：60 条平铺一屏，2026-10-08 截图）。
+     同一个教训本项目吃过一次：健康面板「上一轮对每个文件的结论」平铺 35 行也是改成默认收起。
+     用原生 <details>（不带 open = 收起），不依赖自定义折叠的事件绑定。 */
+  ok('★ 墓碑明细默认收起（<details> 不带 open）', /function tombstoneDetails\(/.test(html) && /return `<details>/.test(html));
+  ok('★ 收起状态下也报出条数（不用点开就知道有多少）', /逐条明细（\$\{tombstones\.length\} 条，可单条解除）/.test(html));
+  ok('卡片本体只调用它，不再自己平铺整张表', /\$\{tombstoneDetails\(tombstones\)\}/.test(html));
+  ok('收起不等于不能操作：行内的「解除」按钮仍在明细里', /data-act="releasetomb"/.test(html));
+
   /* 实时监控 ·「目录轮询（为什么某个录播没被导入）」里的「上一轮对每个文件的结论」：
      35 个文件全是「已导入过」时不许平铺 35 行
      （用户截图 + 原话「这里的显示的太多了 而且是导入过的 优化他」）。

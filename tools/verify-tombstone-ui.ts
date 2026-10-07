@@ -401,7 +401,78 @@ async function main(): Promise<void> {
     ok('健康面板有「墓碑」KPI', /墓碑/.test(healthHtml));
     ok('健康面板的墓碑清单里列出了这一条（含原任务 id）', healthHtml.includes(OLD_ID));
     ok('清单里有「解除」按钮', /data-act="releasetomb"/.test(healthHtml));
+
+    /* ★ 明细默认收起（用户原话「显示的太多了」，2026-10-08 截图里 60 条平铺一屏）。
+       静态断言只能看 HTML 文本，这里在真浏览器里问 DOM：details 必须是**收起**的，
+       点开才展开 —— 顺便证明它真的能展开（不是画了个摆设）。 */
+    const tombFold = await cdp.evalJs<{ exists: boolean; open: boolean; summary: string; cardH: number; rows: number }>(`(() => {
+      const card = Array.from(document.getElementById('otherPage').querySelectorAll('.card'))
+        .find((c) => String(c.querySelector('h2')?.textContent || '').includes('墓碑'));
+      if (!card) return { exists: false, open: true, summary: '', cardH: 0, rows: 0 };
+      const d = card.querySelector('details');
+      return {
+        exists: !!d,
+        open: d ? d.open : true,
+        summary: String(d && d.querySelector('summary') ? d.querySelector('summary').textContent : ''),
+        cardH: Math.round(card.getBoundingClientRect().height),
+        rows: card.querySelectorAll('details tr').length,
+      };
+    })()`);
+    ok('★ 墓碑明细用 <details> 包起来（不是平铺整张表）', tombFold.exists);
+    ok('★ 默认收起（open=false）', tombFold.exists && tombFold.open === false, `open=${String(tombFold.open)}`);
+    ok('★ 收起时表头给出条数（不用点开就知道有多少）', /逐条明细（\d+ 条/.test(tombFold.summary), tombFold.summary);
+    /* ⚠️ 判据必须是**卡片高度**，不是"行有没有 rect"：Chromium 对 closed `<details>` 用的是
+       `content-visibility: hidden` —— 内容保留布局盒、只是不绘制，所以行照样有 rect
+       （实测：收起时 61 行全都有 rect，而卡片高度只有 155px、展开是 3256px）。
+       第一版断言写成"行的 rect 为 0"就永远红。 */
+    const tombOpen = await cdp.evalJs<{ cardH: number; rows: number }>(`(() => {
+      const card = Array.from(document.getElementById('otherPage').querySelectorAll('.card'))
+        .find((c) => String(c.querySelector('h2')?.textContent || '').includes('墓碑'));
+      const d = card ? card.querySelector('details') : null;
+      if (d) d.open = true;
+      return { cardH: card ? Math.round(card.getBoundingClientRect().height) : 0, rows: card ? card.querySelectorAll('details tr').length : 0 };
+    })()`);
+    await sleep(200);
+    const tombOpenH = await cdp.evalJs<number>(`(() => {
+      const card = Array.from(document.getElementById('otherPage').querySelectorAll('.card'))
+        .find((c) => String(c.querySelector('h2')?.textContent || '').includes('墓碑'));
+      return card ? Math.round(card.getBoundingClientRect().height) : 0;
+    })()`);
+    ok(
+      '★ 收起是真的省地方（卡片高度：收起 ≪ 展开）',
+      tombFold.cardH > 0 && tombOpenH > tombFold.cardH * 2,
+      `${tombFold.cardH}px → ${tombOpenH}px（${tombFold.rows} 行明细）`,
+    );
+    ok('★ 展开后明细都在（收起只是省地方，不是把功能藏没了）', tombOpen.rows > 0, `${tombOpen.rows} 行`);
+    await cdp.evalJs(`(() => {
+      const card = Array.from(document.getElementById('otherPage').querySelectorAll('.card'))
+        .find((c) => String(c.querySelector('h2')?.textContent || '').includes('墓碑'));
+      const d = card ? card.querySelector('details') : null;
+      if (d) d.open = false;
+      return true;
+    })()`);
     await shot(cdp, '21-tombstone-health-panel');
+
+    /* ---- 2b. 自动核对入口（2026-10-07 用户要求「查不到的 自动解除」）----
+       说明要说清"每天自动跑"，按钮要能点，接口要支持 dryRun 预演 —— 而且**预演绝不能改台账**。 */
+    ok(
+      '清单里说明了「每天自动核对、查不到的自动解除」',
+      /每天会自动核对/.test(healthHtml) && /查不到/.test(healthHtml),
+      healthHtml.slice(-300),
+    );
+    ok('提供「立即核对一次」按钮', /data-act="reconciletomb"/.test(healthHtml));
+    const beforeCount = await cdp.evalJs<number>(`(async () => (await api('/api/tombstones')).count)()`);
+    const dry = await cdp.evalJs<Record<string, unknown>>(
+      `(async () => api('/api/tombstones/reconcile', { method: 'POST', body: { dryRun: true } }))()`,
+    );
+    const afterCount = await cdp.evalJs<number>(`(async () => (await api('/api/tombstones')).count)()`);
+    ok('★ 自动核对接口支持 dryRun 预演', dry['ok'] === true && dry['dryRun'] === true, JSON.stringify(dry).slice(0, 160));
+    ok('★ 预演不动台账（墓碑数不变）', afterCount === beforeCount, `${beforeCount} → ${afterCount}`);
+    ok(
+      '预演结果里保留/解除/证据不足三个计数都在',
+      typeof dry['kept'] === 'number' && typeof dry['released'] === 'number' && typeof dry['unverified'] === 'number',
+      JSON.stringify({ kept: dry['kept'], released: dry['released'], unverified: dry['unverified'] }),
+    );
 
     /* ---- 3. 点解除：确认框要说清后果，并且台账里的墓碑要真的没了 ---- */
     await cdp.evalJs('document.querySelector(\'#tabs .tab[data-view="tasks"]\').click()');

@@ -2044,6 +2044,33 @@ async function renderHealth(box) {
     ${health.prompts.map((p) => `<tr><td class="mono-sm">${esc(p.name)}.md</td><td class="num">${p.bytes}</td><td style="color:var(--text-3)">${esc(p.head)}</td></tr>`).join('')}
     </tbody></table></div>`;
 
+/**
+ * 墓碑明细表：默认**收起**。
+ *
+ * 为什么（用户原话：「显示的太多了」，2026-10-08 截图里 60 条平铺一屏）：
+ * 这张表是"查账用"的 —— 平时只需要知道"有多少条在生效、每天会自动核对"，
+ * 逐条明细只有真要解除某一个时才需要看。同一个教训本项目已经吃过一次
+ * （健康面板「上一轮对每个文件的结论」平铺 35 行），那次也是改成默认收起 + 表头带数量。
+ *
+ * 用原生 `<details>`：不需要额外绑定，键盘/触屏都能开，也不会像自定义折叠那样漏绑事件。
+ */
+function tombstoneDetails(tombstones) {
+  return `<details>
+    <summary style="cursor:pointer;font-size:12.5px;color:var(--text-2)">逐条明细（${tombstones.length} 条，可单条解除）</summary>
+    <table class="tbl" style="margin-top:8px"><thead><tr><th>立碑时间</th><th>原任务</th><th>切片</th><th>标题</th><th>旧稿件</th><th>原因</th><th></th></tr></thead><tbody>
+    ${tombstones.map((t) => `<tr>
+      <td class="mono-sm">${esc(String(t.retiredAt || '').slice(0, 19).replace('T', ' '))}</td>
+      <td class="mono-sm">${esc(t.taskId)}</td>
+      <td class="num">#${t.clipIndex}</td>
+      <td>${esc(String(t.title || '').slice(0, 40))}</td>
+      <td>${t.bvid ? `<a href="https://www.bilibili.com/video/${esc(t.bvid)}" target="_blank" rel="noreferrer" class="mono-sm">${esc(t.bvid)}</a>` : '<span style="color:var(--text-3)">未反查到</span>'}</td>
+      <td><span class="tag-mini">${t.reason === 'clip-deleted' ? '删了切片' : '删了任务'}</span></td>
+      <td><button class="btn-sm" data-act="releasetomb" data-fp="${esc(t.fingerprint)}" data-title="${esc(t.title || '')}" data-bvid="${esc(t.bvid || '')}">解除</button></td>
+    </tr>`).join('')}
+    </tbody></table>
+  </details>`;
+}
+
   html += `<div class="card"><h2>墓碑（已删除任务的、曾经投出去过的指纹）</h2>
     ${tombstones.length === 0
       ? `<div style="font-size:12.5px;color:var(--text-3);line-height:1.7">
@@ -2056,23 +2083,21 @@ async function renderHealth(box) {
       : `<div style="font-size:12.5px;color:#5b5070;margin-bottom:9px;line-height:1.7">
            共 <b>${tombstones.length}</b> 条在生效。它们代表「这段内容以前投过 B站，而当时的任务已被删除」，
            重新投稿时会被自动跳过（切片卡片上会显示「🪦 墓碑拦截」）。
-           <b>只有在创作中心确认那个稿件确实已经不存在之后</b>，才该解除。
+           <b>每天会自动核对一遍：旧稿件查不到的（含已锁定读不到的）自动解除</b>，
+           证据不足的（有公开稿件这次没拉到）保留待下次。
+           <button class="btn-sm" data-act="reconciletomb" style="margin-left:6px">立即核对一次</button>
          </div>
-         <table class="tbl"><thead><tr><th>立碑时间</th><th>原任务</th><th>切片</th><th>标题</th><th>旧稿件</th><th>原因</th><th></th></tr></thead><tbody>
-         ${tombstones.map((t) => `<tr>
-           <td class="mono-sm">${esc(String(t.retiredAt || '').slice(0, 19).replace('T', ' '))}</td>
-           <td class="mono-sm">${esc(t.taskId)}</td>
-           <td class="num">#${t.clipIndex}</td>
-           <td>${esc(String(t.title || '').slice(0, 40))}</td>
-           <td>${t.bvid ? `<a href="https://www.bilibili.com/video/${esc(t.bvid)}" target="_blank" rel="noreferrer" class="mono-sm">${esc(t.bvid)}</a>` : '<span style="color:var(--text-3)">未反查到</span>'}</td>
-           <td><span class="tag-mini">${t.reason === 'clip-deleted' ? '删了切片' : '删了任务'}</span></td>
-           <td><button class="btn-sm" data-act="releasetomb" data-fp="${esc(t.fingerprint)}" data-title="${esc(t.title || '')}" data-bvid="${esc(t.bvid || '')}">解除</button></td>
-         </tr>`).join('')}
-         </tbody></table>`}
+         ${tombstoneDetails(tombstones)}`}
   </div>`;
 
   if (errors.length) {
-    html += `<div class="card"><h2>最近错误事件（errors.jsonl）</h2><table class="tbl">
+    /* 这份列表是从 errors.jsonl 一路攒下来的（同步追加、几乎不丢），所以会有"陈年旧账"：
+       实测 2026-10-07 面板里躺着 12 条两周前、还没切本地 ASR 时的付费闸门/云端接口错误。
+       给一个"清空历史"入口（默认先留档到 data/error-archive/），免得只能靠人工删文件。 */
+    const old = errors.filter((e) => Date.now() - Date.parse(e.at) > 7 * 86400_000).length;
+    html += `<div class="card"><h2>最近错误事件（errors.jsonl）
+      <span class="ai-tag">共 ${errors.length} 条${old ? ` · 其中 ${old} 条超过 7 天` : ''}</span>
+      <button class="btn-sm" style="margin-left:10px" data-act="clear-errors">清空历史错误</button></h2><table class="tbl">
       <thead><tr><th>时间</th><th>阶段</th><th>类型</th><th>消息</th><th>重试</th><th></th></tr></thead><tbody>
       ${errors.map((e) => `<tr><td class="mono-sm">${esc(fmtTime(Date.parse(e.at)))}</td><td>${esc(e.stage)}</td>
         <td><span class="tag-mini">${esc(e.type)}</span></td><td>${esc(String(e.message).slice(0, 120))}</td><td class="num">${e.retries}</td>
