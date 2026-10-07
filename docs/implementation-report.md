@@ -3550,6 +3550,22 @@ ffmpeg -ss 1435.8 -copyts -to 1592.55 -i <源.ts> \
 
 - `tools/stage-hunks.ts <文件> <oldStart>…`：只把指定 hunk 暂存（`git apply --cached --recount`）；
 - `tools/stage-on-head.ts <文件> <替换对JSON>`：当上面那条因**上下文里混着别人的改动**而
+### 39.6 追加：「删除失败：Failed to fetch」这种提示必须改掉
+
+用户随后问「为什么会删除失败」。查下来**根本没失败**：那条 3.05 GB 的源录播在 00:18:43 被
+「用户手动立即删除」成功移入回收站（`deletedBy: trash`），待删清单已清空，日志里 0 条失败记录、
+状态文件里 0 条 `error`、占用探测（同卷 rename）也通过。
+
+真正发生的是：**那两分钟服务不在**（00:14 被杀 → 00:16 / 00:18 两次重启），用户在窗口期点了
+「立即删除」，`fetch` 在浏览器侧直接抛异常，旧写法把英文原文丢进 toast：
+「删除失败：Failed to fetch」—— 用户没法从这句话判断是「服务不在了、等几秒就好」还是「这个文件删不掉」。
+
+改法（`public/ui.html` 的 `api()`）：网络层失败（fetch 抛异常）**先自动重试一次**（间隔 1.2 秒，
+服务重启通常几秒就回来），仍失败则抛出人话「服务不可达（多半正在重启）—— 稍等几秒重试；一直这样请到
+「健康」页看服务状态」，并打上 `err.network = true` 让调用方能区分处理。
+**注意这与「接口返回 4xx/5xx」是两回事**：后者照旧按服务端给的 `error` 文案展示。
+
+`test/monitor-panel.ts` 加了 3 条静态断言（会重试一次 / 文案是人话 / 带 network 标记）。
   "patch does not apply" 时，取 `HEAD:文件`、只施加自己的字符串替换，再 `hash-object -w` +
   `update-index --cacheinfo` 写进索引 —— 索引 = HEAD + 我的改动，别人的 WIP 原样留在工作区。
 

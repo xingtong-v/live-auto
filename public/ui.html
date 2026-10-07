@@ -495,16 +495,32 @@ const state = {
 };
 
 async function api(path, opts = {}) {
-  const doFetch = async () => {
-    const res = await fetch(path, {
-      method: opts.method || 'GET',
-      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': BOOT.csrf },
-      ...(opts.body ? { body: JSON.stringify(opts.body) } : {}),
-    });
-    const text = await res.text();
-    let data;
-    try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
-    return { res, data };
+  /* ★ 网络层失败与"接口报错"必须分开说。
+     实测（2026-10-08 凌晨）：服务被外部杀掉/正在重启的那两分钟里，用户点「立即删除」，
+     fetch 直接抛 → 旧写法把英文原文丢进 toast：「删除失败：Failed to fetch」——
+     用户完全不知道是"服务不在了、等一会儿就好"，还是"这个文件删不掉、要去看日志"。
+     这里（1）先自动重试一次（重启通常几秒就回来），（2）仍失败就给一句人话。 */
+  const doFetch = async (attempt = 0) => {
+    try {
+      const res = await fetch(path, {
+        method: opts.method || 'GET',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': BOOT.csrf },
+        ...(opts.body ? { body: JSON.stringify(opts.body) } : {}),
+      });
+      const text = await res.text();
+      let data;
+      try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+      return { res, data };
+    } catch (e) {
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 1200));
+        return doFetch(1);
+      }
+      const err = new Error('服务不可达（多半正在重启）—— 稍等几秒重试；一直这样请到「健康」页看服务状态');
+      err.network = true;
+      err.cause = e;
+      throw err;
+    }
   };
 
   let { res, data } = await doFetch();

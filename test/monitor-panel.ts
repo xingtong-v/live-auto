@@ -119,6 +119,13 @@ const html = fs.readFileSync(htmlPath, 'utf8');
   ok('删除后立刻重画清单（否则行还挂在那儿，看着像没删）', /loadMonitor\(true\)/.test(html));
   ok('按下期间按钮置灰并改文案（防连点重复提交）', /b\.disabled = true/.test(html) && /正在删除…/.test(html));
 
+  /* ★ 网络层失败与"接口报错"必须分开说（2026-10-08 实测）：服务被外部杀掉/正在重启时，
+     用户点「立即删除」，fetch 直接抛 → 旧写法把英文原文丢进 toast（「删除失败：Failed to fetch」），
+     用户根本分不清是"服务不在了、等几秒就好"还是"这个文件删不掉"。 */
+  ok('★ api() 对网络层失败会自动重试一次（服务重启通常几秒就回来）', /const doFetch = async \(attempt = 0\)/.test(html) && /if \(attempt === 0\)/.test(html));
+  ok('★ 仍失败时给人话，而不是英文 fetch 原文', /服务不可达（多半正在重启）/.test(html));
+  ok('并把这类错误标出来（network 标记，调用方可区分处理）', /err\.network = true/.test(html));
+
   /* 实时监控 ·「目录轮询（为什么某个录播没被导入）」里的「上一轮对每个文件的结论」：
      35 个文件全是「已导入过」时不许平铺 35 行
      （用户截图 + 原话「这里的显示的太多了 而且是导入过的 优化他」）。
