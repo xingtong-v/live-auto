@@ -810,6 +810,82 @@ export class UiServer {
       return;
     }
 
+    /**
+     * 批量删除任务（任务列表的「多选」）。
+     *
+     * 为什么要有它：一次直播季下来列表里躺着几十场，逐个点「⋯ → 删除任务…」太折磨
+     * （用户原话：「添加 多选功能 可以多选已发布 进行删除」）。
+     *
+     * 语义与单删**完全一致**（逐个走 `orch.deleteTask`，同一套回收站/跳过规则），
+     * 只是把结果汇总并逐项如实返回：
+     *   · 单个失败不影响其它（失败项带原因，界面照实展示）；
+     *   · `ok` 只在**全部成功**时为 true —— 部分成功不许谎报成功；
+     *   · 上限 200 个/次，防止一次误点把整个台账清空。
+     *
+     * ⚠️ 路由必须放在 `/api/task/:id/delete` **之前**：那条正则是 `([^/]+)/delete`，
+     * 而 `delete-batch` 不含尾部的 `/delete`，不会真的冲突 —— 但顺序显式一点更不容易被后人改坏。
+     */
+    if (p === '/api/task/delete-batch' && method === 'POST') {
+      const body = (await this.readBody(req)) as {
+        ids?: unknown;
+        deleteClips?: boolean;
+        deleteRaw?: boolean;
+        deleteTaskDir?: boolean;
+        confirm?: boolean;
+      };
+      if (!body.confirm) throw new Error('批量删除不可逆，请求必须带 confirm: true');
+      const rawIds = Array.isArray(body.ids) ? body.ids : [];
+      const ids = [...new Set(rawIds.map((x) => String(x ?? '').trim()).filter((x) => x.length > 0))];
+      if (ids.length === 0) throw new Error('没有选中任何任务');
+      if (ids.length > 200) throw new Error(`一次最多删 200 个任务（本次收到 ${ids.length} 个）—— 请分批操作`);
+
+      const opts = {
+        deleteClips: body.deleteClips !== false,
+        deleteRaw: body.deleteRaw === true,
+        deleteTaskDir: body.deleteTaskDir === true,
+      };
+      const deleted: string[] = [];
+      const failed: Array<{ id: string; error: string }> = [];
+      const trashIds: string[] = [];
+      let freedBytes = 0;
+      let skippedCount = 0;
+      /* 有已投稿切片的任务要单独报出来：删除本地文件**不会撤回 B站 上的稿件**，
+         用户最容易误解的就是这一点（单删的确认框里也写着）。 */
+      let publishedClips = 0;
+      for (const id of ids) {
+        try {
+          const rec = this.orch.ledger.getTask(id);
+          const clips = rec ? this.orch.ledger.getClips(id) : [];
+          publishedClips += clips.filter((c) => c.status === 'PUBLISHED' || Boolean(c.bvid)).length;
+          const r = await this.orch.deleteTask(id, opts);
+          deleted.push(id);
+          freedBytes += r.freedBytes;
+          skippedCount += r.skipped.length;
+          if (r.trashId) trashIds.push(r.trashId);
+        } catch (e) {
+          failed.push({ id, error: (e instanceof Error ? e.message : String(e)).slice(0, 200) });
+        }
+      }
+      this.invalidateMonitor();
+      const freedMB = Number((freedBytes / 1024 ** 2).toFixed(1));
+      this.sendJson(res, 200, {
+        ok: failed.length === 0,
+        deleted,
+        failed,
+        freedMB,
+        skippedCount,
+        trashIds,
+        publishedClips,
+        note:
+          `已处理 ${deleted.length}/${ids.length} 个任务` +
+          (freedMB ? `，释放 ${freedMB} MB` : '') +
+          (skippedCount ? `，${skippedCount} 项跳过` : '') +
+          (failed.length ? `，${failed.length} 个失败` : '') +
+          (publishedClips ? `；其中 ${publishedClips} 个切片已投稿，B站 上的稿件**不会**被撤回` : ''),
+      });
+      return;
+    }
+
     /** 执行删除 */
     const delMatch = /^\/api\/task\/([^/]+)\/delete$/.exec(p);
     if (delMatch && method === 'POST') {

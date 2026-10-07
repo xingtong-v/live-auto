@@ -135,6 +135,27 @@ const html = fs.readFileSync(htmlPath, 'utf8');
   ok('重跑办法整块只写一次', /确实要重跑：/.test(html) && /用「导入录播」手动挑那一场/.test(html));
   ok('顺带说明"不会自动重导"的原因（免得用户以为漏了）', /不会被自动重导/.test(html));
 
+  /* 任务列表的多选（批量删除）：用户原话「添加 多选功能 可以多选已发布 进行删除」。
+     规则：多选模式下卡片带勾选框、点卡片=勾选、工具条给出「全选已发布」与「删除选中(N)」、
+     确认文案必须说清"不撤回 B站 稿件"，并且只对**当前可见**的选中项生效。 */
+  ok('有「多选」开关按钮', /id="btnMulti"/.test(html));
+  ok('★ 多选模式下卡片渲染勾选框（data-pick）', /class="pick" data-pick=/.test(html));
+  ok('★ 点卡片在多选模式下改为"勾选"（不再切换任务）', /if \(state\.multi\.on\) \{\s*togglePick\(el\.dataset\.id\);/.test(html));
+  ok('有工具条容器 #multiBar', /id="multiBar"/.test(html) && /function renderMultiBar\(/.test(html));
+  ok('★ 工具条有「全选已发布」（用户点名要删的就是这类）', /data-multi="pub"/.test(html) && /全选已发布/.test(html));
+  ok('★ 删除按钮把"删几个"写在脸上', /data-multi="del"[^>]*>删除选中（\$\{n\}）/.test(html));
+  ok('选择状态只在当前可见列表里维护（切筛选不会误删看不见的）', /visible\.has\(id\)[\s\S]{0,80}state\.multi\.sel\.delete\(id\)/.test(html));
+  ok('引用了批量删除接口', html.includes(`'/api/task/delete-batch'`));
+  /* confirm() 是纯文本弹窗：HTML 标签与 markdown 星号会原样显示（踩过） */
+  const batchAt = html.indexOf("async function openBatchDeleteDialog");
+  ok('能定位到批量删除对话框', batchAt > 0, String(batchAt));
+  const batchConfirm = /const okGo = confirm\(([\s\S]*?)\);/.exec(html.slice(batchAt))?.[1] ?? '';
+  ok('取到批量删除的确认文案', batchConfirm.length > 80, `${batchConfirm.length} 字节`);
+  ok('★ 确认文案里没有 HTML 标签 / markdown 星号', !/<[a-z/]/.test(batchConfirm) && !/\*\*/.test(batchConfirm), batchConfirm.replace(/\n/g, ' ').slice(0, 160));
+  ok('★ 确认文案写明不影响 B站 上的稿件', /不会.*撤回或删除/.test(batchConfirm), batchConfirm.replace(/\n/g, ' ').slice(0, 200));
+  ok('★ 确认文案写明进回收站可恢复 + 空间要等回收站清理', /回收站（7 天内可恢复）/.test(batchConfirm) && /回收站清理/.test(batchConfirm));
+  ok('失败项逐条展示（不许只报"部分失败"）', /批量删除：有失败项/.test(html) && /r\.failed\.map\(/.test(html));
+
   /* 内联脚本必须能解析：写坏一个反引号就整页白屏，而且控制台只有一行语法错误 */
   const m = /<script>([\s\S]*?)<\/script>\s*<\/body>/.exec(html) ?? /<script>([\s\S]*)<\/script>/.exec(html);
   const script = m?.[1] ?? '';
@@ -565,6 +586,88 @@ section('⑦ 已投稿文件：审核中 / bv 号 / 只能删已投稿成功的'
   } catch {
     /* ignore */
   }
+}
+
+/* ========================================================================== */
+section('⑧ 批量删除任务（任务列表的「多选」）：逐项如实、部分失败不谎报');
+{
+  /* 本节要自己的 CSRF + POST 助手：上面那两段里的 post2 是块级作用域，出了块就没了 */
+  const bootB = (await fetchJson('/api/bootstrap')) as { data: { csrf?: string } };
+  const csrfB = String(bootB.data['csrf'] ?? '');
+  const postB = async (p: string, body: unknown): Promise<{ status: number; data: Record<string, unknown> }> => {
+    const res = await fetch(base + p, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfB },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    let data: unknown;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { error: text.slice(0, 200) };
+    }
+    return { status: res.status, data: data as Record<string, unknown> };
+  };
+
+  /* 先造三个任务：两个"已发布"（带已投稿切片）+ 一个不存在的 id 用来验证部分失败 */
+  const mkDelTask = (id: string, title: string): void => {
+    ledger.createTask({
+      id,
+      roomId: '12345678',
+      platform: 'Bilibili',
+      title,
+      streamer: '丙主播',
+      status: 'PUBLISHED',
+      stage: 'PUBLISHED',
+      importSource: 'auto',
+      source: { segments: [], totalDuration: 100, rawFiles: [], fullVideoHasDanmaku: false },
+      fullUpload: 'NOT_APPLICABLE',
+      cost: { asrEstimate: 0, asrAudioSeconds: 0, llmActual: 0, llmPromptTokens: 0, llmCompletionTokens: 0, llmCalls: 0, updatedAt: now },
+      createdAt: now,
+      updatedAt: now,
+    } as never);
+    const dir = path.join(tmp, 'clips', id);
+    ensureDir(dir);
+    const f = path.join(dir, '01-000010-x.mp4');
+    fs.writeFileSync(f, 'x'.repeat(2048));
+    ledger.setClips(id, [mkClip(0, { status: 'PUBLISHED', bvid: 'BV1BATCH00001', cutOutput: f })]);
+  };
+  mkDelTask('mon-batch-a', '批量删除 A');
+  mkDelTask('mon-batch-b', '批量删除 B');
+
+  const noConfirm = await postB('/api/task/delete-batch', { ids: ['mon-batch-a'] });
+  ok('★ 不给 confirm 直接拒绝（不可逆操作不许一点就没）', noConfirm.status >= 400, JSON.stringify(noConfirm.data).slice(0, 140));
+  const empty = await postB('/api/task/delete-batch', { ids: [], confirm: true });
+  ok('空清单也拒绝（不静默成功）', empty.status >= 400, JSON.stringify(empty.data).slice(0, 140));
+  const tooMany = await postB('/api/task/delete-batch', { ids: Array.from({ length: 201 }, (_, i) => `x${i}`), confirm: true });
+  ok('★ 一次超过 200 个直接拒绝（防一次误点清空台账）', tooMany.status >= 400, JSON.stringify(tooMany.data).slice(0, 140));
+
+  const r = await postB('/api/task/delete-batch', {
+    ids: ['mon-batch-a', 'mon-batch-b', '不存在任务', 'mon-batch-a'], // 故意带重复项与坏 id
+    confirm: true,
+    deleteClips: true,
+  });
+  eq('HTTP 200（部分失败也是"处理完了"，不是服务端错误）', r.status, 200);
+  eq('★ 重复的 id 只处理一次', (r.data['deleted'] as string[]).length, 2);
+  eq('两个真任务都处理了', r.data['deleted'], ['mon-batch-a', 'mon-batch-b']);
+  eq('★ 坏 id 如实进 failed（不谎报整体成功）', (r.data['failed'] as Array<{ id: string }>).map((f) => f.id), ['不存在任务']);
+  eq('★ ok=false 表示"没有全部成功"（部分成功不许报成功）', r.data['ok'], false);
+  ok('释放体积如实报出', Number(r.data['freedMB']) >= 0, String(r.data['freedMB']));
+  eq('★ 报出"其中 N 个切片已投稿"（删除不会撤回 B站 稿件，用户最容易误解的点）', r.data['publishedClips'], 2);
+  ok('note 里写清了处理比例与已投稿提示', /已处理 2\/3 个任务/.test(String(r.data['note'])) && /不会.*撤回/.test(String(r.data['note'])), String(r.data['note']));
+  /* 只删产物（界面上的默认勾选）时**任务记录必须留着** —— 这是 delete-semantics 定下的语义：
+     产物删了、记录在，用户随时能重切；只有勾了「任务目录」才算整体删除。 */
+  eq('★ 只删产物时任务记录保留（可重切），不是整体删除', [Boolean(ledger.getTask('mon-batch-a')), Boolean(ledger.getTask('mon-batch-b'))], [true, true]);
+
+  /* 再删一次，这次勾上「任务目录」= 整体删除（多选清理已发布场次时通常要的就是这个） */
+  const r2 = await postB('/api/task/delete-batch', { ids: ['mon-batch-a', 'mon-batch-b'], confirm: true, deleteClips: true, deleteTaskDir: true });
+  eq('全部成功时 ok=true', r2.data['ok'], true);
+  ok('★ 勾了任务目录后记录才真正消失', !ledger.getTask('mon-batch-a') && !ledger.getTask('mon-batch-b'));
+  ok('★ 走的是回收站（trashIds 有值 ⇒ 7 天内可恢复）', (r2.data['trashIds'] as string[]).length >= 1, JSON.stringify(r2.data['trashIds']));
+  /* 释放体积按 MB 保留 1 位小数：测试里的任务目录只有几百字节 ⇒ 显示 0.0 是正常的，
+     所以这里只断言"是个非负数"（真实场景几百 MB 时才是有意义的数字）。 */
+  ok('释放体积如实报出（可为 0）', Number(r2.data['freedMB']) >= 0, String(r2.data['freedMB']));
 }
 
 ui.stop();

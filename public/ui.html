@@ -93,6 +93,17 @@
     background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.05)}
   .task .more:hover{border-color:#cfe6f7;color:#1a86c7;background:#f7fcff}
   .task .more:hover{border-color:#cfd3d8;background:#f7f8f9;color:var(--text)}
+  /* ---- 多选（批量删除） ---- */
+  .task .pick{position:absolute;top:11px;left:9px;width:15px;height:15px;cursor:pointer;accent-color:var(--pink);z-index:2}
+  .task.picked{background:var(--pink-soft);border-left-color:var(--pink)}
+  .task.picked .name{font-weight:600}
+  .multibar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    padding:8px 10px;margin:6px 0 4px;background:#fff8f4;border:1px solid #f3d9cb;border-radius:8px;font-size:12.5px}
+  .multibar .cnt{color:var(--text-2)}
+  .multibar .cnt b{color:var(--pink);font-size:14px}
+  .multibar .btn-sm.danger{border-color:#f0c8c8;color:#c33}
+  .multibar .btn-sm[disabled]{opacity:.5;cursor:not-allowed}
+  #btnMulti.on{border-color:#cfe6f7;color:#1a86c7;background:#f7fcff}
   .task-menu{position:fixed;z-index:60;background:#fff;border:1px solid var(--border);
     border-radius:9px;box-shadow:0 8px 28px rgba(0,0,0,.16);padding:4px;min-width:186px;font-size:13px}
   .task-menu button{display:block;width:100%;text-align:left;border:none;background:none;
@@ -400,7 +411,9 @@
           <button data-status="published">已发布</button>
           <button data-status="failed">失败</button>
         </div>
+        <button class="ghost" id="btnMulti" title="多选：批量删除任务（一次清理一批已发布的场次）">多选</button>
       </div>
+      <div id="multiBar" style="display:none"></div>
       <div id="taskList"></div>
     </aside>
     <main class="col col-mid"><div id="detail"><div class="empty">正在加载…</div></div></main>
@@ -447,7 +460,7 @@
 const BOOT = window.__BOOT__ || { csrf: '', version: '?', roomId: '', platform: '' };
 
 /** UI 构建标记：在浏览器控制台里能看到，用来确认页面是不是最新的（避免缓存导致以为功能没做） */
-const UI_BUILD = 'ui-2026-10-06-health-imported-collapsed';
+const UI_BUILD = 'ui-2026-10-07-task-multiselect';
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -464,6 +477,13 @@ const state = {
   watch: null,
   bootstrap: null,
   dirty: new Set(),   // 已编辑但未保存的切片：taskId:idx
+  /**
+   * 任务列表的多选状态（批量删除用）。
+   *
+   * 只在**当前可见列表**里维护选中项：切筛选/搜索时会把看不见的 id 丢掉 ——
+   * 否则用户切到「处理中」再点删除，会把上一个筛选里选中的场次一起删掉（看不见却删了，最糟的交互）。
+   */
+  multi: { on: false, sel: new Set() },
   saving: false,
   /**
    * 实时监控页签的运行态。
@@ -900,6 +920,10 @@ function renderTaskList() {
   const badge = { processing: 'b-run', review: 'b-wait', failed: 'b-fail', published: 'b-done' };
   const group = (s) => (['PUBLISHED', 'ARCHIVED'].includes(s) ? 'published'
     : s === 'FAILED' ? 'failed' : s === 'ANALYZED' ? 'review' : 'processing');
+  const multi = state.multi.on;
+  // 只保留还在列表里的选中项（切换筛选/搜索后不要把看不见的任务也删掉）
+  const visible = new Set(state.tasks.map((t) => t.id));
+  state.multi.sel.forEach((id) => { if (!visible.has(id)) state.multi.sel.delete(id); });
   $('#taskList').innerHTML = state.tasks.length ? state.tasks.map((t) => {
     const g = group(t.status);
     const extra = [];
@@ -911,21 +935,33 @@ function renderTaskList() {
     else if (t.manual || t.importSource === 'manual') extra.push('手动导入');
     // 在等 biliLive-tools 投完整版：这是默认规则下的正常中间态，必须一眼看出来（否则像卡住了）
     if (t.publishWaiting) extra.push('⏳ 等完整版稿件');
-    return `<div class="task ${t.id === state.activeId ? 'active' : ''}" data-id="${esc(t.id)}">
+    const picked = state.multi.sel.has(t.id);
+    return `<div class="task ${t.id === state.activeId ? 'active' : ''}${picked ? ' picked' : ''}" data-id="${esc(t.id)}">
+      ${multi ? `<input type="checkbox" class="pick" data-pick="${esc(t.id)}"${picked ? ' checked' : ''} title="选中这一场">` : ''}
       <div class="when"><span>${esc(t.when)}</span><span>${toTime(t.durationSec)}</span></div>
       <div class="name">${esc(t.title)}</div>
       <div class="meta"><span class="badge ${badge[g] || 'b-idle'}">${esc(t.statusText)}</span>${extra.map((x) => `<span>${esc(x)}</span>`).join('')}</div>
-      <button class="more" data-more="${esc(t.id)}" title="任务操作（右键同样可打开）">⋯</button>
+      ${multi ? '' : `<button class="more" data-more="${esc(t.id)}" title="任务操作（右键同样可打开）">⋯</button>`}
     </div>`;
   }).join('') : '<div class="empty" style="padding:16px">没有符合条件的任务</div>';
+
+  renderMultiBar();
   // ---- 交互绑定 ----
-  // 点击卡片：切换任务
+  // 点击卡片：切换任务；多选模式下改为"勾选/取消"
   $$('#taskList .task').forEach((el) => (el.onclick = () => {
+    if (state.multi.on) {
+      togglePick(el.dataset.id);
+      return;
+    }
     if (state.dirty.size && !confirm('有未保存的切片修改，切换任务会丢失。确定切换？')) return;
     state.dirty.clear();
     state.activeId = el.dataset.id;
     renderTaskList();
     loadDetail().catch((e) => toast(e.message));
+  }));
+  $$('#taskList .task .pick').forEach((c) => (c.onclick = (ev) => {
+    ev.stopPropagation();
+    togglePick(c.dataset.pick);
   }));
 
   // 「⋯」按钮：打开操作菜单。
@@ -951,6 +987,114 @@ function renderTaskList() {
     });
     document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closeTaskMenu(); });
   }
+}
+
+/** 勾选/取消一个任务（多选模式） */
+function togglePick(id) {
+  if (state.multi.sel.has(id)) state.multi.sel.delete(id);
+  else state.multi.sel.add(id);
+  renderTaskList();
+}
+
+/** 多选工具条：选中数量 + 批量操作（「全选已发布」是最常用的那条路） */
+function renderMultiBar() {
+  const bar = $('#multiBar');
+  if (!bar) return;
+  if (!state.multi.on) {
+    bar.style.display = 'none';
+    bar.innerHTML = '';
+    return;
+  }
+  const n = state.multi.sel.size;
+  const pub = state.tasks.filter((t) => ['PUBLISHED', 'ARCHIVED'].includes(t.status)).length;
+  bar.style.display = '';
+  bar.className = 'multibar';
+  bar.innerHTML = `<span class="cnt">已选 <b>${n}</b> 个</span>
+    <button class="btn-sm" data-multi="pub"${pub ? '' : ' disabled'} title="选中当前列表里所有「已发布」的场次">全选已发布（${pub}）</button>
+    <button class="btn-sm" data-multi="clear"${n ? '' : ' disabled'}>清空</button>
+    <button class="btn-sm danger" data-multi="del"${n ? '' : ' disabled'}>删除选中（${n}）</button>
+    <button class="btn-sm" data-multi="exit">退出多选</button>`;
+  $('[data-multi="pub"]').onclick = () => {
+    state.tasks.forEach((t) => { if (['PUBLISHED', 'ARCHIVED'].includes(t.status)) state.multi.sel.add(t.id); });
+    renderTaskList();
+  };
+  $('[data-multi="clear"]').onclick = () => { state.multi.sel.clear(); renderTaskList(); };
+  $('[data-multi="exit"]').onclick = () => { state.multi.on = false; state.multi.sel.clear(); updateMultiButton(); renderTaskList(); };
+  $('[data-multi="del"]').onclick = () => { void openBatchDeleteDialog(); };
+}
+
+function updateMultiButton() {
+  const b = $('#btnMulti');
+  if (!b) return;
+  b.textContent = state.multi.on ? '退出多选' : '多选';
+  b.classList.toggle('on', state.multi.on);
+}
+
+/**
+ * 批量删除对话框。
+ *
+ * 默认与单删一致：**只删切片产物**（最占地方、也最可重建），任务目录与源素材要显式勾。
+ * 确认文案必须把三件事说清楚（缺一条用户就会误判后果）：
+ *   ① 删几个；② 进回收站可恢复、磁盘空间要等回收站清理才释放；③ **不影响 B站 上的稿件**。
+ */
+async function openBatchDeleteDialog() {
+  const ids = [...state.multi.sel];
+  if (!ids.length) return;
+  const pubCount = state.tasks.filter((t) => state.multi.sel.has(t.id) && ['PUBLISHED', 'ARCHIVED'].includes(t.status)).length;
+  let html = `<p style="font-size:13px">已选中 <b>${ids.length}</b> 个任务${pubCount ? `（其中 ${pubCount} 个已发布）` : ''}。勾选要一并删除的内容，<b>三个勾选项对所选任务统一生效</b>。</p>`;
+  html += '<div class="fields" style="grid-template-columns:1fr">';
+  html += '<div class="field"><label><input type="checkbox" id="bDelClips" checked> 切片产物（成片 mp4，最占地方，随时可重切）</label></div>';
+  html += '<div class="field"><label><input type="checkbox" id="bDelTaskDir"> 任务目录（压制产物 + 转写 / 弹幕信号 / 总结；删掉无法回看本场总结，重跑要重新转写）</label></div>';
+  html += '<div class="field"><label><input type="checkbox" id="bDelRaw"> 源素材（录播原文件；被别的任务共用的会自动跳过）</label></div>';
+  html += '</div>';
+  html += '<p class="hintline">选中的任务记录会被删除（移入回收站，7 天内可恢复）。<b>B站 上的稿件不会被撤回或删除</b> —— 要撤下请到 B站创作中心操作。磁盘空间要等「回收站清理」之后才真正释放。</p>';
+  html += '<div style="margin-top:14px"><button class="danger" id="doBatchDelete">确认删除这 ' + ids.length + ' 个任务</button></div>';
+  openInfo('批量删除任务', html);
+  const btn = $('#doBatchDelete');
+  btn.onclick = async () => {
+    const wantTaskDir = !!($('#bDelTaskDir') && $('#bDelTaskDir').checked);
+    const wantRaw = !!($('#bDelRaw') && $('#bDelRaw').checked);
+    const okGo = confirm(
+      `确认删除选中的 ${ids.length} 个任务吗？\n\n` +
+        `· 切片产物：删除\n` +
+        `· 任务目录：${wantTaskDir ? '删除（转写/总结一并消失）' : '保留'}\n` +
+        `· 源素材：${wantRaw ? '删除（被共用会自动跳过）' : '保留'}\n\n` +
+        '· 全部移入回收站（7 天内可恢复），不是永久删除；\n' +
+        '· 磁盘空间要等「回收站清理」之后才真正释放；\n' +
+        '· B站 上的稿件「不会」被撤回或删除，要撤下请去创作中心。',
+    );
+    if (!okGo) return;
+    btn.disabled = true;
+    btn.textContent = '正在删除…';
+    try {
+      const r = await api('/api/task/delete-batch', {
+        method: 'POST',
+        body: { ids, confirm: true, deleteClips: true, deleteTaskDir: wantTaskDir, deleteRaw: wantRaw },
+      });
+      closeInfo();
+      const extra = [];
+      if (r.failed && r.failed.length) extra.push(`失败 ${r.failed.length} 个`);
+      if (r.skippedCount) extra.push(`跳过 ${r.skippedCount} 项`);
+      toast(`${r.note}${extra.length ? `；${extra.join('，')}` : ''}`, 9000);
+      if (r.failed && r.failed.length) {
+        openInfo(
+          '批量删除：有失败项',
+          '<div class="timeline">' +
+            r.failed.map((f) => `<div class="row bad"><span class="t">✗</span><span class="s"><b>${esc(f.id)}</b><br>${esc(f.error)}</span></div>`).join('') +
+            '</div>',
+        );
+      }
+      state.multi.sel.clear();
+      if (state.activeId && ids.includes(state.activeId)) state.activeId = null;
+      state.dirty.clear();
+      setTimeout(() => refreshAll(true), 700);
+    } catch (e) {
+      toast('批量删除失败：' + e.message, 7000);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = `确认删除这 ${ids.length} 个任务`;
+    }
+  };
 }
 
 /* ============================================================================
@@ -3851,6 +3995,13 @@ $$('#statusFilters button').forEach((b) => b.onclick = () => {
   state.status = b.dataset.status;
   loadTasks().catch((e) => toast(e.message));
 });
+/* 多选开关：切到多选后卡片上出现勾选框，点卡片=勾选（不再切换任务） */
+$('#btnMulti').onclick = () => {
+  state.multi.on = !state.multi.on;
+  if (!state.multi.on) state.multi.sel.clear();
+  updateMultiButton();
+  renderTaskList();
+};
 $('#cfgMask').onclick = (e) => { if (e.target.id === 'cfgMask') closeCfg(); };
 $('#infoMask').onclick = (e) => { if (e.target.id === 'infoMask') closeInfo(); };
 document.addEventListener('keydown', (e) => {
