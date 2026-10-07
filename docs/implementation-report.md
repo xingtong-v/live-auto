@@ -3675,3 +3675,58 @@ summary 带条数、**卡片高度收起 155px vs 展开 3256px**、展开后明
 连跑 **3 次全部 36/36**（改之前是"第一次红、第二次绿"）。`typecheck` 干净。
 本仓库其它验证工具（`verify-monitor-ui` / `verify-tombstone-ui` / `ui-e2e`）早就是"等元素再点"的写法，
 只有这一个还在用固定 sleep —— 现在统一了。
+
+---
+
+## 41. `git push` 突然连不上 GitHub：不是仓库的问题，是**解析到的那个 IP 被挡**（2026-10-08）
+
+### 41.1 现象与误判
+
+推提交时报：
+
+```
+fatal: unable to access 'https://github.com/xingtong-v/live-auto.git/':
+Failed to connect to github.com:443 after 21108 ms: Could not connect to server
+```
+
+第一反应是"网络抽风，重试就好"（这仓库以前确实重试就过）。**但连试 3 次、每次隔 5 秒全一样**，
+后来隔着几十秒再试还是失败 —— 说明不是抖动。
+
+### 41.2 实际原因
+
+| 探测 | 结果 |
+|---|---|
+| DNS | `github.com` → **20.205.243.166** |
+| `Test-NetConnection github.com -Port 443` | **False**（这个 IP 的 443 不通） |
+| `Test-NetConnection 140.82.112.3 / 140.82.113.3 / 140.82.114.3 / 20.27.177.113 -Port 443` | 全部 **True** |
+| `ssh.github.com` / `codeload.github.com` / `api.github.com` :443 | 全通 |
+| 对照：`www.baidu.com` / `registry.npmjs.org` :443 | 全通（不是整体断网） |
+| 本机代理 | 没有 `~/.ssh`、没有 7890/7897/10809/1080 在听、git 里也没有 proxy 配置 |
+
+结论：**只有 `github.com` 解析到的那个 IP 被挡**，别的 GitHub 入口都活着。
+
+### 41.3 解决：换一个可达 IP（一次性覆盖，不改配置）
+
+```bash
+# 先探路（只读、便宜）
+git -c http.curloptResolve=github.com:443:20.27.177.113 -c http.version=HTTP/1.1 ls-remote --heads <url> main
+# 通了再用它推
+git -c http.curloptResolve=github.com:443:20.27.177.113 -c http.version=HTTP/1.1 push origin main
+```
+
+实测 `140.82.113.3` 会 `Connection was reset`、`140.82.114.3` 直接超时，**`20.27.177.113` + `HTTP/1.1` 通了**
+（HTTPS 的 SNI 仍是 `github.com`，证书照常校验，不是跳过校验那种危险做法）。
+
+### 41.4 固化成工具：`tools/push-safe.ts`
+
+IP 会轮换，所以不写死。工具逻辑：**直连先试 → 不通就按「候选 IP × HTTP 版本」用 `ls-remote` 探路 →
+找到能用的入口再推**（全程 `-c` 一次性覆盖，不落盘、不改仓库配置；`--check` 只探不推）。
+
+```bash
+npm run push-safe          # 直连不通时自动换入口再推
+node tools/push-safe.ts --check   # 只看现在哪条路通
+```
+
+写完之后跑 `--check`，直连又恢复可用了（这次的挡是间歇性的）—— 工具照样正确报"直连可用"并直接推。
+**下次再遇到 `Failed to connect to github.com:443`，先跑它，不要再无脑重试。**
+
