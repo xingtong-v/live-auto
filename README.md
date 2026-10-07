@@ -69,9 +69,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\autostart.ps1 -Remove
 
 现在：**自动 = 无窗口守护脚本**（只拉起、不杀、不持有）；**手动 = 桌面快捷方式**
 （`launcher.ps1`，有窗口、看得见日志、关窗口即停服务 —— 这是给人用的设计）。
-想要老的"任务也开可见窗口"行为：`tools\autostart.ps1 -Install -VisibleLauncher`。
 启动日志：自动一路在 `data/logs/watchdog.log`（只在真启动时写）+ `service-console.log`；
 手动一路在 `data/logs/launcher-console.log`。
+
+**开机后会自动打开界面**（2026-10-07 起，用户明确要求）。实现是**第二个计划任务**：
+
+| 任务 | 触发 | 动作 | 作用 |
+|---|---|---|---|
+| `直播切片助手（live_auto）` | 登录 + 每 10 分钟 | `conhost --headless powershell -File tools\ensure-service.ps1` | 后端常驻（静默、无窗口） |
+| `直播切片助手（live_auto） · 界面` | **只在登录时**（+45 秒） | `conhost --headless powershell -File tools\open-ui.ps1 -Port 3000` | 开机自动打开界面 |
+
+分成两个任务是因为看门狗每 10 分钟一跳 —— 塞进同一个任务里就会每 10 分钟弹一次界面。
+`open-ui.ps1` 只做"**等 + 开**"：等后端就绪（最多 90 秒，硬超时探活）→ 用 Edge 应用模式打开
+（和桌面快捷方式打开的是同一个窗口，没有地址栏）；**等不到也照样开**（开机时后端可能只是慢，
+刷新一下即可）。它**不负责拉起后端** —— 第一版顺手同步调 `ensure-service.ps1`，
+实测在 `conhost --headless` 下那句不返回、任务卡在 Running、界面永远打不开。
+不想要开机界面：`tools\autostart.ps1 -Install -NoUiAtLogon`；启动日志 `data/logs/open-ui.log`。
+想要老的"任务也开可见窗口"行为：`tools\autostart.ps1 -Install -VisibleLauncher`。
 
 为什么要看门狗：自启只在登录时跑一次。实测 2026-09-24 12:07，正在跑的进程被外部以
 「Ctrl+C 式」终止（任务计划程序的"失败重试"对**被外部终止**不生效），服务就再没自己回来。

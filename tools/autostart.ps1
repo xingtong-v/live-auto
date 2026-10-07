@@ -40,8 +40,15 @@
   加这个开关就回到"后台静默"模式。
 
 .PARAMETER Browser
-  启动时**顺便打开界面**（默认不打开；窗口里会打印地址，自己点开即可）。
-  注意：看门狗每次拉起服务时也会跟着打开浏览器 —— 不想每次弹浏览器就别加。
+  老的"启动时顺便打开浏览器"（仅 -VisibleLauncher 模式有效）。
+  现在**默认行为已改为「登录后自动打开界面」**（见 -NoUiAtLogon），所以这个开关基本不用了。
+
+.PARAMETER NoUiAtLogon
+  **不要**在登录后自动打开界面（默认会打开）。
+  实现：额外注册一个「登录时」触发的一次性任务，动作是
+  `conhost --headless powershell -File tools\open-ui.ps1` —— 它等后端就绪（必要时先无窗口拉起），
+  再用 Edge 应用模式打开界面（和桌面快捷方式打开的是同一个窗口，没有地址栏）。
+  为什么单独一个任务而不是塞进看门狗：看门狗每 10 分钟一跳，塞进去就会每 10 分钟弹一次界面。
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File tools\autostart.ps1 -Install
@@ -60,6 +67,8 @@ param(
   [int]$WatchdogMinutes = 10,
   [switch]$Hidden,
   [switch]$Browser,
+  # 登录后**不要**自动打开界面（默认会打开；见 .PARAMETER NoUiAtLogon）
+  [switch]$NoUiAtLogon,
   # 老行为：让计划任务去跑**可见窗口**的交互式启动器（默认不再这么干，见下方注释）
   [switch]$VisibleLauncher
 )
@@ -71,6 +80,9 @@ $launcher = Join-Path $ROOT 'launcher.ps1'
 # 让计划任务去跑交互式启动器，等于每 10 分钟在屏幕上闪一个窗口，
 # 而且它只用 3 秒 HTTP 探活判断"服务在不在" —— 服务忙时会误判、进而起第二个实例并把健康的那个杀掉）。
 $watchdog = Join-Path $ROOT 'tools\ensure-service.ps1'
+# 「登录后自动打开界面」用的脚本（与看门狗分开：看门狗每 10 分钟一跳，塞进去会每 10 分钟弹界面）
+$openUi = Join-Path $ROOT 'tools\open-ui.ps1'
+$uiTaskName = "$TaskName · 界面"
 $port = 3000
 try {
   $cfg = Get-Content -LiteralPath (Join-Path $ROOT 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -105,12 +117,19 @@ if (-not $VisibleLauncher -and -not (Test-Path -LiteralPath $watchdog)) {
 if ($Remove) {
   Head '移除自启任务'
   $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-  if (-not $existing) {
+  $existingUi = Get-ScheduledTask -TaskName $uiTaskName -ErrorAction SilentlyContinue
+  if (-not $existing -and -not $existingUi) {
     Warn2 '没有找到该任务（可能本来就没装）'
     exit 0
   }
-  Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-  Ok "已移除：$TaskName"
+  if ($existing) {
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    Ok "已移除：$TaskName"
+  }
+  if ($existingUi) {
+    Unregister-ScheduledTask -TaskName $uiTaskName -Confirm:$false
+    Ok "已移除：$uiTaskName"
+  }
   Write-Host '  （正在运行的服务不受影响；桌面快捷方式照旧可用）' -ForegroundColor DarkGray
   exit 0
 }
@@ -145,6 +164,21 @@ if ($Status) {
   } else {
     Warn2 "未注册自启任务：$TaskName"
   }
+  # 界面任务：用户明确要求"开机时打开这个界面"（2026-10-07）——单独一个任务，只在登录时跑一次
+  $tUi = Get-ScheduledTask -TaskName $uiTaskName -ErrorAction SilentlyContinue
+  if ($tUi) {
+    $uiInfo = Get-ScheduledTaskInfo -TaskName $uiTaskName
+    Ok "已注册：$uiTaskName（登录后自动打开界面）"
+    Write-Host "       上次运行    $($uiInfo.LastRunTime)（结果码 $($uiInfo.LastTaskResult)）"
+    $uiAct = ($tUi.Actions | ForEach-Object { [string]$_.Arguments }) -join ' '
+    if ($uiAct -match 'open-ui\.ps1') {
+      Write-Host '       动作        tools\open-ui.ps1（等后端就绪 → Edge 应用窗口打开界面）'
+    } else {
+      Warn2 "界面任务的动作不是 open-ui.ps1：$uiAct"
+    }
+  } else {
+    Warn2 "未注册界面任务：$uiTaskName（开机不会自动打开界面）—— 需要的话：tools\autostart.ps1 -Install"
+  }
   if (Test-Service) { Ok "服务正在运行：$URL" } else { Warn2 "服务未响应：$URL" }
   # biliLive-tools 是上游依赖，它自己也应该自启 —— 顺手检查一下，省得"服务起来了但上游不在"
   $llt = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue).'com.electron.biliLiveTools'
@@ -163,6 +197,11 @@ if ($VisibleLauncher) {
 if ($Browser) { Write-Host '  界面       启动后自动打开浏览器（仅 -VisibleLauncher 模式有效）' }
 Write-Host "  触发时机    登录后 $DelaySec 秒"
 if ($WatchdogMinutes -gt 0) { Write-Host "  看门狗      每 $WatchdogMinutes 分钟检查一次（服务不在就拉起，无窗口）" }
+if ($NoUiAtLogon) {
+  Write-Host '  开机界面    不自动打开（-NoUiAtLogon）'
+} else {
+  Write-Host "  开机界面    登录后 $([Math]::Max(0, $DelaySec) + 15) 秒自动打开（Edge 应用窗口，无控制台窗口）"
+}
 Write-Host "  界面地址    $URL"
 Write-Host ''
 
@@ -234,7 +273,35 @@ try {
   }
 
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers -Settings $settings -Principal $principal `
-    -Description '开机（登录）后自动启动 B站直播切片助手；无窗口、不开浏览器。带看门狗：每 N 分钟检查一次，服务不在就拉起。移除：tools\autostart.ps1 -Remove' -Force | Out-Null
+    -Description '开机（登录）后自动启动 B站直播切片助手；无窗口。带看门狗：每 N 分钟检查一次，服务不在就拉起。移除：tools\autostart.ps1 -Remove' -Force | Out-Null
+
+  # ---- 界面任务：登录后自动打开那个界面（用户 2026-10-07 的明确要求：「开机时打开的是不是这个界面」）----
+  # 与看门狗分成两个任务的理由：看门狗每 10 分钟一跳，塞进同一个任务里就会每 10 分钟弹一次界面。
+  if ($NoUiAtLogon) {
+    # 用户明确不要 → 顺手清掉可能存在的旧任务，避免"以为关了其实还开着"
+    if (Get-ScheduledTask -TaskName $uiTaskName -ErrorAction SilentlyContinue) {
+      Unregister-ScheduledTask -TaskName $uiTaskName -Confirm:$false
+      Ok "已移除界面任务（-NoUiAtLogon）：$uiTaskName"
+    } else {
+      Ok '按 -NoUiAtLogon：不注册界面任务（登录后不会自动打开界面）'
+    }
+  } elseif (-not (Test-Path -LiteralPath $openUi)) {
+    Warn2 "找不到 $openUi，跳过界面任务（登录后需要手动点桌面快捷方式）"
+  } else {
+    $uiDelaySec = [Math]::Max(0, $DelaySec) + 15   # 比服务晚一点：否则界面先开、只会看到"无法访问"
+    $uiArgs = '--headless "{0}" -NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -File "{1}" -Port {2}' -f $ps, $openUi, $port
+    $uiAction = New-ScheduledTaskAction -Execute $conhost -Argument $uiArgs -WorkingDirectory $ROOT
+    $uiTrigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    $uiTrigger.Delay = 'PT{0}S' -f $uiDelaySec
+    $uiSettings = New-ScheduledTaskSettingsSet `
+      -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+      -StartWhenAvailable `
+      -MultipleInstances IgnoreNew `
+      -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+    Register-ScheduledTask -TaskName $uiTaskName -Action $uiAction -Trigger $uiTrigger -Settings $uiSettings -Principal $principal `
+      -Description '登录后自动打开 B站直播切片助手界面（等后端就绪后用 Edge 应用窗口打开，无控制台窗口）。移除：tools\autostart.ps1 -Remove' -Force | Out-Null
+    Ok "已注册界面任务：$uiTaskName（登录后 $uiDelaySec 秒自动打开界面）"
+  }
 
   # ⚠️ PS 5.1 的 `New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew` 的**读取**有坑：
   #    `(Get-ScheduledTask).Settings.MultipleInstancesPolicy` 读回来是空值，所以判断必须看**导出的 XML**。

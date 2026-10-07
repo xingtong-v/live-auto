@@ -174,6 +174,43 @@ section('③ 计划任务的动作：无窗口的守护脚本（不是可见窗�
 }
 
 /* ========================================================================== */
+section('③b 开机界面任务：登录后自动打开那个界面（用户明确要求）');
+{
+  /* 用户 2026-10-07 的提问：「测试开机自启，是不是开机时打开的这个界面？如果不是，修复他」。
+     背景：为了让"每 10 分钟闪一个终端窗口"彻底消失，自动那一路被我改成完全无窗口 ——
+     只起后端、不开界面。用户要的是**开机就能看到界面**，所以另开一个只在登录时跑一次的任务。
+     规则（每条都有实际理由）：
+       · 动作必须走 conhost --headless（否则 Windows Terminal 默认终端下会闪窗）；
+       · 界面任务**只挂登录触发器**，绝不能有 10 分钟重复 —— 否则每 10 分钟弹一次界面；
+       · open-ui.ps1 **不许**再去同步调用 ensure-service.ps1：实测那句在 conhost --headless 下
+         不返回，任务卡在 Running、界面永远打不开；
+       · 等不到后端也照样开界面（用户要的是"看到界面"，刷新一下就行）。 */
+  const uiXml = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', `Export-ScheduledTask -TaskName '${TASK_NAME} · 界面'`], {
+    encoding: 'utf8',
+  });
+  ok('界面任务已注册', uiXml.includes('<Task'), uiXml.slice(0, 80));
+  ok('★ 动作是 tools\\open-ui.ps1', /open-ui\.ps1/.test(uiXml), (uiXml.match(/<Arguments>.*?<\/Arguments>/) ?? [''])[0].slice(0, 200));
+  ok('★ 动作走 conhost.exe（无控制台窗口）', /<Command>\s*[^<]*conhost\.exe\s*<\/Command>/.test(uiXml), (uiXml.match(/<Command>.*?<\/Command>/) ?? [''])[0]);
+  ok('★ 只挂登录触发器（没有 10 分钟重复，否则会每 10 分钟弹界面）', /LogonTrigger/.test(uiXml) && !/<Interval>PT\d+M<\/Interval>/.test(uiXml), (uiXml.match(/<Interval>.*?<\/Interval>/) ?? ['(无重复)'])[0]);
+  ok('有执行时限（卡住的实例不会一直挂着）', /<ExecutionTimeLimit>PT5M<\/ExecutionTimeLimit>/.test(uiXml), (uiXml.match(/<ExecutionTimeLimit>.*?<\/ExecutionTimeLimit>/) ?? [''])[0]);
+
+  const ui = fs.readFileSync(path.join(ROOT_DIR, 'tools', 'open-ui.ps1'), 'utf8');
+  const uiCode = executableLines(ui);
+  ok('★ 不再同步调用 ensure-service.ps1（那一句在 headless 下不返回，实测卡死过）', !/ensure-service\.ps1/.test(uiCode), (uiCode.match(/.*ensure-service.*/) ?? [''])[0].trim());
+  ok('★ 不杀任何进程', !/Stop-Process|taskkill/i.test(uiCode));
+  ok('用 Edge 应用模式打开（和桌面快捷方式同一个窗口）', /--app=\$url/.test(ui) || /'--app='/.test(ui), '');
+  ok('探活用 HttpClient + CancellationToken（硬超时）', /HttpClient/.test(ui) && /CancellationTokenSource/.test(ui));
+  ok('等不到后端也照样打开界面（用户要的是看到界面）', /仍按用户要求打开界面/.test(ui));
+  ok('一分钟内不重复开（计划任务与启动文件夹可能都触发）', /已经开过界面，跳过/.test(ui));
+
+  const ac2 = fs.readFileSync(autostartPath, 'utf8');
+  ok('安装器默认注册界面任务', /Register-ScheduledTask -TaskName \$uiTaskName/.test(ac2));
+  ok('提供 -NoUiAtLogon 关掉它', /\$NoUiAtLogon/.test(ac2) && /已移除界面任务（-NoUiAtLogon）/.test(ac2));
+  ok('★ -Remove 会同时移除两个任务', /Unregister-ScheduledTask -TaskName \$uiTaskName -Confirm:\$false/.test(ac2));
+  ok('-Status 会显示界面任务状态', /登录后自动打开界面/.test(ac2));
+}
+
+/* ========================================================================== */
 section('④ 交互式 launcher.ps1：收尾只收自己的子进程（不许扫全机 node）');
 {
   const lc = fs.readFileSync(launcherPath, 'utf8');
