@@ -100,11 +100,32 @@ if (CHECK_ONLY) {
   process.exit(0);
 }
 
-/* ③ 用找到的入口推 */
-const push = run(['-c', `http.curloptResolve=${host}:443:${hit.ip}`, '-c', `http.version=${hit.ver}`, 'push', remote, branch], 180_000);
-console.log(push.out.trim());
-if (!push.ok) {
-  console.error(`✗ 推送失败：${lastLine(push.err)}`);
-  process.exit(1);
+/* ③ 用找到的入口推。
+ *
+ * ⚠️ 推送失败时要打**完整**的远端输出：第一次用这个工具时只打了 stderr 的最后一行
+ * （`error: failed to push some refs`），把真正的 `remote: Internal Server Error`
+ * 和它的 Request ID 藏掉了 —— 那正是唯一有用的信息（GitHub 侧 500，不是我们的问题）。
+ * 远端 500 是瞬时的，所以这里带重试。 */
+const pushArgs = ['-c', `http.curloptResolve=${host}:443:${hit.ip}`, '-c', `http.version=${hit.ver}`, 'push', remote, branch];
+let pushed = false;
+for (let attempt = 1; attempt <= 3 && !pushed; attempt++) {
+  const push = run(pushArgs, 300_000);
+  const detail = `${push.out}\n${push.err}`.trim();
+  if (push.ok) {
+    console.log(detail);
+    pushed = true;
+    break;
+  }
+  console.error(`✗ 第 ${attempt} 次推送失败，远端原文：\n${detail.split(/\r?\n/).map((l) => `    ${l}`).join('\n')}`);
+  const transient = /Internal Server Error|timed out|Connection was reset|Failed to connect|temporarily unavailable/i.test(detail);
+  if (!transient || attempt === 3) {
+    console.error(
+      transient
+        ? '✗ 三次都被远端/网络拒了 —— 稍后再试（GitHub 侧 500 通常几分钟就恢复；本地提交是安全的，不会丢）'
+        : '✗ 不是瞬时错误（多半是非快进 / 权限），先 git fetch 看一眼分叉，别硬推',
+    );
+    process.exit(1);
+  }
+  await new Promise((r) => setTimeout(r, attempt * 15_000));
 }
 console.log('✓ 已推送（走的是一次性路由覆盖，没改仓库配置）');
