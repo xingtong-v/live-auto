@@ -59,6 +59,7 @@ import { mergeDanmakuXmlFiles, pairSegmentDanmaku, chooseDanmaku } from './danma
 import { discoverRecordingFiles, findSiblingDanmaku, RECORDING_WINDOW_SEC } from './recordings.ts';
 import { GlossaryStore, correctTranscript, hotWordList } from './glossary.ts';
 import { TRASH_DIR, listTrash, moveToTrash, purgeTrash, restoreFromTrash, trashStats } from './trash.ts';
+import { reconcileTombstones } from './tombstone-reconcile.ts';
 import type {
   ArchiveItem,
   ClipRecord,
@@ -653,6 +654,13 @@ export class Orchestrator {
        而且用户取消删除之后，清单变化能很快反映到界面上。 */
     const pendingDeleteTick = (): void => {
       try {
+        /* ★ 先收尾"文件已经不在了"的条目（被监控面板的一键删除、本场成片目录清理、任务删除
+           等**别的路径**删掉的）：否则界面上会一直列着"文件已不在"的行，还要用户手工点一下，
+           表头的「N 个 / 共 X MB」也是虚的。这一步与开关无关 —— 它不删任何文件，只是把状态对齐。 */
+        const done = closeMissingPending({ logger: this.logger });
+        if (done.closed > 0) {
+          this.logger.info(`待删清单：${done.closed} 项的文件已经不在了，已自动收尾（不占界面、统计也不再计入）`);
+        }
         if (this.cfg.cleanup.deleteAfterUpload.enabled) {
           const r = runDueDeletions({ logger: this.logger });
           if (r.deleted > 0) {

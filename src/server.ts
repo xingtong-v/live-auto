@@ -30,7 +30,7 @@ import { hotWordsText } from './glossary.ts';
 import { checkClipTitles } from './title-check.ts';
 import { auditPublish, renderPublishAudit } from './publish-audit.ts';
 import { describeCandidate, findVideoProducts, listRecordingsDetailed, previewRecording } from './recordings.ts';
-import { cancelPendingDelete, deletePendingNow, listPendingDelete, runDueDeletions } from './pending-delete.ts';
+import { cancelPendingDelete, closeMissingPending, deletePendingNow, listPendingDelete, runDueDeletions } from './pending-delete.ts';
 import { moveToTrash } from './trash.ts';
 import { buildMcpTools, checkMcpToken, generateMcpToken, handleMcpMessage, type JsonRpcRequest } from './mcp.ts';
 import { PREVIEW_DIR, cleanupPreviews, makePreviewClip, previewFileName } from './preview.ts';
@@ -1595,6 +1595,10 @@ export class UiServer {
      * 用户要的是"上传完成后删掉切片和源文件"。删源不可逆，所以进清单后要能在界面上看见、
      * 并且一键取消 —— 这几个接口就是那个"取消"按钮的全部后端。 */
     if (p === '/api/pending-delete' && method === 'GET') {
+      /* 读之前先收尾"文件已经不在了"的条目 —— 界面上不该列着删不掉的东西（用户明确要求）。
+         这一步不删任何文件，只把状态对齐；成本是每条一次 existsSync（清单是几十条量级）。 */
+      const done = closeMissingPending({ logger: orch.logger });
+      if (done.closed > 0) this.invalidateMonitor();
       this.sendJson(res, 200, listPendingDelete());
       return;
     }
@@ -2630,6 +2634,9 @@ export class UiServer {
     /* ---- 4. 待删清单 ---- */
     let pendingDelete: Record<string, unknown> = { count: 0, items: [] };
     try {
+      /* 同 `/api/pending-delete`：先收尾"文件已经不在了"的条目，监控面板上的那张表
+         才不会显示删不掉的行（用户原话：「已经删除了 但是还是显示」）。 */
+      closeMissingPending({ logger: this.orch.logger });
       const pd = listPendingDelete();
       const items = [...pd.pending].sort((a, b) => Date.parse(a.dueAt) - Date.parse(b.dueAt));
       const dueTimes = items.map((i) => Date.parse(i.dueAt)).filter((n) => Number.isFinite(n));

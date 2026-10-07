@@ -27,7 +27,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { DATA_DIR, ensureDir, fnv1a, nowIso, readJson, writeJsonAtomic } from './util.ts';
+import { DATA_DIR, ensureDir, exists, fnv1a, nowIso, readJson, writeJsonAtomic } from './util.ts';
 import { TRASH_DIR, moveToTrash } from './trash.ts';
 import { log as globalLog, type Logger } from './logger.ts';
 
@@ -49,8 +49,8 @@ export interface PendingDeleteEntry {
   dueAt: string;
   cancelledAt?: string;
   deletedAt?: string;
-  /** 实际用的删法：移入回收站 / 直接删除 */
-  deletedBy?: 'trash' | 'rm';
+  /** 实际用的删法：移入回收站 / 直接删除；`missing` = 收尾时文件已经不在了（被别的路径删掉/移走） */
+  deletedBy?: 'trash' | 'rm' | 'missing';
   /**
    * 是**用户手动点了「立即删除」**删掉的（而不是宽限期到点自动删的）。
    *
@@ -479,6 +479,62 @@ export function runDueDeletions(
 
   save(statePath, state);
   return { deleted, failed, bytes, notes };
+}
+
+export interface CloseMissingResult {
+  /** 被自动收尾的条目数（文件已经不在了） */
+  closed: number;
+  /** 文件不在、但父目录也不在 → 保留（可能是整块盘/目录暂时不可用） */
+  kept: number;
+  closedIds: string[];
+}
+
+/**
+ * 把「文件已经不在了」的待删条目**自动收尾**（标记为已删除）。
+ *
+ * 为什么需要（用户原话：「这里的 已经删除了 但是还是显示 删除的不需要显示」，2026-10-08）：
+ *   同一个成片会被**好几条路径**删掉 —— 监控面板的「一键删除可投文件」、
+ *   「用完即删」清理本场成片目录、任务删除、用户手工删文件……
+ *   而待删清单只认自己删的那一次。结果是界面上一直列着「文件已不在」的行，
+ *   还得用户手工点一下「标记为已删除」，表头的「N 个 / 共 X MB」也是虚的
+ *   （那些体积其实早就释放了）。
+ *
+ * 判据里**要求父目录存在**：整块盘或整个目录不可用时（移动硬盘没插、网络盘掉线）
+ * 不算"文件被删了" —— 那种情况保留条目、让用户自己决定，避免把想删的东西悄悄放过。
+ *
+ * 幂等：已收尾的条目不会再次被计入。
+ */
+export function closeMissingPending(
+  opts: { statePath?: string; logger?: Logger; now?: number } = {},
+): CloseMissingResult {
+  const log = opts.logger ?? globalLog;
+  const statePath = opts.statePath ?? STATE_PATH;
+  const now = opts.now ?? Date.now();
+  const state = load(statePath);
+  const closedIds: string[] = [];
+  let kept = 0;
+
+  for (const entry of state.entries) {
+    if (entry.cancelledAt || entry.deletedAt) continue;
+    if (exists(entry.path)) continue;
+    if (!exists(path.dirname(entry.path))) {
+      // 整块目录都不在：可能是盘没挂上，交给用户判断（界面照旧显示「文件已不在」+ 手工按钮）
+      kept++;
+      continue;
+    }
+    entry.deletedAt = new Date(now).toISOString();
+    entry.deletedBy = 'missing';
+    entry.deletedManually = false;
+    entry.error = undefined;
+    closedIds.push(entry.id);
+    log.info(
+      `待删条目自动收尾：文件已经不在了（多半被别的清理路径删掉/移走了）：${entry.path}`,
+      { data: { id: entry.id, taskId: entry.taskId, kind: entry.kind } },
+    );
+  }
+
+  if (closedIds.length > 0) save(statePath, state);
+  return { closed: closedIds.length, kept, closedIds };
 }
 
 export interface DeleteNowItem {

@@ -20,6 +20,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   cancelPendingDelete,
+  closeMissingPending,
   deletePendingNow,
   listPendingDelete,
   runDueDeletions,
@@ -534,6 +535,76 @@ function main(): void {
     eq('立即删除命中了活的那条（deleted = 1）', dupDel.deleted.length, 1);
     eq('同盘 → 进回收站', dupDel.deleted[0]!.by, 'trash');
     ok(!fs.existsSync(dup2), '文件确实被删了（用户的点击不是"点了没反应"）');
+  }
+
+  /* ================= 9. 文件已经不在了 → 自动收尾，界面上不再显示 =================
+   * 用户原话（2026-10-08，配界面截图）：「这里的 已经删除了 但是还是显示 删除的不需要显示」。
+   * 同一个成片会被好几条路径删掉（监控面板的一键删除、清理本场成片目录、任务删除…），
+   * 待删清单只认自己删的那一次 —— 于是一直列着"文件已不在"，还要用户手工点「标记为已删除」，
+   * 表头的「N 个 / 共 X MB」也是虚的。这里钉住自动收尾的语义与边界。 */
+  section('9. 文件已经不在了 → 自动收尾（删掉的不该继续显示）');
+  {
+    const state = newState();
+    const t0 = 1_700_000_000_000;
+    const gone = writeFile(path.join(clipsDir, 'task-G', '01.mp4'), 4096);
+    const alive = writeFile(path.join(clipsDir, 'task-G', '02.mp4'), 8192);
+    scheduleDelete(
+      [
+        { path: gone, kind: 'clip', taskId: 'task-G', reason: '测试：文件后面会被别的路径删掉' },
+        { path: alive, kind: 'clip', taskId: 'task-G', reason: '测试：文件还在' },
+      ],
+      { graceHours: 24, statePath: state, now: t0, logger: quietLogger },
+    );
+    /* 模拟"被别的路径删掉"：直接抹掉文件（不进回收站，这正是用户遇到的情形） */
+    fs.rmSync(gone);
+
+    const r1 = closeMissingPending({ statePath: state, logger: quietLogger, now: t0 + 60_000 });
+    eq('收尾 1 项（文件不在的那个）', r1.closed, 1);
+    eq('文件还在的那个不动', r1.kept, 0);
+
+    const view = listPendingDelete({ statePath: state, now: t0 + 60_000 });
+    eq('★ 清单里只剩还在的那一条（界面上不再显示删不掉的行）', view.pending.length, 1);
+    eq('剩下那条就是文件还在的', view.pending[0]!.path, alive);
+    eq('统计里的体积也不再把已消失的文件算进去', view.stats.pendingBytes, 8192);
+    eq('收尾记录写进 deleted 桶（可追溯）', view.deleted.length, 1);
+    eq('收尾原因标成 missing（与"到点自动删""用户手点"区分开）', view.deleted[0]!.deletedBy, 'missing');
+    eq('不算用户手动删的', view.deleted[0]!.deletedManually, false);
+
+    const r2 = closeMissingPending({ statePath: state, logger: quietLogger, now: t0 + 120_000 });
+    eq('★ 幂等：再跑一次不会重复收尾', r2.closed, 0);
+
+    /* 到点执行时也不能把已收尾的那条再删一遍（否则回收站里会出现莫名其妙的条目） */
+    const before = listTrash(trashRoot).length;
+    const run = runDueDeletions({ statePath: state, now: t0 + 25 * 3600_000, trashRoot, logger: quietLogger });
+    eq('到点执行只删了还在的那一条', run.deleted, 1);
+    eq('回收站新增 1 条（没有为已消失的文件多造条目）', listTrash(trashRoot).length - before, 1);
+    ok(!fs.existsSync(alive), '还在的那条按期删掉了');
+  }
+
+  /* ================= 10. 整块目录都不在 → 不自动收尾（交给用户判断） ================= */
+  section('10. 父目录也不在（盘没挂上/目录没了）→ 保留条目，不悄悄放过');
+  {
+    const state = newState();
+    const t0 = 1_700_000_000_000;
+    /* 夹具本身指向一个不存在的目录：模拟"移动硬盘没插""网络盘掉线" */
+    const detachedDir = path.join(root, 'not-mounted-卷', 'task-H');
+    const p = path.join(detachedDir, '01.mp4');
+    fs.mkdirSync(detachedDir, { recursive: true });
+    const tmpFile = writeFile(p, 1024);
+    scheduleDelete([{ path: tmpFile, kind: 'clip', taskId: 'task-H', reason: '测试：整块目录消失' }], {
+      graceHours: 24,
+      statePath: state,
+      now: t0,
+      logger: quietLogger,
+    });
+    fs.rmSync(detachedDir, { recursive: true, force: true });
+
+    const r = closeMissingPending({ statePath: state, logger: quietLogger, now: t0 + 60_000 });
+    eq('父目录不在 → 不收尾', r.closed, 0);
+    eq('如实报出"保留了几条"（日志里能看见）', r.kept, 1);
+    const view = listPendingDelete({ statePath: state, now: t0 + 60_000 });
+    eq('★ 条目仍在清单里（用户还能自己判断、手工点「标记为已删除」）', view.pending.length, 1);
+    ok(view.pending[0]!.existsNow === false, '界面据 existsNow 显示「文件已不在」', String(view.pending[0]!.existsNow));
   }
 
   console.log('\n' + '─'.repeat(74));
