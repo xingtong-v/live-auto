@@ -75,7 +75,8 @@
     "stitch-test": "node test/stitch-fragments.ts",
     "boot-requeue-test": "node test/boot-requeue.ts",
     "multiselect-ui": "node --experimental-strip-types tools/verify-multiselect-ui.ts",
-    "push-safe": "node tools/push-safe.ts"
+    "push-safe": "node tools/push-safe.ts",
+    "prompt-audit": "node tools/prompt-audit.ts"
   },
   "dependencies": {
     "fast-xml-parser": "^5.2.5",
