@@ -3759,7 +3759,7 @@ node tools/push-safe.ts --check   # 只看现在哪条路通
 | 4 | 确认窗口 + 反查出口 | 阻塞式确认 300s → **90s**（把长尾交给每 5 分钟一轮的反查，不再占着流水线）；反查对**提交超过 1 小时仍未落地**的切片推送告警一次（新增 `alerter.publishUnconfirmed` + 台账 `unconfirmedAlertAt` 防重复打扰），卡片上给**「重新投稿这一片」**（服务端 `includeSubmitted: true` 才放行 SUBMITTED，UI 二次确认要求先去创作中心核实） |
 
 **实测结果**：修完后把 #10 通过新出口补投 ⇒ **15 秒内 PUBLISHED**，
-B站 稿件 `BV1oWpG69Etu` 出现 **P25「星瞳露露争夺于文波…」**，同场 11 片全在 ✓。
+B站 稿件 `BV1oWpG69Etu` 出现 **P25「乙主播露露争夺于文波…」**，同场 11 片全在 ✓。
 
 **同时如实报告一个已造成的后果**：同一场的另一路录制（`qadr`，同标题的另一段，同一个稿件）
 在那次风暴里把「纯良粉因打黑神话怪一小时没过…」投了两次 ⇒ 稿件里 **P22 / P24 内容重复** ✗。
@@ -4032,7 +4032,7 @@ AAC 117 kb/s。工具：新增 `tools/local-asr/ab-silence-trim.ts`（离线跑�
   **本该产生的分P 标题** + 对应切片序号；
 - `batch-landed` / `batch-failed` / `batch-unconfirmed`：结果行（追加写，读取时**以最后一行为准**）；
 - 反查（`confirmPublished`）新增**按批次对账**：用这一轮读到的分P 标题集合把每个未结批次判一遍，
-  写回结论并输出一句话（例：`批次 0bd3b6bf：提交 12 分钟，2/3 个分P 落地，缺：星瞳露露争夺于文波…`）；
+  写回结论并输出一句话（例：`批次 0bd3b6bf：提交 12 分钟，2/3 个分P 落地，缺：乙主播露露争夺于文波…`）；
 - `biliLive-tools` 报 `error` 时批次直接记 `failed`（与切片 FAILED 同源，不再含糊成"待确认"）。
 
 **验证**：新增 `test/publish-batches.ts`（**27 项**，已接入 `npm run verify`）：读写与归并、未结批次语义、
