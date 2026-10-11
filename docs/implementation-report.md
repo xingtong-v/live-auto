@@ -5226,3 +5226,43 @@ tools/local-asr 提到。⇒ 局限也如实写在索引里：**命令行手工�
 - `test/ui-shared-usage.ts` **13/0**；`verify:fast` **27 步 / 30.4 秒**；`typecheck` 干净；
 - 已迁移的两个脚本此前已真机验收：`verify-health-ui` **15/0**（跑两次一致），
   `verify-multiselect-ui` 空台账下失败（用 git 里的原版对照证实与迁移无关）。
+
+## 83. 代码层清理：死代码与静默异常（2026-10-14，只做了一半，另一半需要你定）
+
+### 83.1 先给证据（递归扫全仓 311 个代码文件）
+
+对 `src/**` + `tools/**`（含 `tools/local-asr`、`tools/archive`）+ `test/**` 全量检索，
+找出「只出现 1 次 = 定义处、没人用」的符号，共 14 个候选。
+
+**但复核后发现要分两类** —— 这是本轮最重要的发现：
+
+| 类别 | 符号 | 处置 |
+|---|---|---|
+| **普通遗留工具/常量（已删 5 个）** | `retitleSchema` · `chunkDigestSchema` · `FailureTracker`（analyze）· `appendTaskLog`（daemon）· `findPeaks` · `highEnergyEvents`（danmaku）· `PUBLISH_LOG_PATH`（ledger） | ✅ 已删（4 个文件，**−85 行**），`typecheck` 绿 |
+| **「未接线但有明确意图」（6 个，已暂缓）** | `detectSilence` · `planSilenceTrimmedCalls` · `withOverlap`（**静音裁剪**功能主体）<br>`scanCredentialShapes` + `walkScan` + `CREDENTIAL_SHAPES`（**凭据形态扫描**，注释说给 CI 用）<br>`isRecordComplete`（**录制完成静态判定**，69 行文档）<br>`describeSegments` · `shouldPassAss` | ⏸ **不删**：删它们等于**删功能**，属于产品决策 |
+
+**判据**：前一类是"功能早就换了实现、旧工具忘了删"；后一类是"功能设计过、但调用链从未接上"
+（例如 `asr.silenceTrim` 这个配置项还在、设置面板里还写着说明，可它的实现主体没有入口）。
+**这类只能二选一**：接回去（= 真正实现该功能）或连配置一起删（= 承认不做）—— 需要人来定。
+
+### 83.2 静默 catch 的分级（101 处，未改）
+
+按 `try` 块里实际在做什么自动分级：
+
+| 级别 | 处数 | 例子 |
+|---|---|---|
+| 可忽略 | **15** | 关连接、杀子进程、删临时文件 |
+| **★ 值得留痕** | **35** | 读文件、解析 JSON、网络请求、子进程调用 |
+| 待人工看 | 51 | 其余 |
+
+下一步（未做）：加一个 `ignoreErr(e, note)` 助手（默认静默、`LA_IGNORE_LOG=1` 时打到 stderr），
+把那 35 处从"纯注释"换成"可被打开的痕迹"—— 出问题时不至于一片空白。
+
+### 83.3 方法教训（本轮又踩了三次）
+
+用脚本做"括号配平 + 整块删除"**连续失败三次**：多行签名的函数（声明行没有 `{`）删成残缺、
+类体定界失败留下半个类、以及一次**多删 49 行**吞掉了下一个函数 ✗。所幸每次都被 `tsc` 立刻拦下、
+每次都 `git checkout -- src/` 全量回滚（`media.ts` 那次还连带 42 步测试失败 ✗）。
+
+**定规**：删代码**只能**"`read` 出完整段落 → `edit` 精确替换"（本轮删掉的 5 个就是这么做的 ✓，
+每改完跑 `typecheck` ✓）。**"脚本拼装删除"在这个代码库上不可靠** ✗。

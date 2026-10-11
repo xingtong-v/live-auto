@@ -974,20 +974,6 @@ function itemsInRange(items: DanmakuItem[], start: number, end: number, limit: n
   return out;
 }
 
-/**
- * 密度峰值 Top-N。
- *  - 先按 minIntensity 归一化阈值挑出「热窗口」，再把间隔小于 minGapSec 的热窗口并成一个峰，
- *    避免同一个高能片段被切成好几个相邻峰（默认 30 秒）；
- *  - count = 峰内弹幕总数；intensity = 峰内最热单窗口 / 全场最热单窗口，天然落在 0–1；
- *  - items 传入时给每个峰附上该时间窗自己的热词（给 LLM 用），不传则为空数组。
- */
-export function findPeaks(
-  density: DensityPoint[],
-  opts: { topN: number; minIntensity?: number; items?: DanmakuItem[]; minGapSec?: number },
-): PeakWindow[] {
-  return findPeaksWithNoise(density, opts, []);
-}
-
 function findPeaksWithNoise(
   density: DensityPoint[],
   opts: { topN: number; minIntensity?: number; items?: DanmakuItem[]; minGapSec?: number },
@@ -1210,11 +1196,6 @@ export function extractKeywords(
     picked.push({ word: cand.word, count: cand.count });
   }
   return picked;
-}
-
-/** 高能事件（SC / 上舰 / 礼物）列表，按时间排序 */
-export function highEnergyEvents(items: DanmakuItem[]): DanmakuItem[] {
-  return items.filter((it) => it.kind !== 'danmaku').sort((a, b) => a.time - b.time);
 }
 
 /* ============================================================================

@@ -3905,15 +3905,6 @@ export function summarizeTask(  t: TaskRecord,
   };
 }
 
-/** 追加一条通用流水（供 UI 显示事件日志） */
-export function appendTaskLog(dir: string, entry: { at: string; level: string; msg: string; data?: unknown }): void {
-  try {
-    appendJsonl(path.join(dir, 'events.jsonl'), entry);
-  } catch {
-    /* 日志写失败不影响业务 */
-  }
-}
-
 /** 素材保留说明（UI 右栏「素材」区） */
 export function retentionNote(task: TaskRecord, cfg: AppConfig): { keep: boolean; note: string } {
   const v = judgeDeletability(task, cfg, { now: Date.now() });

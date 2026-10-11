@@ -60,9 +60,6 @@ import {
  * 路径与常量
  * ========================================================================== */
 
-/** 投稿动作流水路径（util.ts 未定义，按 data/ 约定收在本模块） */
-export const PUBLISH_LOG_PATH = path.join(DATA_DIR, 'publish-log.jsonl');
-
 /** 每场任务目录下的固定文件名（目录由 ledger 创建，其它模块按此约定读写） */
 export const TASK_FILES = {
   signals: 'signals.json',

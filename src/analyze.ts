@@ -65,33 +65,6 @@ export const selectionSchema = z.object({
   clips: z.array(clipCandidateSchema).min(1),
 });
 
-export const retitleSchema = z.object({
-  titles: z
-    .array(
-      z.object({
-        index: z.number().int().nonnegative(),
-        title: z.string().min(1).max(80),
-        desc: z.string().max(250).default(''),
-        tags: z.array(z.string().min(1).max(24)).min(1).max(10).default([]),
-      }),
-    )
-    .min(1),
-});
-
-export const chunkDigestSchema = z.object({
-  topics: z.array(z.string().min(1).max(60)).max(8).default([]),
-  highlights: z
-    .array(
-      z.object({
-        time: z.number().finite(),
-        what: z.string().min(1).max(120),
-        why: z.string().max(120).default(''),
-      }),
-    )
-    .max(10)
-    .default([]),
-});
-
 export const chunkOutputSchema = z.object({
   topics: z.array(z.string().min(1).max(60)).max(8).default([]),
   highlights: z
@@ -1558,33 +1531,6 @@ function topNgrams(text: string, topN: number): string[] {
     .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
     .slice(0, topN)
     .map(([w]) => w);
-}
-
-/**
- * 「完全不可用」的判定：**连续 3 次调用失败（含升级模型后的重试）且失败原因非契约校验**
- * （如网络、鉴权、限流）。单次失败不触发降级，先走升级模型重跑。
- */
-export class FailureTracker {
-  private consecutive = 0;
-  private threshold: number;
-  constructor(threshold: number) {
-    this.threshold = Math.max(1, threshold);
-  }
-  /** 记一次失败，返回是否达到降级阈值 */
-  fail(type: string): boolean {
-    if (type === 'contract') {
-      // 契约失败不算「不可用」，它有自己的升级重跑路径
-      return false;
-    }
-    this.consecutive++;
-    return this.consecutive >= this.threshold;
-  }
-  success(): void {
-    this.consecutive = 0;
-  }
-  get count(): number {
-    return this.consecutive;
-  }
 }
 
 /* ============================================================================

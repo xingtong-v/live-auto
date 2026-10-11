@@ -25,3 +25,5 @@
 - [x] 2026-10-11T07:50:55Z | session:9aa24b6c-aef | 浏览器验收脚本去重：抽共享件 tools/ui-shared.ts（2/9 已转） tools/ui-shared.ts tools/verify-health-ui.ts tools/verify-multiselect-ui.ts | 文件：
 
 - [x] 2026-10-11T08:02:02Z | session:9aa24b6c-aef | 共享件收口：机会式采用 + 防新增副本闸门 + 归档 ui-diag tools/ui-shared.ts test/ui-shared-usage.ts tools/archive/README.md | 文件：
+
+- [ ] 2026-10-11T09:40:35Z | session:9aa24b6c-aef | 代码层清理：删 5 个遗留符号（86 行）+ 死代码/静默异常分级报告 src/analyze.ts src/daemon.ts src/danmaku.ts src/ledger.ts docs/implementation-report.md | 文件：
