@@ -17,107 +17,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ROOT_DIR, ensureDir, sleep } from '../src/util.ts';
+import { eq, launchBrowser, ok, report } from './ui-shared.ts';
 
 const BASE = 'http://127.0.0.1:3000';
 /* 与 ui-e2e（9333）、verify-perf-ui（9335）、verify-health-ui（9336）错开 */
 const PORT = 9337;
 const HEADED = process.argv.includes('--headed');
 
-let pass = 0;
-let fail = 0;
-const failures: string[] = [];
-function ok(name: string, cond: boolean, detail?: string): void {
-  if (cond) {
-    pass++;
-    console.log(`  \x1b[32m✓\x1b[0m ${name}`);
-  } else {
-    fail++;
-    failures.push(detail ? `${name} :: ${detail}` : name);
-    console.log(`  \x1b[31m✗\x1b[0m ${name}${detail ? ` :: ${detail}` : ''}`);
-  }
-}
-function eq<T>(name: string, actual: T, expected: T, detail?: string): void {
-  ok(name, JSON.stringify(actual) === JSON.stringify(expected), detail ?? `期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`);
-}
 
 /* ---- 极简 CDP（与 verify-perf-ui / verify-health-ui 同一套写法） ---- */
-class Cdp {
-  private ws: WebSocket;
-  private seq = 0;
-  private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
-  private readonly pageErrors: string[] = [];
-  private constructor(ws: WebSocket) {
-    this.ws = ws;
-    ws.addEventListener('message', (ev) => {
-      let m: { id?: number; method?: string; params?: unknown };
-      try {
-        m = JSON.parse(String(ev.data)) as typeof m;
-      } catch {
-        return;
-      }
-      if (typeof m.id === 'number') {
-        const p = this.pending.get(m.id);
-        if (!p) return;
-        this.pending.delete(m.id);
-        const err = (m as { error?: { message?: string } }).error;
-        if (err) p.reject(new Error(err.message ?? 'CDP 错误'));
-        else p.resolve((m as { result?: unknown }).result);
-        return;
-      }
-      if (m.method === 'Runtime.exceptionThrown') {
-        const p = m.params as { exceptionDetails?: { exception?: { description?: string } } };
-        this.pageErrors.push(p.exceptionDetails?.exception?.description ?? '页面异常');
-      }
-    });
-  }
-  static async attach(port: number): Promise<Cdp> {
-    const deadline = Date.now() + 20000;
-    for (;;) {
-      try {
-        const list = (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()) as Array<{ type: string; webSocketDebuggerUrl?: string }>;
-        const t = list.find((x) => x.type === 'page' && x.webSocketDebuggerUrl);
-        if (t) {
-          const ws = new WebSocket(t.webSocketDebuggerUrl!);
-          const c = new Cdp(ws);
-          await new Promise<void>((res, rej) => {
-            ws.addEventListener('open', () => res(), { once: true });
-            ws.addEventListener('error', () => rej(new Error('WebSocket 连接失败')), { once: true });
-          });
-          await c.send('Runtime.enable');
-          await c.send('Page.enable');
-          return c;
-        }
-      } catch {
-        /* 端口还没起来 */
-      }
-      if (Date.now() > deadline) throw new Error('等不到 Edge 调试端口');
-      await sleep(300);
-    }
-  }
-  send(method: string, params: Record<string, unknown> = {}, timeoutMs = 30000): Promise<unknown> {
-    const id = ++this.seq;
-    return new Promise((resolve, reject) => {
-      const t = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`CDP 超时：${method}`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve: (v) => { clearTimeout(t); resolve(v); }, reject: (e) => { clearTimeout(t); reject(e); } });
-      this.ws.send(JSON.stringify({ id, method, params }));
-    });
-  }
-  async evalJs<T>(expr: string): Promise<T> {
-    const r = (await this.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true, userGesture: true })) as {
-      result?: { value?: unknown };
-      exceptionDetails?: { exception?: { description?: string } };
-    };
-    if (r.exceptionDetails) throw new Error(`页面 JS 异常：${r.exceptionDetails.exception?.description ?? ''}`);
-    return r.result?.value as T;
-  }
-  get errors(): string[] {
-    return [...this.pageErrors];
-  }
-  close(): void { try { this.ws.close(); } catch { /* ignore */ } }
-}
 
 async function main(): Promise<void> {
   console.log('\x1b[1m任务多选批量删除（真浏览器，零删除）\x1b[0m');
@@ -138,34 +46,8 @@ async function main(): Promise<void> {
   const publishedBefore = (api.tasks ?? []).filter((t) => ['PUBLISHED', 'ARCHIVED'].includes(String((t as { status?: string }).status))).length;
   console.log(`  \x1b[90m接口：任务 ${tasksBefore} 个，其中已发布 ${publishedBefore} 个\x1b[0m`);
 
-  const edge = [
-    `${process.env['ProgramFiles(x86)'] ?? ''}\\Microsoft\\Edge\\Application\\msedge.exe`,
-    `${process.env['ProgramFiles'] ?? ''}\\Microsoft\\Edge\\Application\\msedge.exe`,
-    `${process.env['LOCALAPPDATA'] ?? ''}\\Microsoft\\Edge\\Application\\msedge.exe`,
-  ].find((p) => p && fs.existsSync(p));
-  if (!edge) {
-    console.log('  \x1b[31m找不到 Edge\x1b[0m');
-    process.exit(1);
-  }
-  const userDataDir = path.join(os.tmpdir(), `live-auto-multiui-${Date.now()}`);
-  const child: ChildProcess = spawn(
-    edge,
-    [
-      `--remote-debugging-port=${PORT}`,
-      `--user-data-dir=${userDataDir}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-extensions',
-      '--window-size=1700,1400',
-      ...(HEADED ? [] : ['--headless=new']),
-      'about:blank',
-    ],
-    { stdio: 'ignore', detached: false },
-  );
-
-  let cdp: Cdp | undefined;
+  const { cdp, close } = await launchBrowser({ port: PORT, headed: HEADED });
   try {
-    cdp = await Cdp.attach(PORT);
     await cdp.send('Page.navigate', { url: BASE + '/' });
     for (let i = 0; i < 60; i++) {
       if (await cdp.evalJs<boolean>('!!document.querySelector("#taskList .task")').catch(() => false)) break;
@@ -260,18 +142,11 @@ async function main(): Promise<void> {
       console.log(`  \x1b[90m截图：${file}\x1b[0m`);
     }
   } finally {
-    cdp?.close();
-    try { child.kill(); } catch { /* ignore */ }
-    await sleep(300);
-    try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    await close();
+  await report();
   }
 
-  console.log(`\n\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);
-  if (failures.length) {
-    console.log('\x1b[31m失败项：\x1b[0m');
-    for (const f of failures) console.log(`  - ${f}`);
-  }
-  process.exitCode = fail === 0 ? 0 : 1;
+  await report();
 }
 
 await main();
