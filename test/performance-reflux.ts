@@ -461,7 +461,11 @@ const get = async (p: string): Promise<Record<string, unknown>> => {
 
   const r2 = await post('/api/performance/refresh');
   eq('★ 同一天再回流：不再重复打接口（候选为 0）', r2['checked'], 0);
-  ok('给出原因说明而不是静默 empty', String((r2['notes'] as string[]).join(' ')).includes('已拉过'), JSON.stringify(r2['notes']));
+  /* 只锁「必须给出明确原因」，**不锁具体措辞**：
+     2026-10-14 实测同代码在"当天第一次跑"通过、重复跑失败 —— 原因是它死盯着连续子串 `已拉过`，
+     而实际文案是「今天**已经**拉过一轮了（每日一次）…」。断言该守"不许静默 empty"这个性质。 */
+  const why2 = String((r2['notes'] as string[]).join(' '));
+  ok('给出原因说明而不是静默 empty', /每日一次|已拉过|已经拉过/.test(why2), why2);
   eq('详情接口调用次数没有增加（确实没打网络）', detailCalls, 6);
 
   const jsonl = fs.readFileSync(path.join(dataDir, 'performance.jsonl'), 'utf8').trim().split('\n');

@@ -20,4 +20,4 @@
 
 - [x] 2026-10-11T06:32:47Z | session:9aa24b6c-aef | 设置面板：为 asr.incrementalEnabled 加界面开关（含重启提示） web/src/42-设置弹窗.js test/config-coverage.ts tools/verify-tabs.ts | 文件：
 
-- [ ] 2026-10-11T07:28:48Z | session:9aa24b6c-aef | 归档 96 个零引用工具 + 设置面板实测标注 tools/archive/README.md web/src/42-设置弹窗.js test/config-coverage.ts | 文件：
+- [x] 2026-10-11T07:28:48Z | session:9aa24b6c-aef | 归档 96 个零引用工具 + 设置面板实测标注 tools/archive/README.md web/src/42-设置弹窗.js test/config-coverage.ts | 文件：
