@@ -107,5 +107,7 @@
 | `watch-scan-probe.ts` | 4.1 KB | 探查：`import.watch.dirs` 到底有没有参与扫盘。 |
 | `watch-task.ts` | 4.6 KB | 盯着一个任务跑完：轮询 /api/task/:id，把阶段时间线、切片数、状态变化打出来。 |
 
+| `ui-diag.ts` | 9.0 KB | UI 精确诊断：把页面跑起来后，逐项检查「为什么点不动」。 |
+
 > 判定口径：没有被 package.json / README / 实现报告 / verify 清单 / src / tools/local-asr 提到。
 > 如果你手工敲过其中某个脚本（命令行用法检索不到），把它挪回 `tools/` 即可。

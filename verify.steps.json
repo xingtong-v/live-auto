@@ -211,6 +211,11 @@
       "fast": true
     },
     {
+      "name": "ui-shared-usage-test",
+      "cmd": "npm run ui-shared-usage-test",
+      "fast": true
+    },
+    {
       "name": "config-coverage-test",
       "cmd": "npm run config-coverage-test",
       "fast": true

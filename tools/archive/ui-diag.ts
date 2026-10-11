@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { ROOT_DIR, sleep, ensureDir } from '../src/util.ts';
+import { ROOT_DIR, sleep, ensureDir } from '../../src/util.ts';
 
 const BASE = 'http://127.0.0.1:3000';
 const PORT = 9335;

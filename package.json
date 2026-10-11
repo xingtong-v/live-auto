@@ -110,7 +110,8 @@
     "cover-test": "node test/cover.ts",
     "guard": "node tools/guard.ts",
     "pre-transcribe-test": "node test/pre-transcribe.ts",
-    "pre-transcribe-tick-test": "node test/pre-transcribe-tick.ts"
+    "pre-transcribe-tick-test": "node test/pre-transcribe-tick.ts",
+    "ui-shared-usage-test": "node test/ui-shared-usage.ts"
   },
   "dependencies": {
     "fast-xml-parser": "^5.2.5",

@@ -5179,3 +5179,50 @@ tools/local-asr 提到。⇒ 局限也如实写在索引里：**命令行手工�
 其余 7 个脚本（`verify-tabs` / `verify-monitor-ui` / `verify-perf-ui` / `verify-tombstone-ui` /
 `verify-error-report-ui` / `verify-subtitle-switch` / `ui-e2e`）仍是自带驱动；`ui-diag.ts`（191 行、0 断言）
 仍是归档候选。
+
+## 82. 共享件的收口：机会式采用 + 一道"不许再长出新副本"的闸门（2026-10-14）
+
+### 82.1 决策（方案 A + C）
+
+§81 抽出 `tools/ui-shared.ts` 并迁了 2 个脚本（`verify-health-ui` / `verify-multiselect-ui`，各 −130 行）。
+对其余 6 个**不做强行迁移** —— 逐一核对锚点后发现它们是"各自演化过的脚本"：
+
+| 文件 | 锚点不合的原因（由转换器的校验逐条报出） |
+|---|---|
+| `verify-tabs.ts` | 顶层直接起浏览器、紧凑单行类、计数变量定义方式不同 |
+| `verify-monitor-ui.ts` / `verify-tombstone-ui.ts` / `verify-error-report-ui.ts` | 没有 `process.exitCode = fail` 这一行（汇总写法不同） |
+| `verify-subtitle-switch.ts` | 没有 `class Cdp`（它复用别的东西） |
+| `ui-e2e.ts` | 1357 行、多段 try、attach 位置不同 |
+
+**判据**：它们是**正在稳定工作、已通过真机验收**的脚本；为"少 700 行重复"去churn 它们的风险大于收益
+⇒ 采用**机会式采用**：新脚本一律用共享件，老脚本等下次因**真实原因**被改动时顺手迁移。
+
+### 82.2 配套闸门：`test/ui-shared-usage.ts`（13 项，已进 verify 快速层）
+
+只减不增的名单 + 四条断言：
+
+1. **没有"既不在历史名单、又不用共享件"的浏览器脚本** —— 新脚本必须 import 共享件；
+2. **不许再长出新副本**：`tools/` 下除共享件与名单内 6 个文件外，任何文件都不得定义 `class Cdp`
+   （这是"修一处要改十处"的根因，必须堵住）；
+3. 共享件必须导出约定的 API（含 `launchBrowser` / `ok` / `eq` / `report` / `readonly errors`），
+   且不得踩本项目禁用的语法（构造函数参数属性）；
+4. 已归档的 `ui-diag.ts` 不许回到 `tools/` 顶层。
+
+**名单是只减不增的**：迁走一个就从名单删一个（断言会提醒）。
+
+### 82.3 归档 `ui-diag.ts`（方案 C）
+
+191 行、**0 条断言**、没有 npm 脚本、无人引用 ⇒ `git mv` 到 `tools/archive/`（并修正其相对 import 层级、
+在归档索引 README 里补一行说明）。`tools/` 顶层 .ts 数：**68 → 67**。
+
+### 82.4 一处自查出来的显示错误（如实记）
+
+闸门头一版跑出来写着「已用共享件 **0**」✗ —— 因为迁过的两个脚本**已经不含 `class Cdp`/`attach`**，
+于是被排除在"浏览器相关脚本"之外，计数自然为 0。断言本身是对的，但**这行字会误导人** ⇒ 已改成单独统计
+"import 了共享件的文件"（现在正确显示 `3 个：ui-shared.ts, verify-health-ui.ts, verify-multiselect-ui.ts`）。
+
+### 82.5 验证
+
+- `test/ui-shared-usage.ts` **13/0**；`verify:fast` **27 步 / 30.4 秒**；`typecheck` 干净；
+- 已迁移的两个脚本此前已真机验收：`verify-health-ui` **15/0**（跑两次一致），
+  `verify-multiselect-ui` 空台账下失败（用 git 里的原版对照证实与迁移无关）。
