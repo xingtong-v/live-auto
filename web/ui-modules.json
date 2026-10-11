@@ -1,0 +1,110 @@
+{
+  "note": "这些片段按序拼接即 public/ui.html；改 UI 请改模块后跑 npm run build:ui",
+  "parts": [
+    {
+      "file": "00-shell-head.html",
+      "kind": "shell",
+      "label": "HTML 外壳（head + 顶栏 + 页签）"
+    },
+    {
+      "file": "10-style.css",
+      "kind": "css",
+      "label": "样式"
+    },
+    {
+      "file": "20-shell-body.html",
+      "kind": "shell",
+      "label": "HTML 外壳（各页签容器 + 弹窗）"
+    },
+    {
+      "file": "30-脚本分块-1.js",
+      "kind": "js",
+      "label": "脚本分块 1"
+    },
+    {
+      "file": "31-基础.js",
+      "kind": "js",
+      "label": "基础"
+    },
+    {
+      "file": "32-数据加载.js",
+      "kind": "js",
+      "label": "数据加载"
+    },
+    {
+      "file": "33-左栏-任务列表.js",
+      "kind": "js",
+      "label": "左栏：任务列表"
+    },
+    {
+      "file": "34-任务操作菜单-列表项的-按钮与右键都能打开.js",
+      "kind": "js",
+      "label": "任务操作菜单（列表项的「⋯」按钮与右键都能打开）"
+    },
+    {
+      "file": "35-中栏-本场详情.js",
+      "kind": "js",
+      "label": "中栏：本场详情"
+    },
+    {
+      "file": "36-中栏交互.js",
+      "kind": "js",
+      "label": "中栏交互"
+    },
+    {
+      "file": "37-右栏-发布排期.js",
+      "kind": "js",
+      "label": "右栏：发布排期"
+    },
+    {
+      "file": "38-排期栏的逐片操作-编辑-改发布时间-删除.js",
+      "kind": "js",
+      "label": "排期栏的逐片操作：编辑 / 改发布时间 / 删除"
+    },
+    {
+      "file": "39-其它页签-健康-成本-表现-Prompt.js",
+      "kind": "js",
+      "label": "其它页签：健康 / 成本 / 表现 / Prompt"
+    },
+    {
+      "file": "40-实时监控-api-monitor-默认-5-秒自动刷新.js",
+      "kind": "js",
+      "label": "实时监控（/api/monitor，默认 5 秒自动刷新）"
+    },
+    {
+      "file": "41-切片库与稿件视图-跨场次检索-按-bvid-体检稿件.js",
+      "kind": "js",
+      "label": "切片库与稿件视图（跨场次检索 / 按 bvid 体检稿件）"
+    },
+    {
+      "file": "42-设置弹窗.js",
+      "kind": "js",
+      "label": "设置弹窗"
+    },
+    {
+      "file": "43-通用弹窗.js",
+      "kind": "js",
+      "label": "通用弹窗"
+    },
+    {
+      "file": "44-顶栏与事件绑定.js",
+      "kind": "js",
+      "label": "顶栏与事件绑定"
+    },
+    {
+      "file": "45-导入录播-参考-biliLive-tools-的做法-列出可导入的录播让用户点选.js",
+      "kind": "js",
+      "label": "导入录播（参考 biliLive-tools 的做法：列出可导入的录播让用户点选）"
+    },
+    {
+      "file": "46-启动.js",
+      "kind": "js",
+      "label": "启动"
+    },
+    {
+      "file": "90-shell-end.html",
+      "kind": "shell",
+      "label": "HTML 外壳（收尾）"
+    }
+  ]
+}

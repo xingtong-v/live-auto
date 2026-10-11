@@ -391,12 +391,21 @@
 </div>
 
 <div class="tabs" id="tabs">
-  <button class="tab on" data-view="tasks">任务</button>
-  <button class="tab" data-view="monitor">实时监控</button>
-  <button class="tab" data-view="health">健康面板</button>
-  <button class="tab" data-view="cost">成本</button>
-  <button class="tab" data-view="perf">稿件表现</button>
-  <button class="tab" data-view="prompts">Prompt</button>
+  <!-- P1-7（2026-10-13）：页签**分组**（分隔线 + 悬停说明）+ 每个页签一句"什么时候来这儿"。
+       为什么用 title 而不是加一行说明文字：不动布局、不占高度，且鼠标一停就能看到。
+       三个分组：干活（任务/实时监控）｜运维（健康面板/待删回收站）｜资产（稿件表现/切片库/Prompt）。 -->
+  <button class="tab on" data-view="tasks" title="日常入口：看场次列表、审核切片、改标题、发布">任务</button>
+  <button class="tab" data-view="monitor" title="正在跑什么、在等什么、为什么没动（默认 5 秒自动刷新）">实时监控</button>
+  <span class="tabsep" style="width:1px;height:16px;background:var(--border);margin:0 8px;display:inline-block;vertical-align:middle"></span>
+  <button class="tab" data-view="health" title="现在有没有需要你处理的事（待办）/ 错误 / 磁盘 / 自检">健康面板</button>
+  <!-- ★ 2026-10-11 用户要求：「将这两个（查看回收站 / 查看待删清单）放到成本的位置，然后将成本放到稿件表现里」；
+       随后又要求「待删清单和回收站放一起」—— 两者本来就是同一条生命周期上的两段（待删 → 已删可恢复），
+       合并成一页两段，顺带去掉重复了两遍的"最近已删除"列表。 -->
+  <button class="tab" data-view="trash" title="用完即删的宽限期内可反悔 / 已删除的可恢复（按天折叠）">待删 / 回收站<span id="pendingTabBadge"></span></button>
+  <span class="tabsep" style="width:1px;height:16px;background:var(--border);margin:0 8px;display:inline-block;vertical-align:middle"></span>
+  <button class="tab" data-view="perf" title="长期资产视角：已发布稿件的播放/点赞/评分，以及月度成本">稿件表现</button>
+  <button class="tab" data-view="clips" title="跨场次找切片：按标题/状态/评分检索，可试看、可跳到那一场">切片库</button>
+  <button class="tab" data-view="prompts" title="选片与标题的提示词（改这里会影响后续场次的挑选质量）">Prompt</button>
 </div>
 
 <div id="viewTasks">
@@ -413,6 +422,8 @@
         </div>
         <button class="ghost" id="btnMulti" title="多选：批量删除任务（一次清理一批已发布的场次）">多选</button>
       </div>
+      <!-- 测试夹具开关（默认隐藏；由 renderTaskList 按实际条数填充，没有夹具时这里是空的） -->
+      <div id="fixtureToggleBar" style="padding:0 12px 6px"></div>
       <div id="multiBar" style="display:none"></div>
       <div id="taskList"></div>
     </aside>
@@ -460,7 +471,7 @@
 const BOOT = window.__BOOT__ || { csrf: '', version: '?', roomId: '', platform: '' };
 
 /** UI 构建标记：在浏览器控制台里能看到，用来确认页面是不是最新的（避免缓存导致以为功能没做） */
-const UI_BUILD = 'ui-2026-10-08-perf-pubdate';
+const UI_BUILD = 'ui-2026-10-14-perf-refresh';
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -668,16 +679,16 @@ async function refreshAll(silent) {
 }
 
 /**
- * 待删清单角标：有待删文件时直接在按钮上显示数量和释放空间。
+ * 待删清单角标：有待删文件时直接在**页签**上显示数量和释放空间。
  *
- * 为什么要在按钮上提示而不是只在弹窗里：这个功能的默认宽限期是 24 小时，
+ * 为什么要在页签上提示而不是只写在页面里：这个功能的默认宽限期是 24 小时，
  * 用户很可能根本不记得它还挂着 —— 到点删掉了源录播才发现就晚了。
+ * （2026-10-11：入口从设置弹窗搬到了标签栏，角标跟着搬到页签上；旧 id 保留兼容。）
  */
 async function refreshPendingBadge() {
-  const btn = $('#btnPendingDelete');
-  const badge = $('#pendingDeleteBadge');
+  const badge = $('#pendingTabBadge') || $('#pendingDeleteBadge');
   const hint = $('#pendingDeleteHint');
-  if (!btn || !badge) return;
+  if (!badge) return;
   try {
     const r = await api('/api/pending-delete');
     const n = r.stats.pendingCount;
@@ -705,6 +716,12 @@ async function refreshPendingBadge() {
  */
 async function deletePendingNow(ids, entries) {
   const list = (entries || []).filter((e) => ids.includes(e.id));
+  /* 防御：真要删的条目一个都不在**待删**清单里（比如界面给了已删条目的按钮、或清单刚被别处刷新过）
+     就别弹"共 0.0 MB"那种莫名其妙的话 —— 直接说清并收手。 */
+  if (ids.length === 0 || list.length === 0) {
+    toast('这些条目已经处理过了，无需再删', 5000);
+    return null;
+  }
   const permanent = list.filter((e) => e.willTrash === false);
   const gone = list.filter((e) => e.existsNow === false);
   const mb = (list.reduce((a, e) => a + (Number(e.sizeBytes) || 0), 0) / 1048576).toFixed(1);
@@ -725,8 +742,13 @@ async function deletePendingNow(ids, entries) {
   return r;
 }
 
-/** 待删条目的一行标签与按钮（清单弹窗与监控面板共用，两处文案不能漂移） */
+/** 待删条目的一行标签与按钮（清单页 / 监控面板共用，两处文案不能漂移） */
 function pendingRowActions(e, opts = {}) {
+  /* ★ 2026-10-11 用户实测踩到：**「最近已删除」的行也挂着「立即删除」按钮** ——
+     点下去还弹「立即删除 1 个文件（共 0.0 MB）？」，纯属误导（文件早就不在了；
+     服务端会把它归到 skipped「这一条已经删过了」）。已删条目只留结果说明，不给任何动作按钮。
+     行正文里已经写了「已移入回收站 / 已永久删除」（`deletedBy`），所以这里什么都不用再挂。 */
+  if (e.deletedAt || e.deletedBy) return e.deletedBy ? '' : '<span class="tag-mini">已删除</span>';
   const willTrash = e.willTrash !== false;
   const tag = e.existsNow === false
     ? '<span class="tag-mini">文件已不在</span>'
@@ -937,12 +959,19 @@ function renderTaskList() {
   const group = (s) => (['PUBLISHED', 'ARCHIVED'].includes(s) ? 'published'
     : s === 'FAILED' ? 'failed' : s === 'ANALYZED' ? 'review' : 'processing');
   const multi = state.multi.on;
+  /* ★ 2026-10-11：**测试夹具默认不显示**（用户最早的抱怨就是"列表太长"，而实测每天 38–45 个任务里
+     真实直播只有 2–7 场，其余全是 `测试场次`/`【界面测试】…` 这类夹具，由自动化测试造出来）。
+     不静默丢弃：条数写在下面的开关上，想看随时点开；成本统计也同步排除（口径见 src/fixtures.ts）。 */
+  const all = state.tasks;
+  const fixtures = all.filter((t) => t.fixture);
+  const shown = showFixtureTasks ? all : all.filter((t) => !t.fixture);
   // 只保留还在列表里的选中项（切换筛选/搜索后不要把看不见的任务也删掉）
-  const visible = new Set(state.tasks.map((t) => t.id));
+  const visible = new Set(shown.map((t) => t.id));
   state.multi.sel.forEach((id) => { if (!visible.has(id)) state.multi.sel.delete(id); });
-  $('#taskList').innerHTML = state.tasks.length ? state.tasks.map((t) => {
+  $('#taskList').innerHTML = shown.length ? shown.map((t) => {
     const g = group(t.status);
     const extra = [];
+    if (t.fixture) extra.push('🔧 测试夹具');
     if (t.progress) extra.push(`${t.progress.label}`);
     if (t.clipCount) extra.push(`${t.clipCount} 候选`);
     if (t.degradedCount) extra.push(`${t.degradedCount} 降级`);
@@ -959,7 +988,18 @@ function renderTaskList() {
       <div class="meta"><span class="badge ${badge[g] || 'b-idle'}">${esc(t.statusText)}</span>${extra.map((x) => `<span>${esc(x)}</span>`).join('')}</div>
       ${multi ? '' : `<button class="more" data-more="${esc(t.id)}" title="任务操作（右键同样可打开）">⋯</button>`}
     </div>`;
-  }).join('') : '<div class="empty" style="padding:16px">没有符合条件的任务</div>';
+  }).join('') : `<div class="empty" style="padding:16px">${fixtures.length && !showFixtureTasks ? `没有符合条件的真实场次（另有 ${fixtures.length} 个测试夹具被隐藏）` : '没有符合条件的任务'}</div>`;
+  /* 夹具开关：只在真的有夹具时出现，且写清"藏了几个"（不静默） */
+  const bar = document.getElementById('fixtureToggleBar');
+  if (bar) {
+    bar.innerHTML = fixtures.length
+      ? `<label style="font-size:12px;color:var(--text-3);display:flex;align-items:center;gap:6px;cursor:pointer">
+           <input type="checkbox" id="showFixtures"${showFixtureTasks ? ' checked' : ''}> 显示测试夹具（${fixtures.length}）
+         </label>`
+      : '';
+    const cb = document.getElementById('showFixtures');
+    if (cb) cb.onchange = () => { showFixtureTasks = cb.checked; renderTaskList(); };
+  }
 
   renderMultiBar();
   // ---- 交互绑定 ----
@@ -1028,6 +1068,8 @@ function renderMultiBar() {
   bar.innerHTML = `<span class="cnt">已选 <b>${n}</b> 个</span>
     <button class="btn-sm" data-multi="pub"${pub ? '' : ' disabled'} title="选中当前列表里所有「已发布」的场次">全选已发布（${pub}）</button>
     <button class="btn-sm" data-multi="clear"${n ? '' : ' disabled'}>清空</button>
+    <button class="btn-sm" data-multi="retry"${n ? '' : ' disabled'} title="对选中的场次逐个「从失败阶段重跑」（已完成的会跳过）">批量重跑（${n}）</button>
+    <button class="btn-sm" data-multi="export"${n ? '' : ' disabled'} title="把选中的场次导成 CSV（场次/标题/切片数/投稿状态/播放）">导出清单（${n}）</button>
     <button class="btn-sm danger" data-multi="del"${n ? '' : ' disabled'}>删除选中（${n}）</button>
     <button class="btn-sm" data-multi="exit">退出多选</button>`;
   $('[data-multi="pub"]').onclick = () => {
@@ -1037,6 +1079,60 @@ function renderMultiBar() {
   $('[data-multi="clear"]').onclick = () => { state.multi.sel.clear(); renderTaskList(); };
   $('[data-multi="exit"]').onclick = () => { state.multi.on = false; state.multi.sel.clear(); updateMultiButton(); renderTaskList(); };
   $('[data-multi="del"]').onclick = () => { void openBatchDeleteDialog(); };
+  /* 批量重跑（P2 跨场次批量操作）：逐个调既有的「从失败阶段重跑」端点 —— 不新开一条重跑路径。
+     刻意**串行 + 逐个报进度**：并发重跑会让多条流水线同时抢 CPU/带宽，也可能撞上投稿风控。 */
+  $('[data-multi="retry"]').onclick = async () => {
+    const ids = [...state.multi.sel];
+    if (!ids.length) return;
+    if (!confirm(`对选中的 ${ids.length} 个场次执行「从失败阶段重跑」？\n\n· 已完成的场次会自动跳过\n· 会逐个执行（不并发），进度在右上角提示`)) return;
+    let done = 0;
+    let skipped = 0;
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        const r = await api(`/api/task/${encodeURIComponent(id)}/retry`, { method: 'POST', body: {} });
+        if (r && r.ok === false) skipped++;
+        else done++;
+      } catch {
+        failed++;
+      }
+      toast(`批量重跑 ${done + skipped + failed}/${ids.length}…`, 1500);
+    }
+    toast(`批量重跑完成：已触发 ${done}，跳过 ${skipped}，失败 ${failed}`, 6000);
+    refreshAll(true).catch(() => undefined);
+  };
+  /* 导出清单：导的是**屏幕上选中的场次**（与所见一致），不再另查一遍 */
+  $('[data-multi="export"]').onclick = () => {
+    const rows = state.tasks.filter((t) => state.multi.sel.has(t.id));
+    const head = ['场次时间', '标题', '任务ID', '状态', '时长秒', '切片数', '已发布', '待确认', '失败', 'ASR估算', 'LLM实际'];
+    const csv = [head.join(',')]
+      .concat(
+        rows.map((t) =>
+          [
+            t.when,
+            t.title,
+            t.id,
+            t.status,
+            t.durationSec ?? '',
+            t.clipCount ?? 0,
+            t.publishedCount ?? '',
+            t.submittedCount ?? '',
+            t.failedCount ?? '',
+            t.cost?.asrEstimate ?? '',
+            t.cost?.llmActual ?? '',
+          ]
+            .map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`)
+            .join(','),
+        ),
+      )
+      .join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv' }));
+    a.download = `场次清单-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast(`已导出 ${rows.length} 个场次`, 4000);
+  };
 }
 
 function updateMultiButton() {
@@ -1136,7 +1232,10 @@ function renderDetail() {
       ? '<button class="btn-sm" data-act="stop-task">停止处理</button>' : ''}
     <button class="btn-sm" data-act="retry-from">从某阶段重跑</button>
     ${publishedN ? '<button class="btn-sm" data-act="copy-links">复制全部稿件链接</button>' : ''}
+    <button class="btn-sm" data-act="refresh-publish" title="立刻去 B站 反查一次这一场的投稿落地情况（不等后台每 5 分钟那一轮）；只读，不会重复投稿">刷新投稿状态</button>
     <button class="btn-sm" data-act="publish-audit">投稿体检</button>
+    <button class="btn-sm" data-act="publish-batches" title="每次投稿本该产生哪几个分P、实际落地了哪几个">投稿批次</button>
+    <button class="btn-sm" data-act="recap" title="这一场的产出复盘：切片/评分/投稿/表现/待办，一页看完">复盘报告</button>
     <button class="btn-sm" data-act="open-dir">打开产物目录</button>
     <button class="btn-sm" data-act="delete-task" style="color:#c33;border-color:#f0c8c8">删除任务…</button>
     <span style="margin-left:auto;font-size:11.5px;color:var(--text-3)" class="mono">${esc(d.id)}</span>
@@ -1293,6 +1392,10 @@ function clipHTML(c) {
      否则延迟窗口内重投会在同一稿件里留下重复分P）。 */
   const DONE_STATUSES = ['PUBLISHED', 'SUBMITTED', 'SUBMITTING', 'SKIPPED'];
   const canPublishThis = !!c.selected && !tomb && !DONE_STATUSES.includes(c.status);
+  /* 「已提交待确认」且**确认窗口过了很久**（反查会给它写 `unconfirmedAlertAt`，并推送告警）：
+     B站 稿件里极可能真的没有这一条 ⇒ 给一个显式的「重新投稿这一片」。
+     默认的批量投稿**不会**碰它（避免重复分P），必须由人点、且二次确认。 */
+  const republishThis = !tomb && c.status === 'SUBMITTED' && !!c.unconfirmedAlertAt;
   const statusPill = tomb ? `<span class="pill tomb">🪦 墓碑拦截</span>`
     : c.status === 'PUBLISHED' ? `<span class="pill">已发布${c.bvid ? ' ' + esc(c.bvid) : ''}</span>`
     : failed ? `<span class="pill fail">失败</span>`
@@ -1335,6 +1438,7 @@ function clipHTML(c) {
       <button class="linkbtn" data-act="preview-cut">试看</button>
       <button class="linkbtn" data-act="open-llc">在 biliLive-tools 中编辑</button>
       ${canPublishThis ? '<button class="linkbtn" data-act="publish-this" style="color:var(--pink);font-weight:600">投稿这一片</button>' : ''}
+      ${republishThis ? '<button class="linkbtn" data-act="republish-this" style="color:#c8811a">重新投稿这一片</button>' : ''}
       ${c.dtime ? `<span style="color:var(--text-3)">排期 ${esc(fmtTime(c.dtime * 1000))}</span>` : ''}
       ${statusPill}
       ${c.bvid ? `<a href="https://www.bilibili.com/video/${esc(c.bvid)}" target="_blank" rel="noreferrer" style="font-size:12px">查看稿件</a>` : ''}
@@ -1429,6 +1533,72 @@ function bindDetail() {
   };
 
   // 投稿体检：本场投了几次、有没有重复、bvid 是否可信、标题有没有硬伤
+  /* 刷新投稿状态：**真的去 B站 反查一次**（不是重画页面 —— 重画只会把旧状态再显示一遍）。
+     用户 2026-10-11 要求：「任务这里加个刷新 用于及时刷新投稿信息」。 */
+  const refreshBtn = $('[data-act="refresh-publish"]');
+  if (refreshBtn) refreshBtn.onclick = async () => {
+    refreshBtn.disabled = true;
+    const old = refreshBtn.textContent;
+    refreshBtn.textContent = '反查中…';
+    try {
+      const r = await api(`/api/task/${encodeURIComponent(d.id)}/refresh-publish`, { method: 'POST' });
+      toast(r.note || '已刷新投稿状态', 8000);
+      await refreshAll(true);
+    } catch (e) {
+      toast('刷新失败：' + e.message, 8000);
+    } finally {
+      refreshBtn.disabled = false;
+      refreshBtn.textContent = old;
+    }
+  };
+  /* 投稿批次时间线（2026-10-11 优化第二批 ②）：批次账的只读呈现。
+     逐片状态只说明"某片现在是什么"，批次能说明"这一次投稿整体成没成、缺哪个分P"。 */
+  const batchesBtn = $('[data-act="publish-batches"]');
+  if (batchesBtn) batchesBtn.onclick = async () => {
+    batchesBtn.disabled = true;
+    try {
+      const r = await api(`/api/task/${encodeURIComponent(d.id)}/batches`);
+      const rows = (r.batches || []).map((b) => {
+        const st = b.status === 'landed' ? '<b style="color:#2a7">已落地</b>'
+          : b.status === 'failed' ? '<b style="color:#c33">提交失败</b>'
+          : b.status === 'unconfirmed' ? '<b style="color:#c8811a">未确认</b>' : '已提交（等反查）';
+        return `<div class="row ${b.status === 'failed' ? 'bad' : ''}"><span class="t">${fmtTime(Date.parse(b.at))}</span><span class="s">
+          <b>${b.kind === 'append' ? '追加进已有稿件' : '新建稿件'}</b> · ${b.parts} 个分P · ${st}${b.bvid ? ` · <a href="https://www.bilibili.com/video/${esc(b.bvid)}" target="_blank" rel="noreferrer">${esc(b.bvid)}</a>` : ''}<br>
+          <span style="color:var(--text-3)">批次 ${esc(String(b.uploadTaskId).slice(0, 8))} · 落地 ${b.landed}/${b.parts}${b.missing && b.missing.length ? ` · 缺：${esc(b.missing.map((x) => String(x).slice(0, 16)).join('、'))}` : ''}</span>
+          ${b.note ? `<br><span style="color:var(--text-3)">${esc(b.note)}</span>` : ''}
+        </span></div>`;
+      }).join('');
+      openInfo('投稿批次时间线', (r.batches || []).length
+        ? `<p style="font-size:13px">本场一共投了 <b>${r.batches.length}</b> 次。每次投稿是一个"批次"：同一个 uploadTaskId 下的分P 一起投、一起确认。</p><div class="timeline">${rows}</div>`
+        : `<p>${esc(r.note || '没有批次记录')}</p>`);
+    } catch (e) { toast('读取投稿批次失败：' + e.message, 6000); }
+    batchesBtn.disabled = false;
+  };
+  /* 每场复盘报告（2026-10-11 优化第三批 ⑧）：一页看完这一场的产出与待办 */
+  const recapBtn = $('[data-act="recap"]');
+  if (recapBtn) recapBtn.onclick = async () => {
+    recapBtn.disabled = true;
+    try {
+      const r = await api(`/api/task/${encodeURIComponent(d.id)}/recap`);
+      const L = [];
+      L.push(`【${r.task.title}】`);
+      L.push(`${r.task.when} · ${toTime(r.task.durationSec)} · 状态 ${r.task.status}`);
+      L.push('');
+      L.push(`切片：共 ${r.clips.total} 个`);
+      L.push(Object.entries(r.clips.byStatus).map(([k, v]) => `${k} ${v}`).join(' · ') || '（无切片）');
+      if (r.clips.avgScore !== undefined) L.push(`评分：均 ${r.clips.avgScore}（${r.clips.minScore}–${r.clips.maxScore}）`);
+      for (const x of r.clips.top) L.push(`  ★ ${Number(x.score).toFixed(1)} ${x.title}`);
+      L.push('');
+      L.push(`投稿：${r.publish.batches} 次批次（落地 ${r.publish.landed} / 未落地或未确认 ${r.publish.submitted} / 失败 ${r.publish.failed}${r.publish.missingParts ? ` / 缺 ${r.publish.missingParts} 个分P` : ''}）`);
+      L.push(`表现：${r.performance.measured} 个稿件拉到数据 · 播放 ${r.performance.view} · 点赞 ${r.performance.like}`);
+      L.push(`成本：ASR 估算 ¥${Number(r.transcript.asrEstimate).toFixed(2)}（音频 ${Math.round(r.transcript.asrAudioSeconds / 60)} 分钟）· LLM ¥${Number(r.transcript.llmActual).toFixed(4)}（${r.transcript.llmCalls} 次）`);
+      if (r.todos.length) { L.push(''); L.push('需要你处理：'); for (const x of r.todos) L.push(`  ⚠ ${x}`); }
+      const text = L.join('\n');
+      state.lastCopy = text;
+      openInfo('复盘报告 · ' + r.task.when, `<pre class="raw">${esc(text)}</pre><p class="hintline">${esc(r.note)}</p>`);
+    } catch (e) { toast('生成复盘报告失败：' + e.message, 6000); }
+    recapBtn.disabled = false;
+  };
   const auditBtn = $('[data-act="publish-audit"]');
   if (auditBtn) auditBtn.onclick = async () => {
     auditBtn.disabled = true; auditBtn.textContent = '体检中…';
@@ -1764,6 +1934,37 @@ function bindDetail() {
         pub1.textContent = old;
       }
     };
+    /* 重投「已提交待确认」的切片（B站 稿件里 1 小时都没出现，反查已告警）。
+       这是**唯一**会重投 SUBMITTED 切片的入口，所以必须二次确认：
+       若它其实只是 B站 列表慢（或已经在稿件里了），重复投递会在同一稿件里留下重复分P。 */
+    const rep1 = card.querySelector('[data-act="republish-this"]');
+    if (rep1) rep1.onclick = async () => {
+      const c0 = d.clips.find((x) => x.index === idx) || {};
+      const okGo = confirm(
+        `确认要重新投稿这一片吗？\n\n内容：「${String(c0.title || '')}」\n` +
+          (c0.bvid ? `目标稿件：https://www.bilibili.com/video/${c0.bvid}\n` : '') +
+          `\n【请先在创作中心确认这个分P 确实不在稿件里】——\n` +
+          `· 确实不在 → 点确定，重新投一次；\n` +
+          `· 其实在（只是列表延迟）→ 点取消，重复投递会在同一稿件里留下重复分P。`
+      );
+      if (!okGo) return;
+      rep1.disabled = true;
+      const old = rep1.textContent;
+      rep1.textContent = '重投中…';
+      try {
+        const r = await api(`/api/task/${encodeURIComponent(d.id)}/approve`, {
+          method: 'POST',
+          body: { indices: [idx], includeSubmitted: true },
+        });
+        toast(`已重新提交这一片（${r.count ?? 1} 个切片）——反查确认后会变成「已发布」`, 8000);
+        setTimeout(() => refreshAll(true), 1500);
+      } catch (e) {
+        const problems = e.payload && e.payload.problems;
+        toast('重投失败：' + (problems && problems.length ? problems.join('；') : e.message), 9000);
+        rep1.disabled = false;
+        rep1.textContent = old;
+      }
+    };
     const recut = card.querySelector('[data-act="recut"]');
     if (recut) recut.onclick = async () => {
       recut.disabled = true;
@@ -2038,7 +2239,9 @@ async function renderOther(v) {
       return;
     }
     if (v === 'health') return renderHealth(box);
-    if (v === 'cost') return renderCost(box);
+    /* 2026-10-11：待删清单与回收站合并成一页（用户：「待删清单和回收站放一起」） */
+    if (v === 'trash') return renderDeletePage(box);
+    if (v === 'clips') return renderClipLibrary(box);
     if (v === 'perf') return renderPerf(box);
     if (v === 'prompts') return renderPrompts(box);
   } catch (e) {
@@ -2056,6 +2259,32 @@ async function renderHealth(box) {
     <button class="btn-sm" style="margin-left:10px" data-act="selfcheck">一键自检</button>
     <button class="btn-sm" data-act="checknow">立即检查录制</button>
     <button class="btn-sm" data-act="perfrefresh">刷新稿件表现数据</button></h2>`;
+  /* ★ 2026-10-11（优化第一批 A4）：**统一待办**放最上面 —— 原来要人管的事散在三处
+     （未确认投稿在任务列表/切片卡片、失败场次在任务列表、磁盘与待删在各自页面），
+     用户问"现在要我做什么"时没人能一句话回答。判据集中在服务端 `/api/todos`（界面与 MCP 共用）。 */
+  let todos = { items: [], clean: true, note: '' };
+  try {
+    todos = await api('/api/todos');
+  } catch (e) {
+    todos = { items: [], clean: true, note: '待办读取失败：' + e.message };
+  }
+  /* P1-7（2026-10-13）正文级定位说明：健康面板的入口价值在"待办"，先把它说清楚。 */
+  html += `<p class="hintline">这一页回答：<b>现在有没有需要你处理的事</b>（待办在最上面）；往下是连接/磁盘/错误/墓碑这类体检信息。日常只看最上面那块就够。</p>`;
+  html += `<div class="card"><h2>待办<span class="ai-tag">${todos.items.length ? `${todos.items.length} 项需要你处理` : '没有需要处理的事'}</span></h2>
+    ${todos.items.length
+      ? `<div class="timeline">${todos.items
+          .map(
+            (it) => `<div class="row ${it.level === 'error' ? 'bad' : ''}">
+          <span class="t">${it.level === 'error' ? '❗' : '⚠'}</span>
+          <span class="s"><b>${esc(it.title)}</b><br><span style="color:var(--text-3)">${esc(it.detail)}</span><br>
+          <button class="btn-sm" data-todo="${it.action.kind === 'task' ? `task:${esc(it.action.taskId)}` : `tab:${esc(it.action.view)}`}">${esc(it.actionLabel || '去处理')}</button>
+          <button class="linkbtn" data-todo-snooze="${esc(it.key)}" title="24 小时内不再显示这条待办">忽略 24h</button>
+          <button class="linkbtn" data-todo-done="${esc(it.key)}" title="已处理，永久隐藏">已处理</button></span>
+        </div>`,
+          )
+          .join('')}</div>`
+      : `<p class="hintline" style="color:var(--green)">✅ ${esc(todos.note || '现在没有需要你处理的事。')}</p>`}
+    </div>`;
   html += `<div class="kpis">
     ${kpi('biliLive-tools', health.bililive.ok ? '已连接' : '未连接', health.bililive.message, health.bililive.ok ? (health.bililive.drift ? 'warn' : 'ok') : 'bad')}
     ${kpi('版本', esc(health.bililive.version || '?'), `核实版本 ${health.bililive.expected}${health.bililive.drift ? '（差异较大，接口可能已变动）' : ''}`, health.bililive.drift ? 'warn' : '')}
@@ -2165,6 +2394,35 @@ function tombstoneDetails(tombstones) {
       if (r.polled.length || r.reconciled.length) setTimeout(() => refreshAll(true), 1500);
     } catch (e) { toast(e.message); }
   };
+  /* 待办条目的动作：跳任务详情 或 跳某个页签（判据在服务端 /api/todos，这里只负责跳） */
+  $$('[data-todo-snooze]').forEach((b) => (b.onclick = async () => {
+    const key = String(b.dataset.todoSnooze || '');
+    if (!confirm('忽略这条待办 24 小时？（到期会自动重新出现）')) return;
+    b.disabled = true;
+    try { const r = await api('/api/todos/dismiss', { method: 'POST', body: { key, mode: 'snooze', hours: 24 } });
+      toast('已忽略 24 小时' + (r.dismissedCount ? '（当前共忽略 ' + r.dismissedCount + ' 项）' : ''), 4000); renderOther('health');
+    } catch (e) { toast('忽略失败：' + e.message, 6000); b.disabled = false; }
+  }));
+  $$('[data-todo-done]').forEach((b) => (b.onclick = async () => {
+    const key = String(b.dataset.todoDone || '');
+    if (!confirm('标记为「已处理」？会永久隐藏这条待办（恢复需手改 data/todo-dismiss.jsonl）')) return;
+    b.disabled = true;
+    try { const r = await api('/api/todos/dismiss', { method: 'POST', body: { key, mode: 'done' } });
+      toast('已标记处理' + (r.dismissedCount ? '（共 ' + r.dismissedCount + ' 项被忽略/处理）' : ''), 4000); renderOther('health');
+    } catch (e) { toast('标记失败：' + e.message, 6000); b.disabled = false; }
+  }));
+$$('[data-todo]').forEach((b) => (b.onclick = () => {
+    const raw = String(b.dataset.todo || '');
+    if (raw.startsWith('task:')) {
+      const taskId = raw.slice(5);
+      state.activeId = taskId;
+      state.dirty.clear();
+      switchView('tasks');
+      loadDetail().catch((e) => toast('打开任务失败：' + e.message, 6000));
+      return;
+    }
+    if (raw.startsWith('tab:')) switchView(raw.slice(4));
+  }));
   $('[data-act="perfrefresh"]').onclick = async () => {
     toast('正在拉取稿件表现数据…');
     try {
@@ -2379,6 +2637,8 @@ function renderMonitor(box) {
     return `<span class="stage ${st}"><span class="dot">${mark}</span>${esc(label)}${prog}</span>`;
   }).join('<span class="arrow">›</span>');
 
+  /* P1-7 正文级定位说明：这一页是"直播进行中盯一眼"用的，和"跑完复盘"要分清。 */
+  html += `<p class="hintline">这一页回答：<b>现在在干什么、在等什么、为什么没动</b>（默认 5 秒自动刷新，适合直播进行中盯一眼）。跑完一场的产出请到「任务」里看复盘报告。</p>`;
   html += `<div class="card"><h2>流水线（现在在干什么）${d.pipeline.length ? badge(`${d.pipeline.length} 个活跃任务`, 'b-run') : badge('空闲', 'b-idle')}</h2>`;
   if (d.pipeline.length) {
     html += `<table class="tbl"><thead><tr><th>任务</th><th>状态</th><th style="width:46%">阶段</th><th>已用</th><th class="num">花费</th></tr></thead><tbody>
@@ -2700,12 +2960,15 @@ function renderMonitor(box) {
   });
 }
 
-async function renderCost(box) {
-  const data = await api('/api/tasks?limit=500');
-  const m = data.monthly;
+/**
+ * 成本（月度汇总）：**不再是独立页签**，作为「稿件表现」里的一张折叠卡片。
+ * 2026-10-11 用户要求：「将这两个放到成本的位置 然后将成本放到稿件表现里」。
+ * 只把 HTML 生成抽出来复用，数字与口径一个字没改（同一份 `/api/tasks` 的 `monthly`）。
+ */
+function costHtml(m) {
   const days = Object.entries(m.byDay || {}).sort((a, b) => a[0].localeCompare(b[0]));
   const max = Math.max(0.01, ...days.map(([, v]) => v.asr + v.llm));
-  box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">成本月度汇总（${esc(m.month)}）</h2>
+  return `
     <div class="kpis">
       <div class="kpi"><div class="k">本月合计</div><div class="v">¥${m.total.toFixed(2)}</div><div class="n">${m.tasks} 场直播</div></div>
       <div class="kpi"><div class="k">字幕识别（估算值）</div><div class="v">¥${m.asrEstimate.toFixed(2)}</div><div class="n">音频 ${m.asrAudioHours} 小时</div></div>
@@ -2721,7 +2984,391 @@ async function renderCost(box) {
       </tbody></table>` : '<div class="empty">本月暂无数据</div>'}</div>`;
 }
 
+/**
+ * 「待删 / 回收站」——把两条**同一条生命周期**上的清单放在一页里。
+ *
+ * 2026-10-11 用户反馈：「待删清单里的 已经删除的 不在显示 或者待删清单和回收站放一起」。
+ * 原来两个页签各有一份"已删除"：待删清单底部列 `最近已删除`（20 条，只是历史），
+ * 回收站按天分组列出同一批东西（但能恢复、能彻底删、还带保留期限）—— 同一件事说两遍，
+ * 而且两份的**动作还不一样**（那份历史什么都没有）。所以合并成一页两段：
+ *   ① 待删（宽限期内，可取消 / 立即删除）；② 回收站（已删，可恢复 / 彻底删除 / 超期自动清理）。
+ * 「最近已删除」那段历史**去掉** —— 回收站就是它的完整版（含恢复与期限）。
+ */
+async function renderDeletePage(box) {
+  /* 两段各自取数：一段失败不该让另一段整页空白 */
+  const pend = await api('/api/pending-delete').catch((e) => ({ error: e.message }));
+  const trash = await api('/api/trash').catch((e) => ({ error: e.message }));
+  const keepDays = Number(state.bootstrap?.config?.cleanup?.trashDays ?? 0);
+
+  /* ---------------- 第一段：待删（宽限期内） ---------------- */
+  const pendRow = (e) => `<div class="row"><span class="t">${fmtTime(Date.parse(e.dueAt))}</span><span class="s">
+      <b>${esc(e.path.split(/[\\/]/).pop() || e.path)}</b>
+      <span style="color:var(--text-3)"> · ${e.kind === 'raw' ? '源录播' : e.kind === 'clip' ? '成片' : '完整版'} · ${fmtBytes(e.sizeBytes)}</span><br>
+      <span class="mono-sm" style="color:var(--text-3)">${esc(e.path)}</span><br>
+      <span style="color:var(--text-3)">${esc(e.reason)}</span>
+      <br>${pendingRowActions(e, { cancellable: true })}
+      ${e.error ? `<br><span style="color:#c33">上次删除失败：${esc(e.error)}</span>` : ''}
+    </span></div>`;
+  const pendList = pend.error
+    ? `<div class="row"><span class="s" style="color:#c33">待删清单读取失败：${esc(pend.error)}</span></div>`
+    : pend.pending.length
+      ? pend.pending.map(pendRow).join('')
+      : '<div class="row"><span class="s" style="color:var(--text-3)">没有待删除的文件</span></div>';
+  const pendCard = `<div class="card">
+      <h2>① 待删（用完即删 · 宽限期内可取消）</h2>
+      <p style="font-size:13px">本场全部切片确认投稿成功后，成片与源录播会排进这里，<b>宽限期过后自动删除</b>。
+      宽限期内点「取消删除」就不会删；点「立即删除」则<b>现在</b>就删（不等宽限期）。<br>
+      ${pend.error ? '' : `待删 <b>${pend.stats.pendingCount}</b> 项，可释放 <b>${fmtBytes(pend.stats.pendingBytes)}</b>${pend.stats.nextDueAt ? `，最早 <b>${fmtTime(Date.parse(pend.stats.nextDueAt))}</b> 执行` : ''}。`}</p>
+      <div class="timeline">${pendList}</div>
+      <div style="margin-top:12px">
+      ${!pend.error && pend.pending.length ? `<button class="btn-sm" id="pendingDelAll" style="border-color:#f0c8c8;color:#c33">全部立即删除（${pend.pending.length} 项 · ${fmtBytes(pend.stats.pendingBytes)}）</button> ` : ''}
+      <button class="btn-sm" id="pendingRunDue">立即执行到点的删除</button>
+      <span class="hintline" style="margin-left:8px">「到点删除」每 10 分钟自动执行一次，这里只是手动触发；要提前删请点上面的「立即删除」。</span></div>
+    </div>`;
+
+  /* ---------------- 第二段：回收站（已删除） ---------------- */
+  const trashRow = (e) => `<div class="row"><span class="t">${fmtTime(Date.parse(e.deletedAt))}</span><span class="s">
+      <b>${esc(e.title)}</b><br>
+      <span style="color:var(--text-3)">${fmtBytes(e.totalBytes)} · ${e.files.length} 项 · 任务 <span class="mono-sm">${esc(e.taskId)}</span>${e.task ? '' : '（无台账快照，只能恢复文件）'}</span><br>
+      <button class="btn-sm" data-restore="${esc(e.id)}">恢复</button>
+      <button class="btn-sm" data-purge="${esc(e.id)}" style="color:#c33">彻底删除</button></span></div>`;
+  /* 按**本地日期**分组（`deletedAt` 是 ISO，直接切前 10 位会串到 UTC 那天：凌晨删的会跑到前一天） */
+  const byDay = new Map();
+  const entries = trash.error ? [] : trash.entries;
+  for (const e of entries) {
+    const day = fmtTime(Date.parse(e.deletedAt)).slice(0, 10) || '未知日期';
+    const arr = byDay.get(day);
+    if (arr) arr.push(e);
+    else byDay.set(day, [e]);
+  }
+  const days = [...byDay.entries()].sort((a, b) => b[0].localeCompare(a[0])); // 最新的天在最上面
+  const expireTextOf = (list) => {
+    if (!(keepDays > 0)) return '<span class="hintline" style="color:#c8811a">已关闭自动清理（cleanup.trashDays=0）</span>';
+    const oldest = Math.min(...list.map((e) => Date.parse(e.deletedAt)).filter((n) => Number.isFinite(n)));
+    if (!Number.isFinite(oldest)) return '';
+    const leftMs = oldest + keepDays * 86400_000 - Date.now();
+    const leftDays = Math.ceil(leftMs / 86400_000);
+    if (leftMs <= 0) return `<span class="hintline" style="color:#c33">已过期 · 下次自动清理就删</span>`;
+    return `<span class="hintline">${leftDays <= 1 ? '今天到期' : `还有 ${leftDays} 天到期`} · 到期自动删除</span>`;
+  };
+  const dayBlocks = days
+    .map(([day, list]) => {
+      const bytes = list.reduce((a, e) => a + (Number(e.totalBytes) || 0), 0);
+      /* 每一天都**默认收起**（用户 2026-10-11：「改成默认是折叠状态」） */
+      return `<details class="trashday">
+        <summary style="cursor:pointer;font-size:13px;font-weight:600;padding:6px 0;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span>${esc(day)}</span>
+          <span class="ai-tag">${list.length} 项 · ${fmtBytes(bytes)}</span>
+          ${expireTextOf(list)}
+          <button class="btn-sm" style="margin-left:auto;color:#c33" data-day-purge="${esc(day)}"
+            title="彻底删除这一天的全部条目（不可恢复）">彻底删除这天</button>
+        </summary>
+        <div class="timeline">${list.map(trashRow).join('')}</div>
+      </details>`;
+    })
+    .join('');
+  const expiredCount = keepDays > 0
+    ? entries.filter((e) => Date.parse(e.deletedAt) + keepDays * 86400_000 <= Date.now()).length
+    : 0;
+  const trashCard = `<div class="card">
+      <h2>② 回收站（已删除 · 可恢复）</h2>
+      ${trash.error
+        ? `<div class="row"><span class="s" style="color:#c33">回收站读取失败：${esc(trash.error)}</span></div>`
+        : `<p style="font-size:13px">共 ${entries.length} 项，占用 ${fmtBytes(trash.stats.bytes)}。删除的任务会先到这里，可随时恢复（含台账记录）。<br>
+      <b>保留 ${keepDays > 0 ? `${keepDays} 天` : '不自动清理'}</b>${keepDays > 0 ? '（在「设置 → 回收站 / 待删清单」里改）：超期的条目每天会自动彻底删除，下面每个日期都标了还剩几天。' : '（cleanup.trashDays=0：删任务会直接永久删除，没有回收站）'}
+      下面按<b>删除日期</b>分组（默认全部收起，点日期展开）：</p>
+      ${days.length ? dayBlocks : '<div class="row"><span class="s" style="color:var(--text-3)">回收站是空的</span></div>'}
+      <div style="margin-top:12px">
+        ${days.length ? '<button class="btn-sm" id="trashToggleAll">全部展开</button> ' : ''}
+        ${keepDays > 0 ? `<button class="btn-sm" id="trashPurgeExpired"${expiredCount ? '' : ' disabled'} title="${expiredCount ? `现在就彻底删除这 ${expiredCount} 项已过期的` : '当前没有过期条目'}">立即清理过期项${expiredCount ? `（${expiredCount}）` : ''}</button> ` : ''}
+        <button class="btn-sm" id="trashPurgeAll" style="color:#c33">清空回收站（不可逆）</button>
+      <span class="hintline" style="margin-left:8px">目录：<span class="mono-sm">${esc(trash.dir)}</span></span></div>`}
+    </div>`;
+
+  box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">待删 / 回收站</h2>
+    <p class="hintline">这一页回答两个问题：① 哪些文件是「用完即删」但仍在宽限期内（可以取消）；② 已经删掉的能不能恢复（按天折叠，可整组恢复或彻底清掉）。</p>${pendCard}${trashCard}`;
+
+  /* ---------------- 绑定：任何动作完成后**整页重画**（两段一起刷新） ---------------- */
+  const rerender = () => renderDeletePage(box);
+  box.querySelectorAll('[data-pending-del]').forEach((b) => (b.onclick = async () => {
+    b.disabled = true;
+    try {
+      const res = await deletePendingNow([b.dataset.pendingDel], pend.pending);
+      if (res === null) { b.disabled = false; return; } // 用户在确认框里点了取消
+      toast(`已删除 ${res.deleted} 项（释放 ${fmtBytes(res.bytes)}）`, 6000);
+      await rerender();
+      void refreshPendingBadge();
+    } catch (e) { toast('删除失败：' + e.message, 6000); b.disabled = false; }
+  }));
+  const delAll = box.querySelector('#pendingDelAll');
+  if (delAll) delAll.onclick = async () => {
+    delAll.disabled = true;
+    try {
+      const res = await deletePendingNow(pend.pending.map((e) => e.id), pend.pending);
+      if (res === null) { delAll.disabled = false; return; }
+      toast(`已删除 ${res.deleted} 项（释放 ${fmtBytes(res.bytes)}）`, 6000);
+      await rerender();
+      void refreshPendingBadge();
+    } catch (e) { toast('删除失败：' + e.message, 6000); delAll.disabled = false; }
+  };
+  box.querySelectorAll('[data-cancel]').forEach((b) => (b.onclick = async () => {
+    b.disabled = true;
+    try {
+      await api('/api/pending-delete/cancel', { method: 'POST', body: { id: b.dataset.cancel } });
+      toast('已取消：这个文件不会被自动删除');
+      await rerender();
+      void refreshPendingBadge();
+    } catch (e) { toast('取消失败：' + e.message, 6000); b.disabled = false; }
+  }));
+  const runDue = box.querySelector('#pendingRunDue');
+  if (runDue) runDue.onclick = async () => {
+    runDue.disabled = true;
+    try {
+      const rr = await api('/api/pending-delete/run', { method: 'POST', body: {} });
+      toast(`执行完成：删除 ${rr.deleted} 项（释放 ${fmtBytes(rr.bytes)}）${rr.failed ? `，失败 ${rr.failed} 项` : ''}`, 7000);
+      await rerender();
+      void refreshPendingBadge();
+    } catch (e) { toast('执行失败：' + e.message, 6000); runDue.disabled = false; }
+  };
+  /* 每个日期行的「彻底删除这天」：必须 preventDefault —— 它在 <summary> 里，
+     不拦的话点一下既删东西又顺手把这一天折叠/展开（原生 details 的默认行为）。 */
+  box.querySelectorAll('[data-day-purge]').forEach((b) => (b.onclick = async (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const day = b.dataset.dayPurge;
+    const list = byDay.get(day) ?? [];
+    const bytes = list.reduce((a, e) => a + (Number(e.totalBytes) || 0), 0);
+    if (!confirm(`彻底删除 ${day} 这一天的 ${list.length} 个条目（${fmtBytes(bytes)}）？\n\n文件将从磁盘抹掉，与「恢复」不同 —— **不可恢复**。`)) return;
+    b.disabled = true;
+    try {
+      const rr = await api('/api/trash/purge', { method: 'POST', body: { confirm: true, ids: list.map((e) => e.id) } });
+      toast(`已彻底删除 ${rr.purged} 项，释放 ${fmtBytes(rr.bytes)}`, 7000);
+      await rerender();
+    } catch (e) { toast('删除失败：' + e.message, 6000); b.disabled = false; }
+  }));
+  const expireBtn = box.querySelector('#trashPurgeExpired');
+  if (expireBtn) expireBtn.onclick = async () => {
+    if (!confirm(`立即彻底删除已超过 ${keepDays} 天的条目（${expiredCount} 项）？不可恢复。`)) return;
+    expireBtn.disabled = true;
+    try {
+      const rr = await api('/api/trash/purge', { method: 'POST', body: { confirm: true, olderThanDays: keepDays } });
+      toast(rr.note || `已清理 ${rr.purged} 项过期条目`, 7000);
+      await rerender();
+    } catch (e) { toast('清理失败：' + e.message, 6000); expireBtn.disabled = false; }
+  };
+  const toggleAll = box.querySelector('#trashToggleAll');
+  if (toggleAll) toggleAll.onclick = () => {
+    const all = [...box.querySelectorAll('details.trashday')];
+    const expand = all.some((d) => !d.open); // 还有收起的 → 这一下全展开
+    for (const d of all) d.open = expand;
+    toggleAll.textContent = expand ? '全部收起' : '全部展开';
+  };
+  box.querySelectorAll('[data-restore]').forEach((b) => (b.onclick = async () => {
+    b.disabled = true;
+    try {
+      const rr = await api('/api/trash/restore', { method: 'POST', body: { id: b.dataset.restore } });
+      toast(`已恢复 ${rr.restored.length} 项${rr.warnings.length ? `（${rr.warnings.length} 项提示）` : ''}`, 6000);
+      await rerender();
+      void refreshAll(true);
+    } catch (e) { toast('恢复失败：' + e.message, 6000); b.disabled = false; }
+  }));
+  box.querySelectorAll('[data-purge]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('彻底删除这一项？文件将从磁盘抹掉，无法恢复。')) return;
+    b.disabled = true;
+    try {
+      await api('/api/trash/purge', { method: 'POST', body: { confirm: true, ids: [b.dataset.purge] } });
+      toast('已彻底删除');
+      await rerender();
+    } catch (e) { toast('删除失败：' + e.message, 6000); b.disabled = false; }
+  }));
+  const purgeAll = box.querySelector('#trashPurgeAll');
+  if (purgeAll) purgeAll.onclick = async () => {
+    if (!confirm('清空回收站？里面所有文件将被永久删除，无法恢复。')) return;
+    purgeAll.disabled = true;
+    try {
+      const rr = await api('/api/trash/purge', { method: 'POST', body: { confirm: true } });
+      toast(rr.note || '已清空回收站');
+      await rerender();
+    } catch (e) { toast('清空失败：' + e.message, 6000); purgeAll.disabled = false; }
+  };
+}
+
+/* ============================================================================
+ * 切片库与稿件视图（跨场次检索 / 按 bvid 体检稿件）
+ * ========================================================================== */
+/**
+ * 切片库：把所有场次的切片拉平成一张可检索的表（2026-10-11 优化第一批 P0-3）。
+ *
+ * 为什么需要：稿件是长期资产，而切片一直只能"一场场翻任务"看 —— 想复盘"上次那种题材多少播放"、
+ * 想把一条老切片再发一次、想核对某条到底投没投出去，都得先想起它在哪一场。
+ *
+ * 三条刻意的规矩：
+ *   ① 只读视图：不改台账、不触发投稿；「试看」走与任务详情同一个 `/api/preview-cut`（行为一致）；
+ *   ② 检索条件留在页面状态里（切走再回来不丢），并且**每次改筛选都重新查服务端**（口径与统计同源）；
+ *   ③ 截断如实说：超过 limit 时写「只显示前 N 条，共 M 条」，不假装全都在。
+ */
+async function renderClipLibrary(box) {
+  const p = new URLSearchParams({ q: clipLib.q, status: clipLib.status, sort: clipLib.sort, limit: String(clipLib.limit) });
+  if (clipLib.asc) p.set('asc', '1');
+  const d = await api('/api/clips/library?' + p.toString());
+  const STATUS_LABEL = {
+    CANDIDATE: '候选',
+    CUT: '已切片',
+    CUTTING: '切片中',
+    SUBMITTING: '投稿中',
+    SUBMITTED: '已提交待确认',
+    PUBLISHED: '已发布',
+    FAILED: '失败',
+    SKIPPED: '已跳过',
+    PENDING_UPLOAD: '待上传',
+  };
+  const rows = d.rows || [];
+  box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">切片库
+    <span class="ai-tag">共 ${d.total} 条${d.truncated ? ` · 只显示前 ${d.limit} 条` : ''} · 已发布 ${d.counts.published} / 待确认 ${d.counts.submitted} / 候选 ${d.counts.candidate} / 失败 ${d.counts.failed}</span></h2>
+    <p class="hintline">这一页回答：<b>跨场次</b>找一条切片 —— 按标题/状态/评分检索，可试看、可跳到那一场、可导出 CSV。（只看这一场请用「任务」，只看某个稿件请点行内的「看稿件」。）</p>
+    <div class="card">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <input class="inp" id="libQ" placeholder="搜标题 / 场次 / 任务 ID / BV 号" value="${esc(clipLib.q)}" style="width:260px">
+        <select class="inp" id="libStatus" style="width:auto">
+          ${[['', '全部状态'], ['PUBLISHED', '已发布'], ['SUBMITTED', '已提交待确认'], ['CANDIDATE', '候选'], ['CUT', '已切片'], ['FAILED', '失败'], ['SKIPPED', '已跳过']]
+            .map(([v, t]) => `<option value="${v}"${clipLib.status === v ? ' selected' : ''}>${t}</option>`).join('')}
+        </select>
+        <select class="inp" id="libSort" style="width:auto">
+          ${[['score', '按评分'], ['view', '按播放'], ['like', '按点赞'], ['time', '按场次时间'], ['duration', '按时长']]
+            .map(([v, t]) => `<option value="${v}"${clipLib.sort === v ? ' selected' : ''}>${t}</option>`).join('')}
+        </select>
+        <button class="btn-sm" id="libDir">${clipLib.asc ? '↑ 升序' : '↓ 降序'}</button>
+        <button class="btn-sm" id="libExport">导出 CSV</button>
+        <span class="hintline">${esc(d.note || '')}</span>
+      </div>
+      ${rows.length ? `<table class="tbl"><thead><tr>
+        <th>标题</th><th>场次</th><th>评分</th><th>时长</th><th>状态</th><th>播放</th><th>点赞</th><th>稿件</th><th>操作</th>
+      </tr></thead><tbody>
+      ${rows.map((r) => `<tr>
+        <td>${esc(r.title)}${r.fixture ? ' <span class="tag-mini">🔧 夹具</span>' : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${r.tombstone ? ' <span class="tag-mini">🪦 墓碑</span>' : ''}</td>
+        <td class="mono-sm" title="${esc(r.taskId)}">${esc(String(r.taskWhen).slice(5, 16))} · ${esc(String(r.taskTitle).slice(0, 14))}</td>
+        <td class="num">${Number(r.score ?? 0).toFixed(1)}</td>
+        <td class="num">${r.durationSec}s</td>
+        <td class="mono-sm">${esc(STATUS_LABEL[r.status] || r.status)}</td>
+        <td class="num">${r.view ?? '—'}</td>
+        <td class="num">${r.like ?? '—'}</td>
+        <td>${r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noreferrer" class="mono-sm">${esc(r.bvid)}</a> <button class="linkbtn" data-lib-archive="${esc(r.bvid)}">看稿件</button>` : '—'}</td>
+        <td class="mono-sm">
+          ${r.hasCut ? `<button class="linkbtn" data-lib-preview="${esc(r.taskId)}|${r.index}">试看</button>` : '<span style="color:var(--text-3)">未切片</span>'}
+          <button class="linkbtn" data-lib-goto="${esc(r.taskId)}|${r.index}">去这一场</button>
+          ${r.status === 'SUBMITTED' ? `<button class="linkbtn" data-lib-republish="${esc(r.taskId)}|${r.index}" title="这一片显示已提交但未在 B站 分P 列表里确认，可重投一次">重新投稿这一片</button>` : ''}
+        </td>
+      </tr>`).join('')}
+      </tbody></table>`
+      : '<div class="empty">没有匹配的切片。换个关键词，或把状态切到「全部状态」。</div>'}
+      ${d.truncated ? `<p class="hintline">还有 ${d.total - d.limit} 条没显示 —— 缩小搜索范围，或点下面的「多显示 200 条」。</p>
+        <div style="margin-top:8px"><button class="btn-sm" id="libMore">多显示 200 条</button></div>` : ''}
+    </div>`;
+  /* 检索条件：改完**重新查服务端**（同一份口径，不在前端另算一套） */
+  const q = box.querySelector('#libQ');
+  if (q) {
+    let timer = null;
+    q.oninput = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { clipLib.q = q.value.trim(); renderClipLibrary(box); }, 300);
+    };
+  }
+  const st = box.querySelector('#libStatus');
+  if (st) st.onchange = () => { clipLib.status = st.value; renderClipLibrary(box); };
+  const so = box.querySelector('#libSort');
+  if (so) so.onchange = () => { clipLib.sort = so.value; renderClipLibrary(box); };
+  const dirBtn = box.querySelector('#libDir');
+  if (dirBtn) dirBtn.onclick = () => { clipLib.asc = !clipLib.asc; renderClipLibrary(box); };
+  const more = box.querySelector('#libMore');
+  if (more) more.onclick = () => { clipLib.limit = Math.min(500, clipLib.limit + 200); renderClipLibrary(box); };
+  const exp = box.querySelector('#libExport');
+  if (exp) exp.onclick = () => {
+    /* 导出的是**当前这批行**（与屏幕所见一致），不是另查一遍 —— 免得导出的和看到的不一样 */
+    const head = ['标题', '场次时间', '场次', '任务ID', '评分', '时长秒', '状态', '播放', '点赞', 'BV号'];
+    const csv = [head.join(',')]
+      .concat(rows.map((r) => [r.title, r.taskWhen, r.taskTitle, r.taskId, r.score, r.durationSec, r.status, r.view ?? '', r.like ?? '', r.bvid ?? '']
+        .map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')))
+      .join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv' }));
+    a.download = `切片库-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast(`已导出 ${rows.length} 行 CSV`, 4000);
+  };
+  box.querySelectorAll('[data-lib-preview]').forEach((b) => (b.onclick = async () => {
+    const [taskId, index] = String(b.dataset.libPreview).split('|');
+    b.disabled = true;
+    try {
+      const r = await api('/api/preview-cut', { method: 'POST', body: { taskId, index: Number(index) } });
+      toast(r.ok ? `已用 ${r.player || '系统播放器'} 播放该片段` : (r.note || '打不开'), 5000);
+    } catch (e) { toast('试看失败：' + e.message, 6000); }
+    b.disabled = false;
+  }));
+  /* 稿件级视图（2026-10-11 优化第二批 ⑥）：点 bvid 旁的「看稿件」看这个稿件的全部分P 与健康 */
+  box.querySelectorAll('[data-lib-archive]').forEach((b) => (b.onclick = async () => {
+    const bvid = String(b.dataset.libArchive || '');
+    b.disabled = true;
+    try {
+      const a = await api('/api/archive/' + encodeURIComponent(bvid));
+      const partRows = (a.parts || []).map((x) => `<div class="row"><span class="t">P${x.page}</span><span class="s">${esc(x.title)}${x.durationSec ? ` <span style="color:var(--text-3)">· ${x.durationSec}s</span>` : ''}</span></div>`).join('');
+      const clipRows = (a.clips || []).map((c) => `<div class="row"><span class="t">#${c.index}</span><span class="s">${esc(c.title)} <span style="color:var(--text-3)">· ${esc(String(c.status))} · 评分 ${Number(c.score ?? 0).toFixed(1)}</span></span></div>`).join('');
+      const health = (a.duplicates || []).length
+        ? `<p style="color:#c33;font-weight:600">⚠ 有 ${a.duplicates.length} 个重复分P：${esc(a.duplicates.map((d) => d.title + '×' + d.count).join('、'))} —— 需要到创作中心删掉多余的</p>`
+        : (a.missingLocal || []).length
+          ? `<p style="color:#c8811a;font-weight:600">⚠ 本地记着 ${a.missingLocal.length} 个切片投到了这个稿件，但线上分P 里没有</p>`
+            + `<div class="timeline">${a.missingLocal.map((m) => `<div class="row"><span class="t">#${m.clipIndex}</span><span class="s">${esc(m.title)}
+              <button class="linkbtn" data-arch-republish="${esc(m.taskId)}|${m.clipIndex}">重新投稿这一片</button></span></div>`).join('')}</div>`
+            + '<p class="hintline">重投前请先到创作中心确认它确实没落地；助手只追加缺失分P，不会产生重复分P。</p>'
+          : '<p style="color:var(--green)">✅ 分P 与本地记录一致（无重复、无缺失）</p>';
+      openInfo(`稿件 ${bvid}`, `
+        <p style="font-size:13px"><b>${esc(a.title || '')}</b><br>
+        <a href="${esc(a.url)}" target="_blank" rel="noreferrer">${esc(a.url)}</a></p>
+        ${health}
+        <p style="font-size:13px">${(a.parts || []).length} 个分P${a.performance ? ` · 播放 ${a.performance.view ?? '—'} / 点赞 ${a.performance.like ?? '—'}（${esc(String(a.performance.date ?? ''))}）` : ''}
+        · 本地记着 ${(a.clips || []).length} 个切片属于它</p>
+        <h4 style="margin-top:10px">线上分P</h4><div class="timeline">${partRows || '<div class="row"><span class="s" style="color:var(--text-3)">读不到分P 列表</span></div>'}</div>
+        ${clipRows ? `<h4 style="margin-top:12px">本地切片（本台账）</h4><div class="timeline">${clipRows}</div>` : ''}`);
+    } catch (e) { toast('读取稿件失败：' + e.message, 6000); }
+    b.disabled = false;
+  }));
+  /* P1-4 就地动作：给「已提交待确认」的行一个重投出口（复用既有 approve + includeSubmitted）。
+     为什么必须先 confirm 并写清指引：重投的前提是"确实没落地"，这只有人到创作中心看一眼才知道；
+     助手只追加缺失的分P，不会产生重复分P（§40 的教训），但前提仍是人工确认。 */
+  /* 稿件视图里的同类动作（P1-4）：与切片库共用同一端点与同一套 confirm 文案，行为一致 */
+  box.querySelectorAll('[data-arch-republish]').forEach((b) => (b.onclick = async () => {
+    const [taskId, index] = String(b.dataset.archRepublish || '').split('|');
+    if (!confirm('确认重新投稿这一片？（请先到 B站创作中心确认它确实没落地）')) return;
+    b.disabled = true;
+    try {
+      const r = await api(`/api/task/${encodeURIComponent(String(taskId))}/approve`, { method: 'POST', body: { indices: [Number(index)], includeSubmitted: true } });
+      toast(r.note || '已提交重新投稿', 6000);
+    } catch (e) { toast('重新投稿失败：' + e.message, 6000); b.disabled = false; }
+  }));
+  box.querySelectorAll('[data-lib-republish]').forEach((b) => (b.onclick = async () => {
+    const [taskId, index] = String(b.dataset.libRepublish || '').split('|');
+    if (!confirm('确认重新投稿这一片？\n\n请先到 B站创作中心看它到底有没有落地：\n· 已落地 ⇒ 点「取消」，别重投\n· 确实没落地 ⇒ 点「确定」（助手只追加缺失分P，不会产生重复分P）')) return;
+    b.disabled = true;
+    try {
+      const r = await api(`/api/task/${encodeURIComponent(String(taskId))}/approve`, { method: 'POST', body: { indices: [Number(index)], includeSubmitted: true } });
+      toast(r.note || '已提交重新投稿，稍后可在「投稿批次」里看结果', 6000);
+      renderClipLibrary(box);
+    } catch (e) { toast('重新投稿失败：' + e.message, 6000); b.disabled = false; }
+  }));
+  box.querySelectorAll('[data-lib-goto]').forEach((b) => (b.onclick = () => {
+    const [taskId] = String(b.dataset.libGoto).split('|');
+    state.activeId = taskId;
+    state.dirty.clear();
+    switchView('tasks');
+    loadDetail().catch((e) => toast('打开任务失败：' + e.message, 6000));
+  }));
+}
+
 let perfAutoTried = false;
+/** 「测试夹具」开关（默认隐藏；见 renderTaskList 的说明） */
+let showFixtureTasks = false;
+/** 切片库的检索条件（页内状态，切走再回来保持） */
+const clipLib = { q: '', status: '', sort: 'score', asc: false, limit: 200 };
 let perfLastRefresh = null;
 /* 「稿件已不存在」的行默认不显示；用户想核对时可以展开（见 renderPerf 里的说明） */
 let perfShowGone = false;
@@ -2781,6 +3428,8 @@ function sortPerfRows(rows) {
 const perfSortLabel = () => PERF_SORTS.find((s) => s.key === perfSort)?.label ?? '播放';
 async function renderPerf(box) {
   const p = await api('/api/performance');
+  /* 成本卡片（2026-10-11 从独立页签并进来）：数字与口径同原「成本」页，取的就是这个接口的 monthly ✓ */
+  const costData = await api('/api/tasks?limit=500');
   /* 首次打开这一页、且「知道有稿件但一条统计都没拉到」时，自动跑一次回流再重画。
      为什么要自动：这一页的数字全来自回流（performance.jsonl），用户打开它就是想看数据，
      让他先去别处点「刷新稿件表现数据」等于这一页默认是坏的（实测就是这个观感）。
@@ -2790,6 +3439,7 @@ async function renderPerf(box) {
   if (stale) {
     perfAutoTried = true;
     box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">稿件表现统计（近 30 天）</h2>
+    <p class="hintline">这一页回答：<b>长期资产</b>表现如何 —— 每个稿件的播放/点赞/评分、评分档与播放的相关性，以及月度成本（ASR 估算 + LLM 实际）。数据来自周期性回流。</p>
       <div class="card"><div class="empty">正在拉取 ${p.archiveTotal} 个稿件的表现数据…（首次打开这一页会自动回流一次）</div></div>`;
     try {
       perfLastRefresh = await api('/api/performance/refresh', { method: 'POST' });
@@ -2810,19 +3460,22 @@ async function renderPerf(box) {
   const shown = sortPerfRows(perfShowGone ? p.rows : live);
   const livePartTotal = live.reduce((a, r) => a + (Number(r.partCount) || 1), 0);
   box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">稿件表现统计（近 30 天）</h2>
-    <div class="card"><h2>LLM 评分 vs 实际播放（相关性，非因果）</h2>
-      ${corrTotal ? `<table class="tbl"><thead><tr><th>评分档</th><th>稿件数</th><th>平均播放</th></tr></thead><tbody>
+    <p class="hintline">这一页回答：<b>长期资产</b>表现如何 —— 每个稿件的播放/点赞/评分、评分档与播放的相关性，以及月度成本（ASR 估算 + LLM 实际）。数据来自周期性回流。</p>
+    <div class="card"><h2>LLM 评分 vs 实际播放（相关性，非因果）</h2>      ${corrTotal ? `<table class="tbl"><thead><tr><th>评分档</th><th>稿件数</th><th>平均播放</th></tr></thead><tbody>
       ${p.correlation.map((c) => `<tr><td>${esc(c.bucket)}</td><td class="num">${c.count}</td><td class="num">${c.avgView}</td></tr>`).join('')}
       </tbody></table>` : `<div class="empty">这一档还统计不了：需要「既有 LLM 评分、又拉到了播放数据」的稿件。
         ${Number(p.pulledTotal || 0) > 0 ? `现在有 ${p.pulledTotal} 个稿件有播放数据，但它们的分P 任务是早期投的（评分没有落进表现数据）；新投的稿件会自动带上评分。` : '先让一场直播跑完投稿，再回来刷新。'}</div>`}
       <p class="hintline">${esc(p.note)}</p></div>
     <div class="card"><h2>已发布稿件表现（按${perfSortLabel()}${perfSortAsc ? '升序' : '降序'}）<span class="ai-tag">${live.length} 个在库稿件 · ${livePartTotal} 个分P · 已拉到数据 ${p.pulledTotal ?? 0} 个${goneRows.length ? ` · ${perfShowGone ? `含 ${goneRows.length} 个已删除` : `已隐藏 ${goneRows.length} 个已删除`}` : ''}</span>
       <span style="margin-left:auto;font-weight:400;font-size:12.5px;color:var(--text-2);display:inline-flex;align-items:center;gap:6px">排序
+        <button class="btn-sm" id="perfRefreshNow" title="在页面上重查一遍（不动 B站，看的是已落库的最新数据）">🔄 刷新</button>
+        <button class="btn-sm" id="perfForceRefresh" title="去 B站 强制拉一次最新统计（忽略每日一次的限制）">⬇️ 强制重拉</button>
         <select id="perfSortKey" class="inp" style="width:auto;padding:3px 8px;font-size:12.5px">
           ${PERF_SORTS.map((s) => `<option value="${s.key}"${s.key === perfSort ? ' selected' : ''}>${esc(s.label)}</option>`).join('')}
         </select>
         <button class="btn-sm" id="perfSortDir" title="切换升序/降序">${perfSortAsc ? '↑ 升序' : '↓ 降序'}</button>
       </span></h2>
+      <p class="hintline" id="perfFreshNote" style="min-height:18px"></p>
       ${shown.length ? `<table class="tbl"><thead><tr><th>标题</th><th>评分</th><th>播放</th><th>点赞</th><th>投币</th><th>收藏</th><th>弹幕</th><th title="这个稿件最近一次投出切片的时间（同稿件多分P 取最近）">发布时间</th><th>数据日期</th></tr></thead><tbody>
       ${shown.map((r) => `<tr><td><a href="${esc(r.url)}" target="_blank" rel="noreferrer">${esc(r.title)}</a>${r.gone ? ' <span class="tag-mini">稿件已不存在</span>' : ''}${r.unavailable ? ` <span class="tag-mini">${esc(r.unavailable)}</span>` : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${Number(r.partCount) > 1 ? ` <span class="ai-tag">同一稿件 ${r.partCount} 个分P</span>` : ''}</td>
         <td class="num">${r.llmScore === undefined ? '—' : Number(r.llmScore).toFixed(1)}</td><td class="num">${r.view ?? '—'}</td><td class="num">${r.like ?? '—'}</td>
@@ -2836,12 +3489,65 @@ async function renderPerf(box) {
           ? '有稿件但一条都没拉到：展开「健康面板 → 刷新稿件表现数据」重试。'
           : '切片要先投出去并拿到 bvid（多分P 续传成功后自动写入），然后才会出现在这里。'}</div>`}
       ${goneRows.length ? `<p class="hintline">已隐藏 ${goneRows.length} 个 B站 上已不存在的稿件（被删或下架，取不到任何数据）：<button class="linkbtn" id="perfGoneToggle">${perfShowGone ? '收起它们' : '显示它们'}</button></p>` : ''}
-      ${failed.length ? `<p class="hintline">上次回流有 ${failed.length} 个稿件取不到统计：${failed.map((f) => `${esc(f.bvid)}（${esc(String(f.error).slice(0, 60))}）`).join('、')}</p>` : ''}</div>`;
+      ${failed.length ? `<p class="hintline">上次回流有 ${failed.length} 个稿件取不到统计：${failed.map((f) => `${esc(f.bvid)}（${esc(String(f.error).slice(0, 60))}）`).join('、')}</p>` : ''}</div>
+    <!-- ★ 2026-10-11 用户要求把「成本」并进这一页（原来的独立页签让给了回收站/待删清单）。
+         用原生 <details> 默认收起：这一页的主角是稿件表现，成本是"顺手看一眼"的附属信息。 -->
+    <details class="group"><summary style="cursor:pointer;font-size:14px;font-weight:600">成本（月度汇总 · ${esc(String(costData.monthly.month))}）</summary>
+      <div class="inner" style="padding-top:10px">
+        ${costData.monthly.fixturesExcluded
+          ? `<p class="hintline">已排除 <b>${costData.monthly.fixturesExcluded}</b> 个<b>测试夹具</b>任务（自动化测试造的，不算真实开销）；
+             要看它们请到任务列表勾「显示测试夹具」。</p>`
+          : ''}
+        ${costHtml(costData.monthly)}</div>
+    </details>`;
   /* 「显示它们 / 收起它们」与排序选择器是这张卡里的两个事件，就地绑定（与其它卡片的写法一致）。
      排序改完**整页重画**：只是重新排一遍，API 数据没变（多一次本地 GET，可忽略）。 */
   const goneToggle = box.querySelector('#perfGoneToggle');
   if (goneToggle) goneToggle.addEventListener('click', () => { perfShowGone = !perfShowGone; renderPerf(box); });
-  const sortSel = box.querySelector('#perfSortKey');
+  /* ★ 2026-10-14：这一页自己的刷新入口 + **结果反馈**。
+     用户实测反馈"刷新不及时"：其实刷新按钮原来只在健康面板上，而且候选为空时接口只回一句 notes、
+     界面不显示 ⇒ 点了像没反应。现在：按钮在本页、结果写在这行提示里（含"今天已拉过"这种正常情况）。 */
+  const perfNote = (msg, kind) => {
+    const el = box.querySelector('#perfFreshNote');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.color = kind === 'bad' ? '#c33' : kind === 'ok' ? '#2a7' : '';
+  };
+  const perfDoRefresh = async (force) => {
+    const b1 = box.querySelector('#perfRefreshNow');
+    const b2 = box.querySelector('#perfForceRefresh');
+    if (b1) b1.disabled = true;
+    if (b2) b2.disabled = true;
+    perfNote(force ? '正在向 B站 强制拉取（会慢几秒）…' : '正在重查…');
+    try {
+      const r = await api('/api/performance/refresh', { method: 'POST', body: force ? { force: true } : {} });
+      const at = new Date().toLocaleTimeString('zh-CN');
+      if (r.noop) {
+        /* 这两种"没拉到"都是**正常**的，必须说清 —— 否则用户以为功能坏了 */
+        perfNote((r.notes && r.notes[0]) || '没有需要拉取的稿件', '');
+      } else {
+        perfNote(`${force ? '强制重拉' : '刷新'}完成：更新 ${r.updated}/${r.checked} 个稿件${r.failed && r.failed.length ? `，${r.failed.length} 个取不到统计` : ''}（${at}）`, r.failed && r.failed.length ? 'bad' : 'ok');
+      }
+      await renderOther('perf');
+      const el = document.getElementById('perfFreshNote');
+      if (el) {
+        el.textContent = r.noop ? ((r.notes && r.notes[0]) || '没有需要拉取的稿件') : `${force ? '强制重拉' : '刷新'}完成：更新 ${r.updated}/${r.checked} 个稿件（${at}）`;
+      }
+      if (!r.noop) toast(`已更新 ${r.updated}/${r.checked} 个稿件`, 4000);
+    } catch (e) {
+      perfNote('刷新失败：' + e.message, 'bad');
+      toast('刷新失败：' + e.message, 6000);
+    }
+    const b1b = document.getElementById('perfRefreshNow');
+    const b2b = document.getElementById('perfForceRefresh');
+    if (b1b) b1b.disabled = false;
+    if (b2b) b2b.disabled = false;
+  };
+  const rn = box.querySelector('#perfRefreshNow');
+  if (rn) rn.onclick = () => perfDoRefresh(false);
+  const rf = box.querySelector('#perfForceRefresh');
+  if (rf) rf.onclick = () => perfDoRefresh(true);
+    const sortSel = box.querySelector('#perfSortKey');
   if (sortSel) sortSel.onchange = () => {
     perfSort = PERF_SORTS.some((s) => s.key === sortSel.value) ? sortSel.value : 'view';
     perfStore.set('liveauto.perfSort', perfSort);
@@ -2876,6 +3582,158 @@ const LLM_PRESETS = {
   ollama: { url: 'http://127.0.0.1:11434/v1', model: 'qwen3:14b', note: '完全本地运行、数据不出机器。⚠️ Ollama 默认上下文仅 2048 token，必须在 Modelfile 里设 num_ctx，否则长文本会被静默截断。' },
   custom: { url: '', model: '', note: '自行填写任意 OpenAI 兼容端点。' },
 };
+
+/** 「常用」快跳字段（打开设置先看到这些，不用在 81 个输入里翻） */
+const CFG_PINNED = [
+  ['c_baseUrl', 'biliLive-tools 地址'],
+  ['c_roomId', '直播间'],
+  ['c_autoPublish', '自动发布'],
+  ['c_multiPart', '多分P'],
+  ['c_immediatePublish', '立即发布'],
+  ['c_trashDays', '回收站保留天数'],
+  ['c_dailyLimit', '每日投稿上限'],
+  ['c_isOnlySelf', '仅自己可见'],
+];
+/** 危险字段：改错了代价大（0 有特殊语义 / 会删源），必须在界面上标出来 */
+const CFG_DANGER = new Set(['c_trashDays', 'c_deleteRaw', 'c_keepOnFail']);
+
+/**
+ * 设置面板瘦身（2026-10-11 优化第一批 A1）。
+ *
+ * 问题：**81 个输入平铺一页**，找一个开关要滚很久；危险项（`trashDays=0` 会直接不用回收站、
+ * 删源开关）和常用项混在一起，看不出轻重。
+ *
+ * 做法是**纯增强层**：不改任何字段的 id / name / 保存口径（`saveCfg` 仍按 id 读值），
+ * 只是把已有的 `.group` 包成可折叠的 `<details>`、加搜索框、把常用字段做成快跳、给危险字段打标。
+ * 这样零风险：就算这层不生效，设置面板照旧能用（只是又变回平铺）。
+ */
+function enhanceCfgPanel() {
+  const body = $('#cfgBody');
+  if (!body) return;
+  /* ⚠️ 幂等判断必须看**本次渲染的结果**，不能看 #cfgBody 自己身上的标记：
+     每次打开设置都会重写 #cfgBody.innerHTML（子节点全新），而 dataset 挂在容器自身、会留下来 ——
+     实测症状就是"只有第一次打开是瘦身的，第二次又变回 81 个输入平铺"。
+     改成"已经存在搜索框就说明这一轮增强过了"，天然自愈。 */
+  if (body.querySelector('#cfgSearch')) return;
+  const groups = [...body.querySelectorAll('.group')];
+  /* ① 分组折叠：默认收起 —— 打开设置先看到"目录"，而不是 81 个输入 */
+  for (const g of groups) {
+    const h3 = g.querySelector('h3');
+    const title = h3 ? String(h3.textContent).trim() : '设置';
+    const box = document.createElement('details');
+    box.className = 'cfggroup';
+    const sum = document.createElement('summary');
+    sum.style.cssText = 'cursor:pointer;font-size:14px;font-weight:600;padding:6px 0';
+    sum.textContent = title;
+    box.appendChild(sum);
+    const inner = document.createElement('div');
+    inner.className = 'inner';
+    while (g.firstChild) {
+      const n = g.firstChild;
+      if (n === h3) {
+        g.removeChild(n);
+        continue;
+      }
+      inner.appendChild(n);
+    }
+    box.appendChild(inner);
+    g.appendChild(box);
+  }
+  /* ② 顶部工具条：搜索 + 全部展开 + 常用快跳 */
+  const bar = document.createElement('div');
+  bar.id = 'cfgBar';
+  bar.style.cssText = 'position:sticky;top:0;background:var(--card);z-index:3;padding:2px 0 10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--border);margin-bottom:10px';
+  /* ③ 与"出厂基线"的差异（P1-7 最后一件）：回答"这套配置和你最初时哪里不一样" ——
+     排障与交接时最需要这一条。数据由服务端下发（configDiff），界面只渲染，
+     免得同一套口径在两端各写一遍。路径末段能匹配到 #c_<名字> 的就做成可点击跳转，
+     匹配不到就只显示路径（不放假跳转）。 */
+  const diff = (state.bootstrap && state.bootstrap.configDiff) || { count: 0, items: [] };
+  bar.innerHTML = `<input class="inp" id="cfgSearch" placeholder="搜索设置项（例：封面 / 保留天数 / 弹幕 / Key）" style="width:300px">
+    <button class="btn-sm" id="cfgExpandAll">全部展开</button>
+    <span class="hintline" id="cfgSearchNote"></span>
+    <span class="hintline">常用：${CFG_PINNED.map(([id, label]) => `<button class="linkbtn" data-cfgjump="${id}">${esc(label)}</button>`).join(' · ')}</span>
+    <details class="hintline" style="margin-left:auto">
+      <summary style="cursor:pointer">${diff.count ? `你改过 <b>${diff.count}</b> 项` : '与出厂基线一致'}</summary>
+      ${diff.count
+        ? `<div style="max-height:220px;overflow:auto;margin-top:6px">
+             ${diff.items
+               .map((it) => {
+                 const leaf = String(it.path).split('.').pop() || '';
+                 const target = body.querySelector(`#c_${leaf}`) ? `c_${leaf}` : '';
+                 return `<div style="white-space:nowrap">${
+                   target ? `<button class="linkbtn" data-cfgjump="${esc(target)}">${esc(it.path)}</button>` : `<span class="mono-sm">${esc(it.path)}</span>`
+                 } <span style="color:var(--text-3)">${it.kind === 'added' ? `新增：${esc(it.to ?? '')}` : it.kind === 'removed' ? `已删除（原 ${esc(it.from ?? '')}）` : `${esc(it.from ?? '')} → <b>${esc(it.to ?? '')}</b>`}</span></div>`;
+               })
+               .join('')}
+             ${diff.count > diff.items.length ? `<div style="color:var(--text-3)">… 还有 ${diff.count - diff.items.length} 项</div>` : ''}
+             <div style="color:var(--text-3);margin-top:6px">基线保存在 data/config-baseline.json（删掉它即以当前配置为新基线）</div>
+           </div>`
+        : ''}
+    </details>`;
+  body.insertBefore(bar, body.firstChild);
+
+  /* ③ 危险字段打标（不阻止保存，但让人看见） */
+  for (const id of CFG_DANGER) {
+    const el = body.querySelector(`#${id}`);
+    const field = el ? el.closest('.field') : null;
+    const label = field ? field.querySelector('label') : null;
+    if (label && !label.querySelector('[data-danger]')) {
+      const tag = document.createElement('span');
+      tag.setAttribute('data-danger', '1');
+      tag.className = 'tag-mini';
+      tag.style.cssText = 'background:#fdecec;color:#c33;margin-left:6px';
+      tag.textContent = '⚠ 改错代价大';
+      label.appendChild(tag);
+    }
+  }
+
+  /* ④ 搜索：按字段的文字过滤；命中的分组自动展开，并如实报匹配数 */
+  const search = body.querySelector('#cfgSearch');
+  const note = body.querySelector('#cfgSearchNote');
+  const fields = [...body.querySelectorAll('.field')];
+  const applyFilter = () => {
+    const q = String(search?.value ?? '').trim().toLowerCase();
+    if (note) note.textContent = '';
+    for (const f of fields) f.style.display = '';
+    for (const g of groups) {
+      const d = g.querySelector('details.cfggroup');
+      if (d && !q) d.open = false;
+    }
+    if (!q) return;
+    let hit = 0;
+    for (const f of fields) {
+      const hay = String(f.textContent ?? '').toLowerCase();
+      const ok = hay.includes(q);
+      f.style.display = ok ? '' : 'none';
+      if (ok) {
+        hit++;
+        const d = f.closest('details.cfggroup');
+        if (d) d.open = true;
+      }
+    }
+    if (note) note.textContent = hit ? `匹配 ${hit} 项（已自动展开所在分组）` : '没有匹配的设置项';
+  };
+  if (search) search.oninput = applyFilter;
+  const expand = body.querySelector('#cfgExpandAll');
+  if (expand) {
+    expand.onclick = () => {
+      const ds = [...body.querySelectorAll('details.cfggroup')];
+      const anyClosed = ds.some((d) => !d.open);
+      for (const d of ds) d.open = anyClosed;
+      expand.textContent = anyClosed ? '全部收起' : '全部展开';
+    };
+  }
+  /* ⑤ 常用快跳：展开所在分组 + 滚到它 + 聚焦（不移动 DOM，避免 id 重复导致保存读错值） */
+  body.querySelectorAll('[data-cfgjump]').forEach((b) => (b.onclick = () => {
+    const el = body.querySelector(`#${b.dataset.cfgjump}`);
+    if (!el) return;
+    const d = el.closest('details.cfggroup');
+    if (d) d.open = true;
+    const field = el.closest('.field');
+    if (field) field.scrollIntoView({ block: 'center' });
+    if (typeof el.focus === 'function') el.focus();
+  }));
+}
 
 async function openCfg() {
   /* 每次打开设置面板都重新拉一次：面板渲染的是「此刻」的配置快照。
@@ -2913,7 +3771,7 @@ async function openCfg() {
     <div class="fields">
       <div class="field"><label>B站直播间房间号</label><input class="inp" id="c_roomId" value="${esc(c.room.roomId)}"></div>
       <div class="field"><label>platform（必须首字母大写）</label><input class="inp" id="c_platform" value="${esc(c.room.platform)}" readonly>
-        <div class="hintline">写成 bilibili 会**静默返回空数组**，触发永不生效（陷阱 #1）</div></div>
+        <div class="hintline">写成 bilibili 会<b>静默返回空数组</b>，触发永不生效（陷阱 #1）</div></div>
       <div class="field"><label>检查开播间隔（秒）</label><input class="inp num" id="c_pollIntervalSec" value="${c.room.pollIntervalSec}"></div>
       <div class="field"><label>下播确认窗口（秒）</label><input class="inp num" id="c_offlineConfirmSec" value="${c.room.offlineConfirmSec}">
         <div class="hintline">断流误触发的防线：持续非直播 ≥ 该窗口才判定本场结束（硬约束 #19）</div></div>
@@ -2922,7 +3780,7 @@ async function openCfg() {
         <select class="inp" id="c_recorderType">
           ${['builtin', 'bililiverecorder', 'blrec', 'ddtv', 'oneliverec', 'custom'].map((t) => `<option value="${t}" ${c.recorder.type === t ? 'selected' : ''}>${{ builtin: '内置引擎（无对外事件源，用轮询）', bililiverecorder: '录播姬', blrec: 'blrec', ddtv: 'DDTV', oneliverec: 'oneliverec', custom: '其它 / custom' }[t]}</option>`).join('')}
         </select>
-        <div class="hintline">首选方案：让录制器**直接配置两个 webhook 目标**（本服务 + biliLive-tools），零转发零单点故障</div></div>
+        <div class="hintline">首选方案：让录制器<b>直接配置两个 webhook 目标</b>（本服务 + biliLive-tools），零转发零单点故障</div></div>
     </div></div>
 
   <div class="group"><h3>切片与选片</h3>
@@ -2940,7 +3798,7 @@ async function openCfg() {
       <div class="field"><label>源文件是否已烧弹幕</label><div class="inline-switch">
         <button class="switch sm ${c.clip.fullVideoHasDanmaku ? 'on' : ''}" id="c_fullVideoHasDanmaku"></button>
         <span>${c.clip.fullVideoHasDanmaku ? '是（切片时不再传 ASS，避免叠双层弹幕）' : '否（切片时传入整场 ASS）'}</span></div>
-        <div class="hintline">该值由压制预设或本场配置决定，**不允许运行时猜测**（硬约束 #12）</div></div>
+        <div class="hintline">该值由压制预设或本场配置决定，<b>不允许运行时猜测</b>（硬约束 #12）</div></div>
       <div class="field"><label>ffmpeg 预设 ID</label><input class="inp" id="c_ffmpegPresetId" value="${esc(c.clip.ffmpegPresetId)}">
         <div class="hintline">从 biliLive-tools 的预设读取参数；切片必须重编码，禁止 stream copy</div></div>
       <div class="field"><label>编码参数覆盖（JSON，可留空）</label><input class="inp" id="c_ffmpegOptionsOverride" value="${esc(JSON.stringify(c.clip.ffmpegOptionsOverride || {}))}"></div>
@@ -2953,12 +3811,14 @@ async function openCfg() {
       <div class="field full"><label>投稿体检</label><div class="ctl">
         <button class="btn-sm" id="btnAuditCurrent">对最近的场次跑一次体检</button>
         <span class="hintline">列出本场投了几次、有没有重复稿件、bvid 是否可信、标题有没有硬伤。也可以在某场任务详情页点「投稿体检」。</span></div></div>
-      <div class="field full"><label>回收站</label><div class="ctl">
-        <button class="btn-sm" id="btnTrash">查看回收站</button>
-        <span class="hintline">删除任务不再不可逆：任务目录与切片产物会先移进回收站（默认留 7 天），可在这里恢复。</span></div></div>
-      <div class="field full"><label>用完即删</label><div class="ctl">
-        <button class="btn-sm" id="btnPendingDelete">查看待删清单<span id="pendingDeleteBadge"></span></button>
-        <span class="hintline" id="pendingDeleteHint">本场全部切片确认投稿成功后，成片与源录播会排进待删清单，宽限期过后自动删除。宽限期内可在这里取消。</span></div></div>
+      <div class="field full"><label>回收站 / 待删清单</label><div class="ctl">
+        <span class="hintline">这两项已经<b>搬到顶部标签栏、并合并成一页</b>（2026-10-11）：
+        「待删 / 回收站」里第一段是「用完即删」的待删（宽限期内可取消），第二段是回收站（已删除、可恢复、超期自动清理）——
+        不用再翻设置。</span></div></div>
+      <div class="field full"><label>回收站保留天数</label><div class="ctl">
+        <input class="inp" id="c_trashDays" type="number" min="0" max="90" step="1" style="width:90px" value="${Number(c.cleanup.trashDays)}">
+        <span class="hintline">超过这个天数的条目会被<b>自动彻底删除</b>（每天检查一次）；在「回收站」页每个日期上也能看到还剩几天到期。
+          <b>0 = 不用回收站</b>：删除任务会直接永久删除，误点了也恢复不了。</span></div></div>
       <div class="field full"><label>MCP 接口</label><div class="ctl">
         <button class="btn-sm" id="btnMcp">接入 Agent（Claude Code / Codex / Cursor）<span id="mcpBadge"></span></button>
         <span class="hintline">把整个切片助手暴露成 MCP 工具，Agent 就能直接用对话驱动流水线：看任务、重跑某阶段、查为什么没导入、取消删源。只监听 127.0.0.1，且必须带 token。</span></div></div>
@@ -3053,7 +3913,7 @@ async function openCfg() {
       <div class="field full"><label>把术语表当热词喂给 Fun-ASR</label><div class="inline-switch">
         <button class="switch sm ${c.asr.localFunasr.hotwordsEnabled !== false ? 'on' : ''}" id="c_funasrHotwords"></button>
         <span>${c.asr.localFunasr.hotwordsEnabled !== false ? '开启（推荐）' : '关闭'}</span></div>
-        <div class="hintline">术语表（<span class="mono-sm">data/glossary.json</span> 的 anchors + terms）会作为 <span class="mono-sm">hotwords</span> 传给本地 Fun-ASR —— <b>只有它支持热词</b>（云端 biliLive-tools 的 /ai/subtitle 不透传热词）。同素材实测：目标词命中 5→8 次、相对云端基准的字错率 5.47%→5.03%，耗时无变化。改了术语表要**重新转写**才生效（缓存键含热词指纹，会自动重算，不会拿旧结果糊弄）。</div></div>
+        <div class="hintline">术语表（<span class="mono-sm">data/glossary.json</span> 的 anchors + terms）会作为 <span class="mono-sm">hotwords</span> 传给本地 Fun-ASR —— <b>只有它支持热词</b>（云端 biliLive-tools 的 /ai/subtitle 不透传热词）。同素材实测：目标词命中 5→8 次、相对云端基准的字错率 5.47%→5.03%，耗时无变化。改了术语表要<b>重新转写</b>才生效（缓存键含热词指纹，会自动重算，不会拿旧结果糊弄）。</div></div>
       <div class="field full"><label>ASR 分段时长（分钟）</label><input class="inp num" id="c_asrSegmentMinutes" value="${c.asr.segmentMinutes}">
         <div class="hintline">/ai/subtitle 是同步阻塞接口，4 小时全片一次调用会挂 20–40 分钟；必须分段且 startTime/endTime 成对（硬约束 #7）。本地 Fun-ASR 会自动忽略它（整文件一次调用，省掉重复加载模型）。</div></div>
       <div class="field"><label>ASR 单价（元/小时，用于估算）</label><input class="inp num" id="c_asrPrice" value="${c.asr.unitPricePerHour}"></div>
@@ -3062,6 +3922,10 @@ async function openCfg() {
           <option value="raw" ${c.asr.inputSource === 'raw' ? 'selected' : ''}>录制原始文件（可与压制并行，推荐）</option>
           <option value="full" ${c.asr.inputSource === 'full' ? 'selected' : ''}>压制产物 mp4</option>
         </select></div>
+      <div class="field full"><label>边录边转写（录制中就把已录完的分段转掉）</label><div class="inline-switch">
+        <button class="switch sm ${c.asr.incrementalEnabled === true ? 'on' : ''}" id="c_incrementalEnabled"></button>
+        <span>${c.asr.incrementalEnabled === true ? '开启（录完只剩最后一段要转）· 需重启服务才生效' : '关闭（等整段录完才开始转）'}</span></div>
+        <div class="hintline">实测"等开始转写"占 573–3691 秒，比转写本身（59 分钟素材约 133–145 秒）长得多 —— 开它能把这部分拿回来。只转<b>已闭合</b>的分段（判据与正式导入同一个常量），任何一段失败就整场回退到整段转写，不会出半截字幕；分段结果走的是同一份 ASR 缓存，不重复计费。<b>⚠️ 改这一项需要重启服务</b>（预转写循环只在启动时按此开关创建）：<span class="mono-sm">node tools/restart-service.ts --force</span>。生效后在日志里搜「预转写」看进度。</div></div>
     </div></div>
 
   <div class="group"><h3>发布策略</h3>
@@ -3079,9 +3943,9 @@ async function openCfg() {
       </div>
       <div class="field"><label>首片提交余量（秒，必须 &gt;7200）</label><input class="inp num" id="c_submitGapSec" value="${c.publish.submitGapSec}">
         <div class="hintline ok" id="hintGap">公式：dtime = 提交时刻 + ${c.publish.submitGapSec} + (N-1)×${c.publish.clipGapSec} + random(0,${c.publish.jitterSec})</div>
-        <div class="hintline">指定了「首片发布时间」后，这一项只作为**兜底下限**（指定时间更早时会被推迟到它）</div></div>
+        <div class="hintline">指定了「首片发布时间」后，这一项只作为<b>兜底下限</b>（指定时间更早时会被推迟到它）</div></div>
       <div class="field"><label>相邻切片间隔（秒）</label><input class="inp num" id="c_clipGapSec" value="${c.publish.clipGapSec}">
-        <div class="hintline">B站硬限制是「相对**各稿件自身提交时刻** &gt;7200 秒」，相邻间隔不受额外限制；7500 仅为保守余量</div></div>
+        <div class="hintline">B站硬限制是「相对<b>各稿件自身提交时刻</b> &gt;7200 秒」，相邻间隔不受额外限制；7500 仅为保守余量</div></div>
       <div class="field"><label>随机抖动上限（秒）</label><input class="inp num" id="c_jitterSec" value="${c.publish.jitterSec}"></div>
       <div class="field"><label>每日投稿上限</label><input class="inp num" id="c_dailyLimit" value="${c.publish.dailyLimit}"></div>
       <div class="field"><label>仅自己可见（试跑期建议开启）</label><div class="inline-switch">
@@ -3110,7 +3974,7 @@ async function openCfg() {
       <div class="field"><label>等待完整版稿件的上限（分钟）</label><input class="inp" id="c_resumeWaitMin" type="number" min="1" max="1440" value="${c.publish.resumeWaitMin}">
         <div class="hintline">biliLive-tools 的压制 + 上传是异步的（实测录制结束后 13–15 分钟才出弹幕版）。超时后本场仍停在「已切片」并告警，交人工确认。</div></div>
       <div class="field"><label>合集 ID（seasonId，留空则无法归入合集）</label><input class="inp" id="c_seasonId" value="${c.publish.seasonId || ''}" placeholder="需在 B站创作中心手动创建后填写">
-        <div class="hintline">⚠️ 没有任何接口能创建合集；留空时切片照常投稿但**不会归入同一合集**</div></div>
+        <div class="hintline">⚠️ 没有任何接口能创建合集；留空时切片照常投稿但<b>不会归入同一合集</b></div></div>
       <div class="field"><label>分区（默认）</label>
         <select class="inp" id="c_defaultCategory">${tags.map((t) => `<option ${c.publish.defaultCategory === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></div>
       <div class="field full"><label>默认标签（逗号分隔）</label><input class="inp" id="c_defaultTags" value="${esc(c.publish.defaultTags.join(', '))}">
@@ -3242,6 +4106,8 @@ function updateTagHint() {
 }
 
 function bindCfg() {
+  /* 设置面板瘦身：分组折叠 + 搜索 + 常用快跳 + 危险标注（纯增强层，见 enhanceCfgPanel 的说明） */
+  enhanceCfgPanel();
   $$('#cfgBody [data-pwd]').forEach((b) => b.onclick = () => {
     const el = document.getElementById(b.dataset.pwd);
     const show = el.type === 'password';
@@ -3326,6 +4192,9 @@ function bindCfg() {
      否则"点了没反应"会被当成按钮坏了（这个坑本项目在其它开关上踩过）。 */
   tgl('#c_funasrHotwords', (on, el) => el.nextElementSibling.textContent = on ? '开启（推荐）' : '关闭');
   tgl('#c_funasrTimestamps', (on, el) => el.nextElementSibling.textContent = on ? '开启（时间戳偏差 ±0.2s，推荐）' : '关闭（退化成 VAD 段粒度，偏差 ±2s）');
+  /* 边录边转写（P1-6）：文案跟着状态变，并在"刚打开"时明确提示要重启 ——
+     否则用户点了、看着是开的，而预转写循环要等下次启动才创建（这一点在实现里是刻意的）。 */
+  tgl('#c_incrementalEnabled', (on, el) => el.nextElementSibling.textContent = on ? '开启（录完只剩最后一段要转）· 需重启服务才生效' : '关闭（等整段录完才开始转）');
   { const cp = $('#btnCopyHotWords'); if (cp) cp.onclick = () => copyText(hotWordsFromForm().perLine, '热词（一行一个）'); }
   { const cp = $('#btnCopyHotWords2'); if (cp) cp.onclick = () => copyText(hotWordsFromForm().commaSeparated, '热词（逗号分隔）'); }
   // 分P 标题模板实时预览：模板写错（变量拼错）肉眼很难发现，这里直接渲染出来
@@ -3353,51 +4222,6 @@ function bindCfg() {
       const btn = document.querySelector('[data-act="publish-audit"]');
       if (btn) btn.click(); else toast('请在该场任务详情页点「投稿体检」');
     }).catch((e) => toast(e.message));
-  }; }
-  // 回收站：列出来 → 恢复 / 彻底清空（唯一会真正抹掉数据的入口）
-  { const tb = $('#btnTrash'); if (tb) tb.onclick = async () => {
-    try {
-      const r = await api('/api/trash');
-      const rows = r.entries.length
-        ? r.entries.map((e) => `<div class="row"><span class="t">${fmtTime(Date.parse(e.deletedAt))}</span><span class="s">
-            <b>${esc(e.title)}</b><br>
-            <span style="color:var(--text-3)">${fmtBytes(e.totalBytes)} · ${e.files.length} 项 · 任务 <span class="mono-sm">${esc(e.taskId)}</span>${e.task ? '' : '（无台账快照，只能恢复文件）'}</span><br>
-            <button class="btn-sm" data-restore="${esc(e.id)}">恢复</button>
-            <button class="btn-sm" data-purge="${esc(e.id)}" style="color:#c33">彻底删除</button></span></div>`).join('')
-        : '<div class="row"><span class="s" style="color:var(--text-3)">回收站是空的</span></div>';
-      openInfo('回收站', `
-        <p style="font-size:13px">共 ${r.entries.length} 项，占用 ${fmtBytes(r.stats.bytes)}。删除的任务会先到这里，可随时恢复（含台账记录）。</p>
-        <div class="timeline">${rows}</div>
-        <div style="margin-top:12px"><button class="btn-sm" id="trashPurgeAll" style="color:#c33">清空回收站（不可逆）</button>
-        <span class="hintline" style="margin-left:8px">目录：<span class="mono-sm">${esc(r.dir)}</span></span></div>`);
-      $$('#infoBody [data-restore]').forEach((b) => (b.onclick = async () => {
-        b.disabled = true;
-        try {
-          const rr = await api('/api/trash/restore', { method: 'POST', body: { id: b.dataset.restore } });
-          toast(`已恢复 ${rr.restored.length} 项${rr.warnings.length ? `（${rr.warnings.length} 项提示）` : ''}`, 6000);
-          closeInfo();
-          await refreshAll(true);
-        } catch (e) { toast('恢复失败：' + e.message, 6000); b.disabled = false; }
-      }));
-      $$('#infoBody [data-purge]').forEach((b) => (b.onclick = async () => {
-        if (!confirm('彻底删除这一项？文件将从磁盘抹掉，无法恢复。')) return;
-        b.disabled = true;
-        try {
-          await api('/api/trash/purge', { method: 'POST', body: { confirm: true, ids: [b.dataset.purge] } });
-          closeInfo();
-          toast('已彻底删除');
-        } catch (e) { toast('删除失败：' + e.message, 6000); b.disabled = false; }
-      }));
-      const all = $('#trashPurgeAll'); if (all) all.onclick = async () => {
-        if (!confirm('清空回收站？里面所有文件将被永久删除，无法恢复。')) return;
-        all.disabled = true;
-        try {
-          const rr = await api('/api/trash/purge', { method: 'POST', body: { confirm: true } });
-          closeInfo();
-          toast(rr.note || '已清空回收站');
-        } catch (e) { toast('清空失败：' + e.message, 6000); all.disabled = false; }
-      };
-    } catch (e) { toast('读取回收站失败：' + e.message, 5000); }
   }; }
 
   // MCP 接口：把端点、token 与可直接粘贴的接入命令摊给用户
@@ -3436,74 +4260,6 @@ function bindCfg() {
     } catch (e) { toast('读取 MCP 信息失败：' + e.message, 5000); }
   }; }
 
-  // 待删清单（「用完即删」的 24 小时反悔窗口）：列出来 → 取消删除
-  // 为什么必须让用户看得见：删源录播不可逆（异盘不进回收站），
-  // 所以"什么时候删、删哪些、怎么反悔"必须能在这个界面上回答。
-  { const pb = $('#btnPendingDelete'); if (pb) pb.onclick = async () => {
-    try {
-      const r = await api('/api/pending-delete');
-      const rowOf = (e, cancellable) => `<div class="row"><span class="t">${cancellable ? fmtTime(Date.parse(e.dueAt)) : '—'}</span><span class="s">
-          <b>${esc(e.path.split(/[\\/]/).pop() || e.path)}</b>
-          <span style="color:var(--text-3)"> · ${e.kind === 'raw' ? '源录播' : e.kind === 'clip' ? '成片' : '完整版'} · ${fmtBytes(e.sizeBytes)}</span><br>
-          <span class="mono-sm" style="color:var(--text-3)">${esc(e.path)}</span><br>
-          <span style="color:var(--text-3)">${esc(e.reason)}</span>
-          <br>${pendingRowActions(e, { cancellable })}
-          ${e.deletedBy ? `<span style="color:var(--text-3)"> · ${e.deletedBy === 'trash' ? '已移入回收站' : '已永久删除'}${e.deletedManually ? '（手动立即删除）' : ''}</span>` : ''}
-          ${e.error ? `<br><span style="color:#c33">上次删除失败：${esc(e.error)}</span>` : ''}
-        </span></div>`;
-      const pend = r.pending.length ? r.pending.map((e) => rowOf(e, true)).join('') : '<div class="row"><span class="s" style="color:var(--text-3)">没有待删除的文件</span></div>';
-      const doneRows = r.deleted.slice(-20).reverse().map((e) => rowOf(e, false)).join('');
-      openInfo('待删清单（用完即删）', `
-        <p style="font-size:13px">本场全部切片确认投稿成功后，成片与源录播会排进这里，<b>宽限期过后自动删除</b>。
-        宽限期内点「取消删除」就不会删；点「立即删除」则<b>现在</b>就删（不等宽限期）。<br>
-        待删 <b>${r.stats.pendingCount}</b> 项，可释放 <b>${fmtBytes(r.stats.pendingBytes)}</b>${r.stats.nextDueAt ? `，最早 <b>${fmtTime(Date.parse(r.stats.nextDueAt))}</b> 执行` : ''}。</p>
-        <div class="timeline">${pend}</div>
-        ${doneRows ? `<h4 style="margin-top:14px">最近已删除</h4><div class="timeline">${doneRows}</div>` : ''}
-        <div style="margin-top:12px">
-        ${r.pending.length ? `<button class="btn-sm" id="pendingDelAll" style="border-color:#f0c8c8;color:#c33">全部立即删除（${r.pending.length} 项 · ${fmtBytes(r.stats.pendingBytes)}）</button>` : ''}
-        <button class="btn-sm" id="pendingRunDue">立即执行到点的删除</button>
-        <span class="hintline" style="margin-left:8px">「到点删除」每 10 分钟自动执行一次，这里只是手动触发；要提前删请点上面的「立即删除」。</span></div>`);
-      /* 「立即删除」：删完**原地重开清单**（调 pb.click() 复用同一个处理函数），
-         让用户直接看到它从待删里消失 —— 只弹个 toast 的话，清单还停在旧内容上，
-         用户会以为没删掉又点一次。 */
-      $$('#infoBody [data-pending-del]').forEach((b) => (b.onclick = async () => {
-        b.disabled = true;
-        try {
-          const res = await deletePendingNow([b.dataset.pendingDel], r.pending);
-          if (res === null) { b.disabled = false; return; } // 用户在确认框里点了取消
-          closeInfo();
-          pb.click();
-        } catch (e) { toast('删除失败：' + e.message, 6000); b.disabled = false; }
-      }));
-      const delAll = $('#pendingDelAll'); if (delAll) delAll.onclick = async () => {
-        delAll.disabled = true;
-        try {
-          const res = await deletePendingNow(r.pending.map((e) => e.id), r.pending);
-          if (res === null) { delAll.disabled = false; return; }
-          closeInfo();
-          pb.click();
-        } catch (e) { toast('删除失败：' + e.message, 6000); delAll.disabled = false; }
-      };
-      $$('#infoBody [data-cancel]').forEach((b) => (b.onclick = async () => {
-        b.disabled = true;
-        try {
-          await api('/api/pending-delete/cancel', { method: 'POST', body: { id: b.dataset.cancel } });
-          toast('已取消：这个文件不会被自动删除');
-          closeInfo();
-          void refreshPendingBadge();
-        } catch (e) { toast('取消失败：' + e.message, 6000); b.disabled = false; }
-      }));
-      const runDue = $('#pendingRunDue'); if (runDue) runDue.onclick = async () => {
-        runDue.disabled = true;
-        try {
-          const rr = await api('/api/pending-delete/run', { method: 'POST', body: {} });
-          toast(`执行完成：删除 ${rr.deleted} 项（释放 ${fmtBytes(rr.bytes)}）${rr.failed ? `，失败 ${rr.failed} 项` : ''}`, 7000);
-          closeInfo();
-          void refreshPendingBadge();
-        } catch (e) { toast('执行失败：' + e.message, 6000); runDue.disabled = false; }
-      };
-    } catch (e) { toast('读取待删清单失败：' + e.message, 5000); }
-  }; }
   tgl('#c_fullVideoHasDanmaku', (on, el) => el.nextElementSibling.textContent = on ? '是（切片时不再传 ASS，避免叠双层弹幕）' : '否（切片时传入整场 ASS）');
   tgl('#c_recordDecisions', (on, el) => el.nextElementSibling.textContent = on ? '开启（记录你的勾选与取消，用于观察 LLM 的偏好偏差）' : '关闭（无法分析选片偏好）');
   tgl('#c_isOnlySelf', (on, el) => el.nextElementSibling.textContent = on ? '开启' : '关闭（公开可见）');
@@ -3641,6 +4397,9 @@ async function saveCfg(force) {
       segmentMinutes: num('#c_asrSegmentMinutes'),
       unitPricePerHour: num('#c_asrPrice'),
       inputSource: val('#c_asrInputSource'),
+      /* 边录边转写（P1-6）：这一项改的是"录制监听 + 转写阶段消费"两条腿，
+         必须真的存下去（漏了就成了"界面上看着开着、其实没生效"）。改完需重启服务。 */
+      incrementalEnabled: on('#c_incrementalEnabled'),
       localFunasr: {
         pythonPath: val('#c_funasrPython'),
         device: val('#c_funasrDevice'),
@@ -3685,6 +4444,9 @@ async function saveCfg(force) {
     },
     cleanup: {
       retentionDays: num('#c_retentionDays'),
+      /* 回收站保留天数（用户 2026-10-11 要求「添加只保留几天的设置 超长时间的自动删除」）：
+         服务端每日检查按它清理过期条目；界面上「回收站」页的到期提示也读同一个值。 */
+      trashDays: Math.max(0, Math.round(num('#c_trashDays')) || 0),
       diskFloorGB: num('#c_diskFloorGB'),
       deleteRawAfterTranscribe: on('#c_deleteRaw'),
       keepFullVideoOnFailure: on('#c_keepOnFail'),
@@ -4024,7 +4786,7 @@ $('#btnImport').onclick = () => {
          判定顺序很重要 —— "已导入过但这会儿还在录"的文件要归到「正在录制」，
          因为它属于"当前正在发生、需要你注意"的那一类。 */
       const buckets = { live: [], idle: [], imported: [] };
-      r.candidates.forEach((c, i) => {
+      r.candidates?.forEach((c, i) => {
         if (c.possiblyRecording) buckets.live.push(i);
         else if (c.importedBy) buckets.imported.push(i);
         else buckets.idle.push(i);

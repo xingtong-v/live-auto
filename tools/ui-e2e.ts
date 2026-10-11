@@ -28,7 +28,7 @@ const HEADED = process.argv.includes('--headed');
 const BASE = 'http://127.0.0.1:3000';
 const PORT = 9333;
 const SHOT_DIR = path.join(ROOT_DIR, 'data', 'ui-shots');
-const UI_BUILD_EXPECTED = 'ui-2026-10-08-perf-pubdate';
+const UI_BUILD_EXPECTED = 'ui-2026-10-14-perf-refresh';
 
 let pass = 0;
 let fail = 0;
@@ -523,7 +523,19 @@ async function main(): Promise<void> {
     console.log(`      \x1b[90m顶栏信息: ${String(basics['brandText'])}\x1b[0m`);
 
     /* ================= 2. 任务卡片与「⋯」按钮 =================
-     * 只看夹具那一张卡（真实任务可能一个都没有，测试不能依赖用户数据） */
+     * 只看夹具那一张卡（真实任务可能一个都没有，测试不能依赖用户数据）。
+     * ★ 2026-10-11：任务列表现在**默认隐藏测试夹具**（每天 38–45 个任务里真实只有 2–7 场，
+     *   其余全是自动化测试造的，用户看着就烦）—— 所以这里先勾上「显示测试夹具」再断言；
+     *   顺带把开关本身也验了（它就是给"我要看一眼夹具"准备的）。 */
+    await cdp.evalJs(`refreshAll(true).then(() => true)`).catch(() => undefined);
+    await sleep(1200);
+    const toggleState = await cdp.evalJs<{ has: boolean; label: string }>(`(() => {
+      const cb = document.getElementById('showFixtures');
+      if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change')); }
+      const bar = document.getElementById('fixtureToggleBar');
+      return { has: !!cb, label: bar ? String(bar.textContent).trim() : '' };
+    })()`);
+    ok('★ 有「显示测试夹具」开关（夹具默认藏起来，但不静默）', toggleState.has, toggleState.label);
     const sel = `#taskList .task[data-id="${fixture}"]`;
     /* 必须**等**卡片渲染出来再断言：页面是异步 fetch 完才画列表的，
        而服务端在跑流水线时（转写/切片占了事件循环）首屏可能就是几秒 ——
@@ -703,6 +715,15 @@ async function main(): Promise<void> {
     /* ================= 8. 设置面板：字幕与术语表 ================= */
     await cdp.evalJs(`document.querySelector('#btnSetting').click()`);
     await sleep(1200);
+    /* ★ 2026-10-11 设置面板瘦身：分组**默认收起**（打开先看到目录，而不是 81 个输入）。
+       所以断言前先点「全部展开」——这一步顺带把这个按钮也验了；不点的话 `innerText` 拿不到折叠内容。 */
+    const expandedCfg = await cdp.evalJs<{ open: number; groups: number }>(`(() => {
+      const b = document.getElementById('cfgExpandAll');
+      if (b) b.click();
+      const ds = [...document.querySelectorAll('#cfgBody details.cfggroup')];
+      return { open: ds.filter((d) => d.open).length, groups: ds.length };
+    })()`);
+    ok('★ 设置分组「全部展开」生效（默认收起，先看目录）', expandedCfg.groups >= 5 && expandedCfg.open === expandedCfg.groups, JSON.stringify(expandedCfg));
     const cfgPanel = await cdp.evalJs<{ open: boolean; fields: Record<string, boolean>; text: string }>(`(() => {
       const body = document.getElementById('cfgBody');
       const ids = ['c_burnSubtitles', 'c_subtitleFontSize', 'c_subtitleMaxChars', 'c_glossaryAnchors', 'c_glossaryTerms', 'c_glossaryRepl', 'btnCopyHotWords', 'c_partTitleTemplate'];
@@ -732,13 +753,17 @@ async function main(): Promise<void> {
     ok('设置里有「简介末尾的 AI 声明」输入框', noticeUi.has);
     ok('默认就带了声明文案（不是空的）', /AI/.test(noticeUi.value) && /投稿|切片/.test(noticeUi.value), noticeUi.value);
     ok('说明了声明不会被 250 字符截断掉', /截断/.test(noticeUi.hint), noticeUi.hint.replace(/\n/g, ' ').slice(0, 120));
-    /* 待删清单入口：删源不可逆，用户必须能在界面上看见"还有多久会删"并反悔 */
-    const pendingUi = await cdp.evalJs<{ btn: boolean; clickable: boolean; label: string }>(`(() => {
-      const b = document.getElementById('btnPendingDelete');
-      return { btn: !!b, clickable: !!b && typeof b.onclick === 'function', label: b ? String(b.textContent).trim() : '' };
+    /* 待删 / 回收站入口：删源不可逆，用户必须能在界面上看见"还有多久会删"并反悔。
+       ★ 2026-10-11：入口从设置弹窗**搬到了顶部标签栏**，随后又按用户要求
+       「待删清单和回收站放一起」合并成一个页签（`data-view="trash"`，名字叫「待删 / 回收站」）。 */
+    const pendingUi = await cdp.evalJs<{ tab: boolean; label: string; hint: string }>(`(() => {
+      const b = document.querySelector('#tabs .tab[data-view="trash"]');
+      const hint = [...document.querySelectorAll('#cfgPanel .hintline, #settingsPanel .hintline')]
+        .map((e) => String(e.textContent)).find((t) => /回收站|待删/.test(t)) || '';
+      return { tab: !!b, label: b ? String(b.textContent).trim() : '', hint };
     })()`);
-    ok('设置里有「待删清单」入口', pendingUi.btn && pendingUi.clickable, pendingUi.label);
-    ok('待删清单的说明写清了"宽限期内可取消"', /宽限期内可取消|宽限期/.test(cfgPanel.text));
+    ok('★ 顶部标签栏有「待删 / 回收站」页签（2026-10-11 从设置搬上来并合并）', pendingUi.tab && /待删/.test(pendingUi.label) && /回收站/.test(pendingUi.label), pendingUi.label);
+    ok('设置面板里留了指路说明（不至于让人找不到）', /标签栏/.test(pendingUi.hint) || /待删/.test(cfgPanel.text), pendingUi.hint.slice(0, 80));
     /* MCP 接入入口：token 在 config.json 里，用户必须能在界面上拿到并复制命令 */
     const mcpUi = await cdp.evalJs<{ btn: boolean; clickable: boolean; label: string }>(`(() => {
       const b = document.getElementById('btnMcp');
@@ -1190,22 +1215,19 @@ async function main(): Promise<void> {
         return true;
       })()`);
 
-      /* ---- 12a. 待删清单弹窗（设置页入口）里的删除按钮 ----
-         不删任何真实条目：只看"按钮在不在、文案对不对"。 */
-      await cdp.evalJs(`document.querySelector('#btnSetting').click()`);
-      await waitFor(`!!document.querySelector('#btnPendingDelete')`, 8000).catch(() => undefined);
-      await sleep(400);
-      const settingsUp = await cdp.evalJs<{ bound: boolean }>(`(() => {
-        const b = document.querySelector('#btnPendingDelete');
-        return { bound: !!b && typeof b.onclick === 'function' };
-      })()`);
-      if (settingsUp.bound) {
-        await cdp.evalJs(`document.querySelector('#btnPendingDelete').click()`);
-        const opened = await waitFor(`/待删清单/.test(String((document.querySelector('#infoTitle') || {}).textContent || ''))`, 8000);
-        ok('设置页「查看待删清单」能打开待删清单弹窗', opened, '弹窗没打开');
-        if (opened) {
-          const rows = await cdp.evalJs<{ total: number; withDel: number; hasAll: boolean; firstTag: string }>(`(() => {
-            const body = document.querySelector('#infoBody');
+      /* ---- 12a. 「待删 / 回收站」**页签**里的删除按钮 ----
+         不删任何真实条目：只看"按钮在不在、文案对不对"。
+         ★ 2026-10-11：入口从设置弹窗搬到标签栏，随后按用户要求与回收站**合并成一个页签**
+           （`data-view="trash"`），断言范围从 `#infoBody` 改成 `#otherPage`。
+           这里先把设置面板收起来，免得它的遮罩挡住点击。 */
+      await cdp.evalJs(`(() => { const m = document.querySelector('#cfgMask'); if (m) m.classList.remove('show'); return true; })()`);
+      await sleep(200);
+      await cdp.evalJs(`document.querySelector('#tabs .tab[data-view="trash"]').click()`);
+      const opened = await waitFor(`!!document.querySelector('#otherPage [data-pending-del]') || /待删/.test(String((document.querySelector('#otherPage') || {}).textContent || ''))`, 10000);
+      ok('★ 点「待删 / 回收站」页签能打开清单（不再藏在设置里）', opened, '页面没渲染出来');
+      if (opened) {
+        const rows = await cdp.evalJs<{ total: number; withDel: number; hasAll: boolean; firstTag: string }>(`(() => {
+            const body = document.querySelector('#otherPage');
             const btns = body ? body.querySelectorAll('[data-pending-del]') : [];
             /* 认**自己那条夹具**而不是"第一行"：清单里随时有真实条目（刚投出来的成片也会进），
                按位置取会把真实条目当成夹具去断言它的删法标注。 */
@@ -1218,18 +1240,13 @@ async function main(): Promise<void> {
               firstTag: row ? String(row.textContent).replace(/\\s+/g, ' ').slice(0, 140) : '',
             };
           })()`);
-          ok('待删清单里每条待删都有「立即删除」按钮', rows.withDel > 0, JSON.stringify(rows));
-          ok('有条目时给出「全部立即删除」入口', rows.hasAll || rows.withDel === 1, JSON.stringify(rows));
-          ok('行内标注了删法（进回收站 / 跨盘不可恢复）', /删除→回收站|跨盘·删除不可恢复|文件已不在/.test(rows.firstTag), rows.firstTag);
-          await screenshot(cdp, '12-pending-delete-dialog');
-        }
-      } else {
-        ok('设置页「查看待删清单」入口已绑定（设置面板当前是否可渲染）', false, '按钮没绑上，弹窗测不了');
+        ok('待删清单里每条待删都有「立即删除」按钮', rows.withDel > 0, JSON.stringify(rows));
+        ok('有条目时给出「全部立即删除」入口', rows.hasAll || rows.withDel === 1, JSON.stringify(rows));
+        ok('行内标注了删法（进回收站 / 跨盘不可恢复）', /删除→回收站|跨盘·删除不可恢复|文件已不在/.test(rows.firstTag), rows.firstTag);
+        await screenshot(cdp, '12-pending-delete-tab');
       }
-      await cdp.evalJs(`document.querySelector('#cfgMask').classList.remove('show')`);
-      /* ⚠️ 必须把 12a 开着的弹窗关掉：它还留在 DOM 里，`document.querySelector('[data-pending-del]')`
-         会先命中弹窗里那一个（不在 <tr> 里），行文本与"全部立即删除"就都查不到了（实测踩过）。 */
-      await cdp.evalJs(`window.closeInfo && window.closeInfo()`);
+      /* ⚠️ 必须离开这个页签：清单里的 `[data-pending-del]` 还留在 DOM 里，
+         12b 在监控面板里 `querySelector` 会先命中它（不在 <tr> 里），行文本与"全部立即删除"就都查不到了（实测踩过）。 */
       await sleep(200);
 
       /* ---- 12b. 监控面板里的待删表：真的点「立即删除」把同盘那条删掉（选择器都限定在 #otherPage 内） ---- */

@@ -1,0 +1,325 @@
+{
+  "note": "verify 清单（显式维护，不推导）。fast=true：改完随手跑的层；optional=true：已知历史债（会红但不阻断）。改这条链请改本文件。 【2026-10-13】快速层扩容：加入兜住主链/界面的套件（monitor-panel/confirm-append/multipart-* /media-plan），此前它们只在全量链里，曾导致一条过期断言红了多轮未被发现。",
+  "steps": [
+    {
+      "name": "asr-worker-test",
+      "cmd": "npm run asr-worker-test"
+    },
+    {
+      "name": "typecheck",
+      "cmd": "npm run typecheck",
+      "fast": true
+    },
+    {
+      "name": "encoding-test",
+      "cmd": "npm run encoding-test",
+      "fast": true
+    },
+    {
+      "name": "check:ui",
+      "cmd": "npm run check:ui",
+      "fast": true
+    },
+    {
+      "name": "ui-modules-test",
+      "cmd": "npm run ui-modules-test",
+      "fast": true
+    },
+    {
+      "name": "media-plan-test",
+      "cmd": "npm run media-plan-test",
+      "fast": true
+    },
+    {
+      "name": "text-test",
+      "cmd": "npm run text-test",
+      "fast": false
+    },
+    {
+      "name": "config-test",
+      "cmd": "npm run config-test",
+      "fast": false
+    },
+    {
+      "name": "audit",
+      "cmd": "npm run audit",
+      "fast": false
+    },
+    {
+      "name": "redact-test",
+      "cmd": "npm run redact-test",
+      "fast": false
+    },
+    {
+      "name": "subtitle-test",
+      "cmd": "npm run subtitle-test",
+      "fast": false
+    },
+    {
+      "name": "streamer-test",
+      "cmd": "npm run streamer-test",
+      "fast": false
+    },
+    {
+      "name": "av-sync-test",
+      "cmd": "npm run av-sync-test",
+      "fast": false
+    },
+    {
+      "name": "title-test",
+      "cmd": "npm run title-test",
+      "fast": false
+    },
+    {
+      "name": "clip-boundary-test",
+      "cmd": "npm run clip-boundary-test",
+      "fast": false
+    },
+    {
+      "name": "delete-test",
+      "cmd": "npm run delete-test",
+      "fast": false
+    },
+    {
+      "name": "trigger-scope-test",
+      "cmd": "npm run trigger-scope-test",
+      "fast": false
+    },
+    {
+      "name": "recordings-test",
+      "cmd": "npm run recordings-test",
+      "fast": false
+    },
+    {
+      "name": "stitch-test",
+      "cmd": "npm run stitch-test",
+      "fast": false
+    },
+    {
+      "name": "watch-test",
+      "cmd": "npm run watch-test",
+      "fast": false
+    },
+    {
+      "name": "watch-skip-burn-test",
+      "cmd": "npm run watch-skip-burn-test",
+      "fast": false
+    },
+    {
+      "name": "pending-delete-test",
+      "cmd": "npm run pending-delete-test",
+      "fast": false
+    },
+    {
+      "name": "monitor-panel-test",
+      "cmd": "npm run monitor-panel-test",
+      "fast": true
+    },
+    {
+      "name": "performance-test",
+      "cmd": "npm run performance-test",
+      "fast": false
+    },
+    {
+      "name": "service-watchdog-test",
+      "cmd": "npm run service-watchdog-test",
+      "fast": false
+    },
+    {
+      "name": "boot-requeue-test",
+      "cmd": "npm run boot-requeue-test",
+      "fast": false
+    },
+    {
+      "name": "error-report-test",
+      "cmd": "npm run error-report-test",
+      "fast": false
+    },
+    {
+      "name": "local-funasr-test",
+      "cmd": "npm run local-funasr-test",
+      "fast": false
+    },
+    {
+      "name": "desc-notice-test",
+      "cmd": "npm run desc-notice-test",
+      "fast": false
+    },
+    {
+      "name": "clip-actions-test",
+      "cmd": "npm run clip-actions-test",
+      "fast": false
+    },
+    {
+      "name": "import-source-test",
+      "cmd": "npm run import-source-test",
+      "fast": false
+    },
+    {
+      "name": "resume-target-test",
+      "cmd": "npm run resume-target-test",
+      "fast": false
+    },
+    {
+      "name": "multipart-routing-test",
+      "cmd": "npm run multipart-routing-test",
+      "fast": true
+    },
+    {
+      "name": "confirm-append-test",
+      "cmd": "npm run confirm-append-test",
+      "fast": true
+    },
+    {
+      "name": "fingerprint-dedup-test",
+      "cmd": "npm run fingerprint-dedup-test",
+      "fast": false
+    },
+    {
+      "name": "fingerprint-tombstone-test",
+      "cmd": "npm run fingerprint-tombstone-test",
+      "fast": false
+    },
+    {
+      "name": "tombstone-reconcile-test",
+      "cmd": "npm run tombstone-reconcile-test",
+      "fast": false
+    },
+    {
+      "name": "fixture-accounting-test",
+      "cmd": "npm run fixture-accounting-test",
+      "fast": true
+    },
+    {
+      "name": "failure-class-test",
+      "cmd": "npm run failure-class-test",
+      "fast": true
+    },
+    {
+      "name": "cover-test",
+      "cmd": "npm run cover-test",
+      "fast": true
+    },
+    {
+      "name": "clean-artifacts-test",
+      "cmd": "npm run clean-artifacts-test",
+      "fast": true
+    },
+    {
+      "name": "recording-health-test",
+      "cmd": "npm run recording-health-test",
+      "fast": true
+    },
+    {
+      "name": "config-coverage-test",
+      "cmd": "npm run config-coverage-test",
+      "fast": true
+    },
+    {
+      "name": "config-baseline-test",
+      "cmd": "npm run config-baseline-test",
+      "fast": true
+    },
+    {
+      "name": "pre-transcribe-tick-test",
+      "cmd": "npm run pre-transcribe-tick-test",
+      "fast": true
+    },
+    {
+      "name": "pre-transcribe-test",
+      "cmd": "npm run pre-transcribe-test",
+      "fast": true
+    },
+    {
+      "name": "incremental-asr-test",
+      "cmd": "npm run incremental-asr-test",
+      "fast": true
+    },
+    {
+      "name": "cut-pipeline-test",
+      "cmd": "npm run cut-pipeline-test",
+      "fast": true
+    },
+    {
+      "name": "publish-batches-test",
+      "cmd": "npm run publish-batches-test",
+      "fast": true
+    },
+    {
+      "name": "clip-library-test",
+      "cmd": "npm run clip-library-test",
+      "fast": true
+    },
+    {
+      "name": "todos-test",
+      "cmd": "npm run todos-test",
+      "fast": true
+    },
+    {
+      "name": "segment-danmaku-test",
+      "cmd": "npm run segment-danmaku-test",
+      "fast": false
+    },
+    {
+      "name": "multipart-cut-snapshot-test",
+      "cmd": "npm run multipart-cut-snapshot-test",
+      "fast": true
+    },
+    {
+      "name": "mcp-test",
+      "cmd": "npm run mcp-test",
+      "fast": false
+    },
+    {
+      "name": "trash-test",
+      "cmd": "npm run trash-test",
+      "fast": false
+    },
+    {
+      "name": "config-conflict-test",
+      "cmd": "npm run config-conflict-test",
+      "fast": false
+    },
+    {
+      "name": "config-conflict-e2e",
+      "cmd": "npm run config-conflict-e2e",
+      "fast": false
+    },
+    {
+      "name": "select-slot-test",
+      "cmd": "npm run select-slot-test",
+      "fast": false
+    },
+    {
+      "name": "e2e",
+      "cmd": "npm run e2e",
+      "fast": false
+    },
+    {
+      "name": "smoke",
+      "cmd": "npm run smoke",
+      "fast": false
+    },
+    {
+      "name": "real",
+      "cmd": "npm run real",
+      "fast": false
+    },
+    {
+      "name": "isolation-test",
+      "cmd": "npm run isolation-test",
+      "fast": true
+    },
+    {
+      "name": "recap-test",
+      "cmd": "npm run recap-test",
+      "fast": true
+    },
+    {
+      "name": "docs-check",
+      "cmd": "npm run docs-check",
+      "fast": true,
+      "optional": true
+    }
+  ]
+}

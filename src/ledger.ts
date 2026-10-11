@@ -530,7 +530,7 @@ function registerExitHook(instance: Ledger): void {
 export class Ledger {
   private readonly ledgerPath: string;
   private readonly decisionsPath: string;
-  private readonly publishLogPath: string;
+  readonly publishLogPath: string;
   private readonly performancePath: string;
   private readonly logger: Logger;
 
@@ -1926,6 +1926,9 @@ export class Ledger {
     days: number,
     now: Date = new Date(),
     extra: Array<{ bvid: string; title?: string; parts?: number; ctime?: number }> = [],
+    /* ★ 2026-10-14：force = 忽略"今天已拉过"的限制（表现页「强制重拉」）。
+       仍然跳过"已消失/已锁定"的稿件 —— 那些没有可拉的统计。 */
+    opts: { force?: boolean } = {},
   ): Array<{ bvid: string; taskId?: string; clipIndex?: number; title?: string; score?: number; parts?: number }> {
     this.load();
     const windowDays = Number.isFinite(days) && days > 0 ? days : 1;
@@ -1933,7 +1936,17 @@ export class Ledger {
     const fromDate = fmtDate(sinceMs);
     const today = fmtDate(now);
     // 当天已有回流记录的 bvid 直接跳过（每天只拉一次）；同时记住最近一次记录的标题/评分/分P，供退化时沿用
-    const pulledToday = new Set<string>();
+    /* force 时把"今天已拉过"的判定变成永假（has() 恒 false）——
+       仍然照常 add/delete，所以 carried（沿用标题/评分/分P）的行为完全不变。 */
+    const pulledTodayRaw = new Set<string>();
+    const pulledToday = opts.force
+      ? {
+          add: (b: string): unknown => pulledTodayRaw.add(b),
+          delete: (b: string): boolean => pulledTodayRaw.delete(b),
+          has: (_b: string): boolean => false,
+          clear: (): void => pulledTodayRaw.clear(),
+        }
+      : pulledTodayRaw;
     const carried = new Map<string, { title?: string; score?: number; parts?: number; at: string }>();
     /* 最近一次记录说「稿件已不存在」的 bvid：不再反复请求（每天 11 个废请求纯属浪费）。
        文件是追加写的 → 后面的行更新，直接覆盖上一次的判断；稿件若重新出现在稿件列表里（extra）会重新纳入。 */

@@ -188,6 +188,77 @@ async function main(): Promise<void> {
   );
   ok('过期快照下一个分P 都没投', res2.parts.length === 0, `实际 ${res2.parts.length}`);
 
+  /* ==========================================================================
+   * 6. 追加失败要**如实说**：biliLive-tools 报错时不能含糊成"待确认"
+   *    （2026-10-10 用户问「这是投稿了吗」—— 那条静默躺在「已提交待确认」半小时，
+   *      原因就是旧代码无论任务成功/失败/还在跑，都只报同一句"任务已完成、B站 侧还没查到"）
+   * ======================================================================== */
+  section('6. 追加被 biliLive-tools 判错 → 标 FAILED 并写清原因');
+  {
+    const cfgResume = { ...realCfg, publish: { ...realCfg.publish, multiPart: true, resumeAid: '117000000000001' } };
+    const dataDir2 = path.join(tmpRoot, 'fail');
+    const taskId2 = 'mp-fail-0001';
+    const clipsDir2 = path.join(dataDir2, 'clips', taskId2);
+    fs.mkdirSync(clipsDir2, { recursive: true });
+    const ledger2 = new Ledger({ path: path.join(dataDir2, 'ledger.json') });
+    ledger2.createTask({
+      id: taskId2,
+      roomId: '12345678',
+      title: '追加失败回归',
+      stage: 'ANALYZED',
+      source: { segments: [], totalDuration: 600, rawFiles: [], fullVideoHasDanmaku: false },
+      fullUpload: 'NOT_APPLICABLE',
+      cost: { asrEstimate: 0, asrAudioSeconds: 0, llmActual: 0, llmPromptTokens: 0, llmCompletionTokens: 0, llmCalls: 0, updatedAt: new Date().toISOString() },
+    });
+    const outFile = path.resolve(clipsDir2, '01-待追加.mp4');
+    fs.writeFileSync(outFile, 'x');
+    ledger2.setClips(taskId2, [
+      {
+        index: 0,
+        start: 10,
+        end: 70,
+        title: '待追加的切片',
+        desc: '',
+        tags: ['测试'],
+        category: '生活',
+        score: 8,
+        selected: true,
+        status: 'CUT' as const,
+        cutOutput: outFile,
+      },
+    ] as never);
+
+    const publisher3 = new Publisher({
+      client: {
+        biliArchives: async (): Promise<unknown[]> => [],
+        /* 续传目标稿件的分P 列表里**始终没有**这条标题 ⇒ 落地确认必然失败 */
+        biliArchiveDetail: async (): Promise<unknown> => ({
+          View: { bvid: 'BV1FAIL00001', videos: 1, pages: [{ part: '完整版', duration: 10 }] },
+        }),
+        biliUpload: async (): Promise<{ taskId: string }> => ({ taskId: 'up-fail-1' }),
+        /* ★ 关键：对方明确报错 —— 旧代码不看这个字段，照样写"任务已完成" */
+        taskDetail: async (): Promise<unknown> => ({ status: 'error', error: '稿件已被锁定，无法追加分P' }),
+      } as never,
+      config: cfgResume,
+      ledger: ledger2,
+      logger: silentLog as never,
+    });
+
+    const r3 = await publisher3.publishAsMultiPart({
+      task: ledger2.getTask(taskId2) as TaskRecord,
+      uid: 1,
+      clips: ledger2.getClips(taskId2),
+      resumeAid: '117000000000001',
+      resumeBvid: 'BV1FAIL00001',
+      logger: silentLog as never,
+    });
+    ok('★ 任务报错 ⇒ ok=false（不再含糊成「已提交待确认」）', r3.ok === false, JSON.stringify({ ok: r3.ok, error: r3.error }).slice(0, 200));
+    ok('错误里带上对方原文（人/自动重跑才有依据）', String(r3.error ?? '').includes('稿件已被锁定'), String(r3.error ?? '(无)'));
+    const c3 = ledger2.getClip(taskId2, 0);
+    ok('★ 切片状态是 FAILED（不是 SUBMITTED）', c3?.status === 'FAILED', `实际 ${String(c3?.status)}`);
+    ok('failReason 写清了原因', String(c3?.failReason ?? '').includes('稿件已被锁定'), String(c3?.failReason ?? '(空)'));
+  }
+
   console.log(`\n\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);
   if (failures.length) {
     console.log('\x1b[31m失败项：\x1b[0m');

@@ -15,7 +15,20 @@
  *  - 每个任务目录保留全链路可追溯的日志与产出。
  */
 import fs from 'node:fs';
+import { runArtifactCleanup, summarizeCleanup } from './clean-artifacts.ts';
+import { buildRecap, recapPushText } from './recap.ts';
+import { runDataBackup, summarizeBackup } from './backup.ts';
 import path from 'node:path';
+import { buildMediaAdapter } from './media-plan.ts';
+import { runPreTranscribeTick } from './pre-transcribe-tick.ts';
+import { usePreTranscribed } from './pre-transcribe.ts';
+
+/**
+ * 预转写状态文件名（P1-6）：放在**录像同目录**，因为预转写发生在任务建立**之前**（那正是它的价值），
+ * 此刻还没有 taskId/taskDir。以 `.` 开头 ⇒ 不会被录像扫描当成分段。
+ * 内容只有 { done: number[], updatedAt, mode }，是**可重建**的进度文件（丢了最多重转一段）。
+ */
+const PRE_TRANSCRIBE_STATE_FILE = '.pre-transcribe.json';
 import v8 from 'node:v8';
 import { BiliLiveClient } from './api.ts';
 import type { AppConfig } from './config.ts';
@@ -26,6 +39,8 @@ import type { Alerter } from './alert.ts';
 import { Alerter as DefaultAlerter } from './alert.ts';
 import { Analyzer, persistAnalysis, PromptStore } from './analyze.ts';
 import { AsrCache, Transcriber, isDryRunPaymentRejection, type AsrMediaAdapter } from './asr.ts';
+import { planSegmentCalls } from './media-plan.ts';
+import { transcribeInWorker } from './asr-worker-client.ts';
 import { Cleaner, checkAfterUploadDelete, judgeDeletability, rotateLogs } from './cleanup.ts';
 import { writeErrorReport, setErrorReportDir, setErrorsPath, classifyError, type ErrorReportInput } from './errors.ts';
 import { LlmClient } from './llm.ts';
@@ -182,6 +197,13 @@ export class Orchestrator {
   private busy = false;
   private queue: Array<{ taskId: string; fromStage?: Stage }> = [];
   private paused = false;
+  /** 当前正在跑流水线的任务 id（入队去重要用到它：跑着的不该被再排一次） */
+  private currentTaskId?: string;
+  /**
+   * 投稿阶段的**单飞表**：taskId → 正在跑的那次投稿。
+   * 见 `publishStage()` 的说明 —— 同一场并发投稿会重复追加分P（2026-10-10 实测 8 次）。
+   */
+  private publishing = new Map<string, Promise<{ ok: boolean; stoppedAt: Stage; error?: string }>>();
   private lastErrorCount = 0;
   /** bvid 反查循环定时器 */
   private confirmTimer?: NodeJS.Timeout;
@@ -189,6 +211,8 @@ export class Orchestrator {
   private waitTimer?: NodeJS.Timeout;
   /** 稿件表现数据回流定时器 */
   private perfTimer?: NodeJS.Timeout;
+  /** 预转写循环的定时器（P1-6，2026-10-14）：只有 asr.incrementalEnabled=true 时才会被创建 */
+  private preTranscribeTimer?: NodeJS.Timeout;
   /** 配置文件变更监听定时器 */
   private cfgTimer?: NodeJS.Timeout;
   /** 「用完即删」的执行循环（每 10 分钟检查待删清单） */
@@ -646,6 +670,16 @@ export class Orchestrator {
         const days = this.cfg.cleanup.trashDays;
         if (days > 0) {
           const r = purgeTrash({ olderThanDays: days, logger: this.logger });
+          /* ★ 数据备份（P0-2 收尾）：与清理同一个每日 tick。ledger.json 是唯一真相来源（指纹/墓碑/场次），
+             原先只有原子写、没有备份。失败只记日志，绝不影响清理与本 tick。 */
+          const bk = runDataBackup({ keep: 14 });
+          if (bk.error) this.logger.warn(summarizeBackup(bk));
+          else this.logger.info(summarizeBackup(bk));
+          /* ★ 验证产物清理（P2）：与备份同一个每日 tick。只清可再生成的调试产物
+             （白名单/保护清单见 src/clean-artifacts.ts：trash/logs/backup 一律不动）。 */
+          const cl = runArtifactCleanup({ keepDays: 7 });
+          if (cl.error) this.logger.warn(summarizeCleanup(cl));
+          else this.logger.info(summarizeCleanup(cl));
           if (r.purged > 0) this.logger.info(`回收站已清理 ${r.purged} 项过期条目（保留 ${days} 天）`, { mod: 'trash' });
         }
       } catch (e) {
@@ -683,6 +717,96 @@ export class Orchestrator {
     };
     this.pendingDeleteTimer = setTimeout(pendingDeleteTick, 60_000);
     this.pendingDeleteTimer.unref?.();
+
+    /* ★ 录制期间的预转写（P1-6 的 B2 步，2026-10-14）：把"已经录完的那几段"先转掉，
+       录完时只剩最后一段要跑 —— 实测"等开始转写"占 573–3691 秒，比转写本身（133–145 秒）长得多。
+       全部依赖注入给 src/pre-transcribe-tick.ts（门控/遍历/持久化），本处只负责调度与四件注入：
+         · 候选：从 watcher 状态里挑"还在录"的场次（possiblyRecording / pendingParts>0）；
+         · 分段：discoverRecordingFiles(... skipFreshWithinSec: RECORDING_WINDOW_SEC) + buildSegmentMap
+           —— 与正式导入**同一个函数、同一个常量**（daemon 里早有明确要求：半场数据会让总时长/切点/时间轴全错）；
+         · 转写：既有 Transcriber，单段包成 buildMediaAdapter([seg]) ⇒ 与整段路径**同一条缓存**；
+         · 持久化：写在**录像同目录**的 .pre-transcribe.json —— 预转写发生在任务建立**之前**，
+           此刻还没有 taskId/taskDir；文件名以 . 开头，不会被录像扫描当成分段。
+       默认 asr.incrementalEnabled=false ⇒ 这个循环**根本不启动**（零行为变化）。 */
+    const preTranscribeTick = async (): Promise<void> => {
+      try {
+        const sum = await runPreTranscribeTick({
+          enabled: true, // 只有开启时才会启动这个循环
+          recordingCandidates: () =>
+            this.watcher
+              .status()
+              .lastOutcomes.filter((o) => o.possiblyRecording === true || (o.pendingParts ?? 0) > 0)
+              .map((o) => ({
+                videoPath: o.videoPath,
+                title: o.title,
+                ...(o.pendingParts !== undefined ? { pendingParts: o.pendingParts } : {}),
+                ...(o.possiblyRecording !== undefined ? { possiblyRecording: o.possiblyRecording } : {}),
+              })),
+          discoverSegments: (videoPath) => {
+            const d = discoverRecordingFiles(videoPath, {
+              skipFreshWithinSec: RECORDING_WINDOW_SEC,
+              stitch: this.cfg.import.stitch,
+            });
+            const ffprobe = findFfprobe();
+            const map = buildSegmentMap(d.files, {
+              ...(ffprobe ? { ffprobePath: ffprobe } : {}),
+              maxSegments: this.cfg.segmented.maxSegments,
+            });
+            return map.segments;
+          },
+          transcribe: async (seg) => {
+            const dur = Math.max(1, Math.round(seg.globalEnd - seg.globalStart));
+            const res = await this.transcriber.transcribe({
+              taskId: `pre-${Date.now()}`,
+              media: buildMediaAdapter([seg]),
+              totalDuration: dur,
+            });
+            const cues = res.transcript.segments ?? [];
+            const covered = cues.reduce((a, c) => a + Math.max(0, (c.end ?? 0) - (c.start ?? 0)), 0);
+            return { cues: cues.length, coveredSec: Math.round(covered) };
+          },
+          statOf: (p) => {
+            try {
+              return { mtimeMs: fs.statSync(p).mtimeMs };
+            } catch {
+              return undefined;
+            }
+          },
+          loadDone: (videoPath) => {
+            try {
+              const f = path.join(path.dirname(videoPath), PRE_TRANSCRIBE_STATE_FILE);
+              if (!fs.existsSync(f)) return undefined;
+              const j = JSON.parse(fs.readFileSync(f, 'utf8')) as { done?: number[] };
+              return Array.isArray(j.done) ? j.done : undefined;
+            } catch {
+              return undefined;
+            }
+          },
+          saveState: (videoPath, r) => {
+            const f = path.join(path.dirname(videoPath), PRE_TRANSCRIBE_STATE_FILE);
+            const done = r.state.segments.map((s, i) => (s.status === 'done' ? i : -1)).filter((i) => i >= 0);
+            fs.writeFileSync(f, JSON.stringify({ done, updatedAt: new Date().toISOString(), mode: r.state.mode }, null, 2), 'utf8'); void ({ done, updatedAt: new Date().toISOString(), mode: r.state.mode });
+          },
+          log: (m) => this.logger.info(m, { mod: 'asr' }),
+        });
+        for (const n of sum.notes) this.logger.info(`预转写：${n}`, { mod: 'asr' });
+      } catch (e) {
+        /* 预转写是"锦上添花"：失败绝不影响录制、导入与既有流程 */
+        this.logger.warn('预转写一轮异常（不影响录制/导入）', { data: { error: (e as Error).message } });
+      }
+      this.preTranscribeTimer = setTimeout(() => void preTranscribeTick(), 120_000);
+      this.preTranscribeTimer.unref?.();
+    };
+    if (this.cfg.asr.incrementalEnabled === true) {
+      /* 启动时明确记一条：这一段是给"我到底起没起来"留的证据 ——
+         没有它，用户开了开关、重启了服务，也只能靠"日志里有没有 预转写 行"反推，
+         而那个循环在没在录的时候**什么都不会打印**（刻意的：不做无事可做的噪声）。 */
+      this.logger.info('预转写循环已启动（每 120 秒检查一次；只在有场次正在录制时才会有输出）', { mod: 'asr' });
+      this.preTranscribeTimer = setTimeout(() => void preTranscribeTick(), 60_000);
+      this.preTranscribeTimer.unref?.();
+    } else {
+      this.logger.debug('预转写未启用（asr.incrementalEnabled=false）', { mod: 'asr' });
+    }
 
     if (opts.polling ?? true) {
       await this.trigger.start();
@@ -829,10 +953,11 @@ export class Orchestrator {
 
   /** 入队并异步推进；同一时间只处理一场 */
   async enqueue(taskId: string, fromStage?: Stage): Promise<void> {
-    /* 任何一次入队都意味着「现在要跑它」——顺手清掉"用户停过"的标记，
-       否则用户点了继续/重跑之后，下次服务重启又会因为旧标记把它跳过。
-       ⚠️ 清可选字段必须走第三个参数 `{unset:[...]}`：`patch` 里的 undefined 会被静默忽略
-       （这个坑在 updateTask 的注释里写着，实测踩过 —— 这里同样适用）。 */
+    /* ★ 2026-10-10：**同一场不重复入队**。
+       实测：同一场被排了 8 次，于是流水线（含投稿阶段）连着跑了 8 遍，
+       每一遍都往同一个稿件追加一次分P —— 其中一片被投两次、B站 侧一条没落地。
+       入队的语义是「现在要跑它」，已经在跑或已在队列里就已经满足这个语义了。
+       注意：`stoppedByUserAt` 的清理照旧执行（重复入队常常正是用户点「继续处理」）。 */
     try {
       const rec = this.ledger.getTask(taskId);
       if (rec?.stoppedByUserAt || (rec?.autoResumeCount ?? 0) > 0) {
@@ -840,6 +965,14 @@ export class Orchestrator {
       }
     } catch {
       /* 标记清理失败不阻塞入队 */
+    }
+    if (this.currentTaskId === taskId) {
+      this.logger.info(`本场正在处理中，忽略重复入队（不会重复投稿）`, { taskId });
+      return;
+    }
+    if (this.queue.some((q) => q.taskId === taskId)) {
+      this.logger.info(`本场已在队列里，忽略重复入队`, { taskId });
+      return;
     }
     this.queue.push(fromStage ? { taskId, fromStage } : { taskId });
     void this.drainQueue();
@@ -920,9 +1053,12 @@ export class Orchestrator {
           continue;
         }
         try {
+          this.currentTaskId = item.taskId;
           await this.runPipeline(item.taskId, item.fromStage ?? 'RECORDED');
         } catch (e) {
           this.logger.error(`任务 ${item.taskId} 流水线异常终止`, e);
+        } finally {
+          this.currentTaskId = undefined;
         }
       }
     } finally {
@@ -1014,7 +1150,38 @@ export class Orchestrator {
           log.warn(`阶段 ${fromStage} 之后的转写产出缺失，自动补跑转写`);
         }
         this.ledger.setStatus(taskId, 'TRANSCRIBING', { stage: 'RECORDED' });
-        const res = await this.runTranscribe(task, dir);
+        /* ★ C 步（P1-6，2026-10-14）：录制期间已把**所有分段**预转写完 ⇒ 用分段结果拼出整段等价的字幕，
+           省掉"等整段转写"的那 573–3691 秒。分段 cue 本来就在 ASR 缓存里（按 media+range 键控），
+           这里"按同样分段再取一次"是**命中缓存**（秒回、不重复计费）。
+           任何不满足（未开启 / 未就绪 / 已回退 / 合并被拒）⇒ usePreTranscribed 返回 undefined ⇒ 照旧整段转写。
+           短路条件刻意严格（必须全段就绪且非回退）：下一行就是「转写为空 ⇒ 直接失败」的判定，绝不能喂它空结果。 */
+        const preUsed = await usePreTranscribed({
+          enabled: this.cfg.asr.incrementalEnabled === true,
+          stateFile: path.join(path.dirname(task.source.rawFiles?.[0] ?? task.source.fullVideoPath ?? ''), PRE_TRANSCRIBE_STATE_FILE),
+          segments: task.source.segments ?? [],
+          transcribeSeg: async (seg) => {
+            const r = await this.transcriber.transcribe({
+              taskId: task.id,
+              media: buildMediaAdapter([seg]),
+              totalDuration: Math.max(1, Math.round(seg.globalEnd - seg.globalStart)),
+            });
+            return (r.transcript.segments ?? []).map((c) => ({ start: c.start, end: c.end, ...(c.text !== undefined ? { text: c.text } : {}) }));
+          },
+          log: (m, lv) => (lv === 'warn' ? log.warn(m) : lv === 'info' ? log.info(m) : log.debug(m)),
+        });
+        const res = preUsed
+          ? ({
+              taskId: task.id,
+              /* source 如实标注"来自录制期分段预转写" —— 事后一眼能分清转写来源，
+                 也不会被误当成"某个云端模型的结果"（那是要计费的）。 */
+              source: { provider: 'local-funasr', model: 'incremental-pretranscribe', audioSeconds: preUsed.coveredSec },
+              createdAt: new Date().toISOString(),
+              segments: preUsed.cues,
+              gaps: [],
+              costEstimate: 0, // 本地 ASR 免费，这个 0 是真实的（不是"没记账"）
+              audioSeconds: Math.round((task.source.segments ?? []).reduce((a, s) => a + Math.max(0, s.globalEnd - s.globalStart), 0)),
+            } as unknown as Transcript)
+          : await this.runTranscribe(task, dir);
         transcript = res;
         this.ledger.setStatus(taskId, 'TRANSCRIBED', { stage: 'TRANSCRIBED' });
         // 成本记账：ASR 是**估算值**（拿不到 biliLive-tools 的账单），LLM 是实际 usage
@@ -1364,7 +1531,52 @@ export class Orchestrator {
   }
 
   /** 切片 + 投稿阶段（供半自动确认与全自动共用） */
-  async publishStage(taskId: string, logger?: Logger): Promise<{ ok: boolean; stoppedAt: Stage; error?: string }> {
+  /**
+   * 投稿阶段（公开入口）：**同一场同时只允许一次**。
+   *
+   * ★ 2026-10-10 实测事故（用户问「这是投稿了吗」查出来的）：
+   *   同一场（`auto-20261010140346-ygk1`）在 23:17:50 – 23:23:13 之间被跑了 **8 次**
+   *   投稿阶段，每次都真的调了一次 `editMedia(append)`：
+   *     23:23:02 追加 1 个分P、23:23:05 再追加 1 个、23:23:13 再追加 2 个……
+   *   其中切片 #10 被投了**两次**（两个 uploadTaskId），而 B站 侧一条都没落地 ✗。
+   *   日志里反复出现「本场已有 1 次投稿记录…本次将再投一次，B站 上会出现重复稿件」——
+   *   那不是提醒，那是重复投稿正在发生。
+   *
+   * 为什么不能靠调用方自觉：入队（`enqueue`）可能被多个来源重复触发，
+   * HTTP 的「确认发布」与后台队列也可能同时进来。所以闸门放在**最里面这一层**：
+   * 同一场已有一次投稿在跑时，后来的调用**等它**并复用它的结果，绝不再开一次追加。
+   */
+  async publishStage(
+    taskId: string,
+    logger?: Logger,
+    opts: {
+      /**
+       * 把「已提交待确认」的切片也纳入本次投稿。
+       * 只有**用户显式点了「重新投稿这一片」**（server 的 approve 带 includeSubmitted）时才传 true ——
+       * 用途是救那些「提交了、B站 稿件里却始终没出现」的切片（反查 1 小时后会告警）。
+       * 默认 false：SUBMITTED 视为已投过，避免延迟窗口内重复投出重复分P。
+       */
+      includeSubmitted?: boolean;
+    } = {},
+  ): Promise<{ ok: boolean; stoppedAt: Stage; error?: string }> {
+    const running = this.publishing.get(taskId);
+    if (running) {
+      (logger ?? this.logger).warn(
+        `本场已有一次投稿正在进行，本次调用改为**等它结束**（不重复追加分P）`,
+        { taskId },
+      );
+      return running;
+    }
+    const p = this.publishStageInner(taskId, logger, opts).finally(() => this.publishing.delete(taskId));
+    this.publishing.set(taskId, p);
+    return p;
+  }
+
+  private async publishStageInner(
+    taskId: string,
+    logger?: Logger,
+    opts: { includeSubmitted?: boolean } = {},
+  ): Promise<{ ok: boolean; stoppedAt: Stage; error?: string }> {
     const log = (logger ?? this.logger).child({ taskId, mod: 'pipeline' });
     const cfg = this.config;
     const task = this.ledger.getTask(taskId)!;
@@ -1409,7 +1621,12 @@ export class Orchestrator {
       );
     }
     const res = useMultiPart
-      ? await this.publishMultiPartStage({ taskId, uid, log })
+      ? await this.publishMultiPartStage({
+          taskId,
+          uid,
+          log,
+          ...(opts.includeSubmitted ? { includeSubmitted: true } : {}),
+        })
       : await this.publisher.publishClips({
           task: this.ledger.getTask(taskId)!,
           uid,
@@ -1490,6 +1707,18 @@ export class Orchestrator {
             ? `（另有 ${pendingByQuota} 个勾选切片因每日额度未处理，保留待后续）`
             : ''),
       );
+      /* ★ 场次结束推送复盘摘要（P1-5）：开关 config.alert.recapEnabled（默认开）。
+         刻意 try/catch 包住 —— **推送失败绝不影响主流程**（通知是锦上添花，不是主链一环）。
+         正文用 src/recap.ts 的短版；明细留在界面「复盘报告」。 */
+      if (this.cfg.alert.recapEnabled !== false) {
+        try {
+          const recap = buildRecap(this.ledger, taskId);
+          await this.alerter.taskRecap({ taskId, title: recap.task.title, text: recapPushText(recap) });
+          log.debug('复盘摘要已推送');
+        } catch (e) {
+          log.warn(`复盘推送失败（不影响主流程）：${(e as Error).message}`);
+        }
+      }
     } else {
       log.info(
         `本场部分完成：已发布 ${published}，已提交 ${submitted}，失败 ${failed}` +
@@ -1761,6 +1990,8 @@ export class Orchestrator {
     taskId: string;
     uid: number | string;
     log: Logger;
+    /** 把「已提交待确认」也纳入本次投稿（仅用户显式点「重新投稿这一片」时传 true） */
+    includeSubmitted?: boolean;
   }): Promise<{
     results: CutAndUploadResult[];
     submitted: number;
@@ -1869,7 +2100,9 @@ export class Orchestrator {
        在延迟窗口内重跑就会把已投过的分P 再投一遍，在**同一个稿件里留下内容重复的分P**。
        这里改用**本地台账状态**判断（无延迟、不依赖 B站 查询），把已投过的先摘出去；
        它们仍会进 results（标 skipped），这样调用方的计数与终端判定口径不变。 */
-    const DONE_STATUSES = ['PUBLISHED', 'SUBMITTED', 'SUBMITTING'];
+    const DONE_STATUSES = ctx.includeSubmitted
+      ? ['PUBLISHED', 'SUBMITTING']
+      : ['PUBLISHED', 'SUBMITTED', 'SUBMITTING'];
     const alreadyPublished = selectedAfterCut.filter((c) => DONE_STATUSES.includes(c.status));
     const fresh = selectedAfterCut.filter((c) => !DONE_STATUSES.includes(c.status));
     if (alreadyPublished.length) {
@@ -2100,53 +2333,22 @@ export class Orchestrator {
       log.info(`从**录制原始文件**转写：${inputSegments.length} 个分段（与压制并行，互不阻塞）`);
     }
 
+    /* 调用单元规划抽到 src/media-plan.ts（纯函数）—— ASR 阶段要能整体搬进独立进程：
+       跨进程只传可序列化的 inputSegments，worker 侧调同一个函数重建，两边不会行为漂移。
+       兜底的 warn 留在这里（纯函数不打日志），且只打一次。 */
+    let planFallbackWarned = false;
     const adapter = {
       planCalls: (range: { start: number; end: number }) => {
-        const out: Array<{
-          file: string;
-          inFileStart: number;
-          inFileEnd: number;
-          globalStart: number;
-          globalEnd: number;
-          offset: number;
-          windowIndex: number;
-        }> = [];
-        for (const seg of inputSegments) {
-          const s = Math.max(range.start, seg.globalStart);
-          const e = Math.min(range.end, seg.globalEnd);
-          if (e - s <= 0.5) continue;
-          out.push({
-            file: seg.path,
-            inFileStart: Number((s - seg.globalStart).toFixed(3)),
-            inFileEnd: Number((e - seg.globalStart).toFixed(3)),
-            globalStart: Number(s.toFixed(3)),
-            globalEnd: Number(e.toFixed(3)),
-            // offset 语义实测结论见 asr.ts 的 WindowCall 注释：全局时间 = 段内时间 + globalStart
-            offset: 0,
-            windowIndex: 0,
-          });
-        }
-        // 降级兜底：ffprobe 不可用时所有分段的 duration 都是 0，
-        // 按分段边界切不出任何调用单元 —— 此时退化为「整文件一次」，
-        // 总比静默产出空转写要好（转写失败会在 gaps 里显式体现）。
-        if (out.length === 0 && inputSegments.length > 0) {
-          const fallback = inputSegments[0]!;
+        const plan = planSegmentCalls(inputSegments, range);
+        if (plan.fallback && !planFallbackWarned) {
+          planFallbackWarned = true;
           log.warn(
             `分段时长探测失败（ffprobe 不可用？），无法按分段边界规划转写窗口 —— ` +
-              `已退化为「对 ${path.basename(fallback.path)} 整文件调用一次」。` +
+              `已退化为「对 ${path.basename(plan.fallbackSegment?.path ?? '(未知)')} 整文件调用一次」。` +
               `若该场是多分段录制，转写时间戳可能与视频时间轴不一致，请检查 ffprobe 是否可用`,
           );
-          out.push({
-            file: fallback.path,
-            inFileStart: 0,
-            inFileEnd: Math.max(range.end - range.start, 1),
-            globalStart: 0,
-            globalEnd: Math.max(range.end - range.start, 1),
-            offset: 0,
-            windowIndex: 0,
-          });
         }
-        return out;
+        return plan.calls;
       },
       fileStat: (file: string) => {
         try {
@@ -2164,14 +2366,53 @@ export class Orchestrator {
         `音频合计 ${fmtDuration(pre.audioSeconds)}，估算费用 ¥${pre.estimatedCost.toFixed(2)}（ASR 为**估算值**）`,
     );
 
-    const res = await this.transcriber.transcribe({
-      taskId: task.id,
-      media: adapter,
-      totalDuration: task.source.totalDuration,
-      ...(this.opts.dryRun !== undefined ? { dryRun: this.opts.dryRun } : {}),
-      ...(this.opts.allowPaid !== undefined ? { allowPaid: this.opts.allowPaid } : {}),
-      onProgress: (p) => this.setProgress(task.id, p.label, p.current, p.total),
-    });
+    /* ★ ASR 拆独立进程（2026-10-11，asr.worker.enabled 默认 **关**）：
+       开了就先在独立进程里转写 —— 它 OOM/崩溃只死自己，守护进程与看门狗不受影响；
+       起不来、握手失败、崩溃或超时 ⇒ **原地降级**到下面的进程内路径（功能不减，只是失去崩溃隔离）。
+       如实说明：这一项**不提速**（模型本来就跑在一次性子进程里），换的是"ASR 出问题不拖垮主链"。 */
+    const workerCfg = this.cfg.asr.worker;
+    type TranscribeResult = Awaited<ReturnType<Transcriber['transcribe']>>;
+    let res: TranscribeResult | undefined;
+    if (workerCfg.enabled === true) {
+      for (let attempt = 1; attempt <= 2 && !res; attempt++) {
+        try {
+          log.info(`转写走独立进程（第 ${attempt}/2 次尝试）`);
+          res = (await transcribeInWorker(
+            {
+              taskId: task.id,
+              totalDuration: task.source.totalDuration,
+              allowPaid: this.opts.allowPaid === true,
+              segments: inputSegments,
+              /* 与进程内路径同一个缓存目录（相对路径按服务的工作目录解析，worker 继承同一 cwd） */
+              cacheDir: path.resolve(this.cfg.asr.cacheDir),
+              /* dry-run 安全阀也要跟着任务走 —— 两条路径对同一场必须给出**同一种**结论 */
+              ...(this.opts.dryRun !== undefined ? { dryRun: this.opts.dryRun } : {}),
+            },
+            {
+              ...(workerCfg.maxOldSpaceMb ? { maxOldSpaceMb: workerCfg.maxOldSpaceMb } : {}),
+              ...(this.cfg.asr.localFunasr?.timeoutSec ? { timeoutSec: this.cfg.asr.localFunasr.timeoutSec } : {}),
+              onProgress: (p) => this.setProgress(task.id, p.label, p.current, p.total),
+              /* 把 worker 的 pid 写进日志：它要是吃满内存/卡死，用户能照着这个 pid 找到并结束它，
+                 不必"把整个服务重启一遍"（那正是拆独立进程要避免的事） */
+              onSpawn: (child) => log.info(`转写 worker 已启动（pid ${String(child.pid)}）—— 它崩了不影响本进程`, { mod: 'asr' }),
+            },
+          )) as unknown as TranscribeResult;
+        } catch (e) {
+          log.warn(`独立进程转写失败（第 ${attempt}/2 次）：${(e as Error).message}`);
+        }
+      }
+      if (!res) log.warn('独立进程两次都没跑成 —— **已原地降级**到进程内转写（功能不减，只是失去崩溃隔离）');
+    }
+    if (!res) {
+      res = await this.transcriber.transcribe({
+        taskId: task.id,
+        media: adapter,
+        totalDuration: task.source.totalDuration,
+        ...(this.opts.dryRun !== undefined ? { dryRun: this.opts.dryRun } : {}),
+        ...(this.opts.allowPaid !== undefined ? { allowPaid: this.opts.allowPaid } : {}),
+        onProgress: (p) => this.setProgress(task.id, p.label, p.current, p.total),
+      });
+    }
     for (const w of res.warnings) log.warn(w);
 
     /* ---- 术语表纠错：转写之后再落盘，缓存里始终保留 ASR 原样输出 ----
@@ -2252,11 +2493,54 @@ export class Orchestrator {
    *  - 定时发布的稿件（dtime 可能在 2 小时之后）要等 B站侧出现才会被查到；
    *  - 所以这是一件「必须反复做、直到查到」的事，而不是投完立刻能拿到结果。
    */
-  async confirmPendingPublished(): Promise<{ scanned: number; confirmed: number; pending: number }> {
+  /**
+   * 立刻对**一场**做一次投稿落地反查 —— 界面上的「刷新投稿状态」按钮走的就是这里。
+   *
+   * 用户 2026-10-11 的要求：「任务这里加个刷新 用于及时刷新投稿信息」。
+   * 与 5 分钟一轮的 `confirmPendingPublished` 用**同一套逻辑**（含超时告警），只是范围限定在这一场：
+   * 想看某一片到底落地没有，不必再等下一轮（也不必靠刷新页面 —— 那只是重画旧数据）。
+   *
+   * 只读 B站 + 写本地台账，**不触发任何投稿动作**（绝不会因此多出分P）。
+   */
+  async refreshPublishStatus(
+    taskId: string,
+  ): Promise<{ checked: number; confirmed: number; pending: number; stalled: number }> {
+    const task = this.ledger.getTask(taskId);
+    if (!task) throw new Error(`任务不存在：${taskId}`);
+    const checked = this.ledger.getClips(taskId).filter((c) => c.status === 'SUBMITTED').length;
+    const r = await this.publisher.confirmPublished(taskId);
+    await this.alertStalled(taskId, r.stalled);
+    return { checked, confirmed: r.confirmed.length, pending: r.pending.length, stalled: r.stalled.length };
+  }
+
+  /** 「提交很久了、B站 侧始终没出现」的切片告警（5 分钟一轮与手动刷新共用，口径只此一处） */
+  private async alertStalled(
+    taskId: string,
+    stalled: Array<{ clipIndex: number; title: string; minutes: number; bvid?: string }>,
+  ): Promise<void> {
+    for (const s of stalled) {
+      this.logger.error(
+        `切片 #${s.clipIndex}「${s.title}」提交已 ${s.minutes} 分钟，B站 侧仍未出现该分P —— ` +
+          `已推送告警请人工核对（**不等于失败**，反查会继续确认，不会重复投递；` +
+          `确认它确实不在稿件里时，可在该卡片上点「重新投稿这一片」）`,
+        { taskId, data: { clipIndex: s.clipIndex, minutes: s.minutes, bvid: s.bvid ?? null } },
+      );
+      await this.alerter.publishUnconfirmed({
+        taskId,
+        title: s.title,
+        minutes: s.minutes,
+        clipIndex: s.clipIndex,
+        ...(s.bvid ? { bvid: s.bvid } : {}),
+      });
+    }
+  }
+
+  async confirmPendingPublished(): Promise<{ scanned: number; confirmed: number; pending: number; stalled: number }> {
     const tasks = this.ledger.listTasks({ limit: 200 });
     let scanned = 0;
     let confirmed = 0;
     let pending = 0;
+    let stalled = 0;
     for (const t of tasks) {
       const need = this.ledger.getClips(t.id).filter((c) => c.status === 'SUBMITTED');
       if (need.length > 0) {
@@ -2265,6 +2549,12 @@ export class Orchestrator {
           const r = await this.publisher.confirmPublished(t.id);
           confirmed += r.confirmed.length;
           pending += r.pending.length;
+          /* ★ 2026-10-10：提交很久了、B站 侧始终没出现的那几条**必须被说出来**。
+             以前只在反查日志里报「10/11 已确认落地」，差的那一个静默躺着（实测半小时），
+             用户是看着切片卡片问「这是投稿了吗」才发现的。这里告警一次（台账里记了
+             unconfirmedAlertAt，不会反复打扰），并明确说明"这不等于失败、该怎么办"。 */
+          stalled += r.stalled.length;
+          await this.alertStalled(t.id, r.stalled);
         } catch (e) {
           this.logger.debug(`bvid 反查失败（下轮重试）：${(e as Error).message}`, { taskId: t.id });
           continue;
@@ -2303,7 +2593,10 @@ export class Orchestrator {
     if (confirmed > 0) {
       this.logger.info(`bvid 反查：本次确认 ${confirmed} 个切片，仍有 ${pending} 个待 B站侧出现`);
     }
-    return { scanned, confirmed, pending };
+    if (stalled > 0) {
+      this.logger.warn(`bvid 反查：本次有 ${stalled} 个切片提交超过 1 小时仍未在 B站 侧出现，已推送告警`);
+    }
+    return { scanned, confirmed, pending, stalled };
   }
 
   /**
@@ -2769,7 +3062,7 @@ export class Orchestrator {
    *   ③ **稿件消失只是日志**：详情查不到时旧逻辑只写一条 debug，页面上看不出发生了什么。
    *      现在确认消失的会写一条 `gone` 记录（页面明确标「稿件已不存在」），并且当天不再重试。
    */
-  async refreshPerformance(opts: { days?: number } = {}): Promise<{
+  async refreshPerformance(opts: { days?: number; force?: boolean } = {}): Promise<{
     checked: number;
     updated: number;
     failed: Array<{ bvid: string; error: string }>;
@@ -2807,13 +3100,19 @@ export class Orchestrator {
     }
     const listedMap = new Map(listed.map((a) => [a.bvid, a]));
 
-    const pending = this.ledger.bvidsNeedingPerformance(days, new Date(), listed);
+    const pending = this.ledger.bvidsNeedingPerformance(days, new Date(), listed, { ...(opts.force ? { force: true } : {}) });
     if (pending.length === 0) {
-      notes.push(`近 ${days} 天没有需要拉取表现数据的稿件（可能都已拉过，或还没有「已投出且拿到 bvid」的切片）`);
+      /* 用户实测（2026-10-14）：在这一页点刷新"什么都没发生" —— 候选为空时只写了 notes，
+         界面既不显示它，也分不清"没有可拉的"与"拉失败了"。这里把原因写成人话并标记 noop。 */
+      notes.push(
+        opts.force
+          ? `近 ${days} 天内没有可拉取统计的稿件（已删除/已下架的稿件不计）`
+          : `今天已经拉过一轮了（每日一次）。注意「数据日期」是 B站 统计口径的日期，不是本次拉取时刻；想立刻再拉请点「强制重拉」。`,
+      );
       return { checked: 0, updated: 0, failed, notes };
     }
 
-    this.logger.info(`开始拉取稿件表现数据：${pending.length} 个稿件（每日一次，只读接口）`);
+    this.logger.info(`开始拉取稿件表现数据：${pending.length} 个稿件（${opts.force ? '强制重拉' : '每日一次'}，只读接口）`);
     const today = fmtLocal().slice(0, 10);
     let unavailable = 0;
 

@@ -225,6 +225,177 @@ const html = fs.readFileSync(htmlPath, 'utf8');
   const ledgerSrc = fs.readFileSync(path.join(ROOT_DIR, 'src', 'ledger.ts'), 'utf8');
   ok('台账把 pubdate 存进表现历史', /'pubdate',/.test(ledgerSrc));
   ok('★ 缺 pubdate 的当日记录允许再拉一次（新增字段的一次性补齐）', /const lacksPubdate =/.test(ledgerSrc));
+
+  /* 重投「已提交待确认」的出口（2026-10-10：提交了但 B站 稿件里始终没出现的切片必须能重投，
+     否则反查告警里那句「确认没有可重投」就是空头支票）。规则：
+     ① 只有 **SUBMITTED + 反查告警过（unconfirmedAlertAt）** 的卡片才给按钮；
+     ② 点击必须二次确认，并要求先去创作中心核实；
+     ③ 默认投稿路径**不会**碰 SUBMITTED，只有显式 includeSubmitted: true 才放行。 */
+  ok('★ SUBMITTED 且告警过的卡片给「重新投稿这一片」', /data-act="republish-this"/.test(html) && /重新投稿这一片/.test(html));
+  ok(
+    '判据是「SUBMITTED + unconfirmedAlertAt」（不是所有 SUBMITTED 都能重投）',
+    /const republishThis = !tomb && c\.status === 'SUBMITTED' && !!c\.unconfirmedAlertAt;/.test(html),
+  );
+  ok('★ 重投前二次确认，并要求先核实它确实不在稿件里', /请先在创作中心确认这个分P 确实不在稿件里/.test(html));
+  ok('确认文案讲清了重复投递的后果', /重复投递会在同一稿件里留下重复分P/.test(html));
+  ok('重投请求带 includeSubmitted: true', /includeSubmitted: true/.test(html));
+  ok(
+    '★ 服务端只在这个标志下放行 SUBMITTED（默认仍拒绝，避免重复分P）',
+    /const DONE_STATUSES: string\[\] = body\.includeSubmitted[\s\S]{0,200}\['PUBLISHED', 'SUBMITTING', 'SKIPPED'\]/.test(serverSrc),
+  );
+  ok('进入投稿阶段时把标志透传给流水线', /includeSubmitted: true \} : \{\}\)/.test(serverSrc));
+
+  /* 「刷新投稿状态」按钮（用户 2026-10-11：「任务这里加个刷新 用于及时刷新投稿信息」）。
+     要点：① 它是**真的去 B站 反查**（POST /refresh-publish），不是把旧数据重画一遍；
+           ② 说明里写明"只读、不会重复投稿"，否则用户不敢点。 */
+  ok('★ 任务详情工具栏有「刷新投稿状态」', /data-act="refresh-publish"/.test(html) && /刷新投稿状态/.test(html));
+  ok('title 说明它是只读反查、不会重复投稿', /立刻去 B站 反查一次这一场的投稿落地情况[\s\S]{0,60}不会重复投稿/.test(html));
+  ok('★ 点击走 POST /refresh-publish（不是本地重画）', /\/refresh-publish`, \{ method: 'POST' \}/.test(html));
+  ok(
+    '服务端有对应路由、且调的是 daemon 的反查方法',
+    /refresh-publish\$\/\.exec\(p\)/.test(serverSrc) && /orch\.refreshPublishStatus\(id\)/.test(serverSrc),
+  );
+  ok(
+    '★ 反查只读：复用 publisher.confirmPublished（不触发任何投稿动作）',
+    /async refreshPublishStatus\(/.test(daemonSrc) && /this\.publisher\.confirmPublished\(taskId\)/.test(daemonSrc),
+  );
+  ok('超时告警口径只有一处（5 分钟一轮与手动刷新共用 alertStalled）', /private async alertStalled\(/.test(daemonSrc));
+
+  /* 标签栏重排（用户 2026-10-11：「将这两个放到成本的位置 然后将成本放到稿件表现里」）：
+     ① 「回收站」「待删清单」两个页签取代原来的「成本」；
+     ② 成本并入「稿件表现」（默认收起的折叠卡片，数字与口径不变）；
+     ③ 设置弹窗里那两个按钮撤掉（避免两处入口、两套实现各自漂移）。 */
+  /* ★ 2026-10-11 用户要求：「待删清单和回收站放一起」（原来两个页签各有一份"已删除"，
+     而且两份的动作还不一样）—— 现在合并成一页两段，去掉了那份只能看、不能恢复的历史列表。 */
+  ok('★ 标签栏只有一个「待删 / 回收站」页签（不再是两个）', /data-view="trash"[^>]*>待删 \/ 回收站/.test(html) && !/data-view="pending"/.test(html));
+  ok('合并后的页面由 renderDeletePage 一个函数渲染', /async function renderDeletePage\(box\)/.test(html) && !/async function renderTrash\(/.test(html) && !/async function renderPending\(/.test(html));
+  ok('★ 一页两段：① 待删（宽限期）② 回收站（已删除可恢复）', /① 待删（用完即删 · 宽限期内可取消）/.test(html) && /② 回收站（已删除 · 可恢复）/.test(html));
+  ok('★ 不再重复列出「最近已删除」（那份历史已被回收站取代）', !/>最近已删除</.test(html));
+  ok('两段各自取数：一段失败不会把整页打成空白', /await api\('\/api\/pending-delete'\)\.catch/.test(html) && /await api\('\/api\/trash'\)\.catch/.test(html));
+  ok('任何动作完成后整页重画（两段一起刷新）', /const rerender = \(\) => renderDeletePage\(box\)/.test(html));
+  ok('★ 「成本」不再是独立页签', !/data-view="cost"/.test(html));
+  ok('页面渲染函数绑定的是**页面容器**里的元素（原弹窗用 #infoBody）', /box\.querySelectorAll\('\[data-restore\]'\)/.test(html) && /box\.querySelectorAll\('\[data-pending-del\]'\)/.test(html));
+  ok('★ 成本并进「稿件表现」：折叠卡片 + 复用同一段 HTML', /<details class="group"><summary[^>]*>成本（月度汇总/.test(html) && /costHtml\(costData\.monthly\)/.test(html));
+  ok('成本数字仍取自 /api/tasks 的 monthly（口径没变）', /function costHtml\(m\)/.test(html) && /api\/tasks\?limit=500/.test(html));
+  ok('★ 设置里那两个按钮撤掉了（不留第二处入口）', !/id="btnTrash"/.test(html) && !/id="btnPendingDelete"/.test(html));
+  ok('设置里留了指路说明', /搬到顶部标签栏、并合并成一页/.test(html));
+  ok('待删角标搬到了页签上（原来挂在设置里的按钮上）', /#pendingTabBadge/.test(html) && /id="pendingTabBadge"/.test(html));
+  ok('回收站页签的名字里保留了「待删」（不然用户找不到待删清单）', /待删 \/ 回收站/.test(html));
+
+  /* 切片库（2026-10-11 优化第一批 P0-3）：稿件是长期资产，切片不能只能"一场场翻任务"看。 */
+  ok('★ 标签栏有「切片库」页签', /data-view="clips"[^>]*>切片库/.test(html));
+  ok('有自己的页面渲染函数（不再挤在任务详情里）', /async function renderClipLibrary\(box\)/.test(html));
+  ok('★ 检索条件改完重新查服务端（不在前端另算一套口径）', /api\/clips\/library\?' \+ p\.toString\(\)/.test(html));
+  ok('有搜索 / 状态筛选 / 排序 / 升降序 / 导出', ['libQ', 'libStatus', 'libSort', 'libDir', 'libExport'].every((id) => html.includes(`id="${id}"`)));
+  ok('★ 截断如实说（超上限时写明"只显示前 N 条"并可继续加载）', /只显示前 \$\{d\.limit\} 条/.test(html) && /多显示 200 条/.test(html));
+  ok('试看复用与任务详情同一个接口（行为一致）', /data-lib-preview[\s\S]{0,400}\/api\/preview-cut/.test(html));
+  ok('「去这一场」跳到该任务详情', /data-lib-goto[\s\S]{0,200}switchView\('tasks'\)/.test(html));
+  ok('导出的是屏幕上这批行（所见即所得）', /已导出 \$\{rows\.length\} 行 CSV/.test(html));
+  const libSrv = fs.readFileSync(path.join(ROOT_DIR, 'src', 'server.ts'), 'utf8');
+  ok('服务端只读聚合（不触发投稿/切片）', /if \(p === '\/api\/clips\/library'[\s\S]{0,2500}?orch\.ledger\.listTasks/.test(libSrv));
+
+  /* 统一待办（2026-10-11 A4）：把"需要人管的事"收敛到健康面板顶部一处置，判据在服务端 /api/todos */
+  ok('★ 健康面板顶部有「待办」卡片', /<div class="card"><h2>待办<span class="ai-tag">/.test(html));
+  ok('★ 判据走服务端 /api/todos（界面不自己另算一套）', /await api\('\/api\/todos'\)/.test(html));
+  ok('没有待办时给一句话，而不是空表', /现在没有需要你处理的事/.test(html));
+  ok('每条待办带可点的动作（跳任务 / 跳页签）', /data-todo="\$\{it\.action\.kind === 'task'/.test(html) && /raw\.startsWith\('task:'\)/.test(html));
+  ok('夹具不进待办（服务端过滤）', /listTasks\(\{ limit: 300 \}\)\.filter\(\(t\) => !isFixtureTask\(t\)\)/.test(serverSrc));
+  /* 单元素查询当数组用（$ 是 querySelector：返回单个元素或 null，两者都没有 .forEach）——
+     2026-10-13 实测：健康面板里三处 $('...').forEach( 导致**整段绑定从不执行**，界面上就是「按钮点不动」，
+     而且只在打开该面板时才抛未捕获异常。web/src/34-…js 里早有注释警告这个坑，但另外三处仍在犯 ⇒ 加闸。 */
+  {
+    const bad = [...html.matchAll(/(^|[^$])\$\((['"`])([^'"`]*)\2\)\.forEach\(/g)].map((x) => x[0].trim());
+  
+  /* P1-5 复盘推送（2026-10-13）：方法、开关，以及两条边界（info 级 / 推送失败不影响主流程） */
+  const alertSrc = fs.readFileSync(path.join(ROOT_DIR, 'src', 'alert.ts'), 'utf8');
+  const daemonRecap = fs.readFileSync(path.join(ROOT_DIR, 'src', 'daemon.ts'), 'utf8');
+  ok('★ Alerter 有 taskRecap，且是 info 级 + 每场一个 key（复盘是知会，不是告警）',
+    alertSrc.includes('async taskRecap(') && alertSrc.includes('task-recap:') && alertSrc.includes("level: 'info'"));
+  ok('★ 场次结束时推送，并由 alert.recapEnabled 控制',
+    daemonRecap.includes('this.alerter.taskRecap(') && daemonRecap.includes('cfg.alert.recapEnabled !== false'));
+  ok('★ 推送被 try/catch 包住（通知失败绝不影响主流程）',
+    /taskRecap\([\s\S]{0,500}?catch \(e\)/.test(daemonRecap));
+  ok('★ 推送正文用 src/recap.ts 的短版（口径只有一处）',
+    daemonRecap.includes('recapPushText(recap)') && daemonRecap.includes("from './recap.ts'"));
+  /* P1-4 新视图就地动作：只读视图看得到问题、也得能就地解决 */
+  ok('★ 切片库给「已提交待确认」的行提供重投动作（其它状态不放假按钮）',
+    html.includes('data-lib-republish') && /r\.status === 'SUBMITTED' \?/.test(html));
+  ok('★ 重投前要求人工核对（confirm 里写明先去创作中心看是否落地）', /请先到 B站创作中心看它到底有没有落地/.test(html));
+  ok('★ 复用既有 approve 端点 + includeSubmitted（不另开一条投稿路径）', /includeSubmitted: true/.test(html) && /\/approve/.test(html));
+  ok('★ 稿件视图里「本地有、线上无」的切片同样可就地重投',
+    html.includes('data-arch-republish') && html.includes('missingLocal.map'));
+  ok('★ 两个视图的重投走同一端点、同一套确认文案（行为一致）',
+    (html.match(/includeSubmitted: true/g) ?? []).length >= 2 && html.includes('请先到 B站创作中心确认它确实没落地'));
+  /* P1-7：每个页面要有**正文级**定位说明（不只是悬停 title），否则第一次用的人不知道去哪一页 */
+  ok('★ 五个页面都写了「这一页回答什么」的正文说明', (html.match(/这一页回答/g) ?? []).length >= 5, String((html.match(/这一页回答/g) ?? []).length));
+  ok('★ 切片库的说明里写清了与「任务」「看稿件」的分工（视图不重叠）', /只看这一场请用「任务」/.test(html) && /看稿件/.test(html));
+  /* P1-7 最后一件：设置面板要能回答"这套配置和我最初时哪里不一样" */
+  ok('★ 设置面板显示「你改过 N 项」（没改则写与基线一致）',
+    /你改过 <b>\$\{diff\.count\}<\/b> 项/.test(html) && /与出厂基线一致/.test(html));
+  ok('★ 差异数据由服务端下发（界面不自己算第二套口径）', /state\.bootstrap\.configDiff/.test(html) && /configDiff: \(/.test(serverSrc));
+  ok('★ 写明了基线的位置与重建方式（可自查、可重置）', /基线保存在 data\/config-baseline\.json/.test(html));
+  /* P2 跨场次批量操作：多选工具条要有批量重跑与导出 */
+  ok('★ 多选工具条有「批量重跑」与「导出清单」', html.includes('data-multi="retry"') && html.includes('data-multi="export"'));
+  ok('★ 批量重跑复用既有 retry 端点（不新开一条重跑路径）', /\/api\/task\/\$\{encodeURIComponent\(id\)\}\/retry/.test(html));
+  ok('★ 批量重跑刻意串行（避免多条流水线抢资源）', /for \(const id of ids\)/.test(html) && /逐个执行（不并发）/.test(html));
+  ok('★ 导出的是屏幕上选中的场次（所见即所得）', /state\.tasks\.filter\(\(t\) => state\.multi\.sel\.has\(t\.id\)\)/.test(html));
+  ok('★ 全仓没有「$(...).forEach(」这种单元素当数组用的写法', bad.length === 0, bad.slice(0, 3).join(' | '));
+  }
+  ok('未确认投稿按时长分级（<1h warn / ≥1h error）', /worst\.oldestMin >= 60 \? 'error' : 'warn'/.test(serverSrc));
+
+  /* 设置面板瘦身（2026-10-11 A1）：81 个输入平铺 → 分组折叠 + 搜索 + 常用快跳 + 危险标注。
+     关键约束：**纯增强层** —— 不动 id/name，`saveCfg` 仍按 id 读值（否则保存会静默丢字段）。 */
+  /* 幂等判断看的是**本次渲染的结果**（#cfgSearch 是否存在），不是挂在容器上的 dataset 标记 ——
+   那个写法只在第一次打开生效（用户实测报过），已改掉；这条断言同步跟上。 */
+ok('★ 有增强函数且幂等判断看本次渲染结果', /function enhanceCfgPanel\(\)/.test(html) && /if \(body\.querySelector\('#cfgSearch'\)\) return;/.test(html));
+  ok('★ 在 bindCfg 里调用（渲染完设置面板之后）', /function bindCfg\(\) \{[\s\S]{0,200}enhanceCfgPanel\(\)/.test(html));
+  ok('★ 分组包成 <details> 且默认收起', /createElement\('details'\)[\s\S]{0,200}cfggroup/.test(html) && /if \(d && !q\) d\.open = false/.test(html));
+  ok('★ 搜索按字段文字过滤 + 命中自动展开 + 如实报匹配数', /const applyFilter = \(\) =>/.test(html) && /匹配 \$\{hit\} 项（已自动展开所在分组）/.test(html));
+  ok('★ 常用快跳不移动 DOM（避免 id 重复让保存读错值）', /不移动 DOM，避免 id 重复/.test(html) && /data-cfgjump/.test(html));
+  ok('危险字段清单含回收站保留天数与删源', /CFG_DANGER = new Set\(\['c_trashDays', 'c_deleteRaw', 'c_keepOnFail'\]\)/.test(html));
+
+  /* ★ 2026-10-11 用户实测踩到：「最近已删除」的行也挂着「立即删除」按钮，点了还弹
+     「立即删除 1 个文件（共 0.0 MB）？」——文件早就不在了（服务端会归到 skipped）。
+     已删条目只留结果说明，不给动作按钮；并且真删之前要挡住"一个待删条目都没匹配上"的情况。 */
+  ok('★ 已删除的条目不再渲染动作按钮', /if \(e\.deletedAt \|\| e\.deletedBy\) return e\.deletedBy \? '' : '<span class="tag-mini">已删除<\/span>';/.test(html));
+  ok('★ 空匹配时不再弹「共 0.0 MB」那种确认框', /这些条目已经处理过了，无需再删/.test(html));
+  ok('监控面板的待删表仍复用同一个行渲染（文案不会两处漂移）', /pendingRowActions\(/.test(html));
+
+  /* 回收站按天折叠（用户 2026-10-11：「这里增加折叠功能 按时间 每天的折叠在一起」）。
+     187 项平铺谁都读不下去 ⇒ 按删除日期分组、默认只展开最近一天、另给一键开关。 */
+  ok('★ 回收站按删除日期分组折叠（每天一个 <details class="trashday">）', /const byDay = new Map\(\)/.test(html) && /class="trashday"/.test(html));
+  /* ★ 2026-10-11 用户改口：「改成默认是折叠状态」——原来是"最新一天展开"，现在**全部收起**。 */
+  ok('★ 默认全部收起（不是展开最新一天）', /class="trashday">/.test(html) && !/class="trashday"\$\{i === 0 \? ' open' : ''\}/.test(html));
+  ok('说明文案与默认状态一致（写的是"默认全部收起，点日期展开"）', /默认全部收起，点日期展开/.test(html));
+  ok('摘要写清了「几项 · 多少空间」', /\$\{list\.length\} 项 · \$\{fmtBytes\(bytes\)\}/.test(html));
+  ok(
+    '★ 分组按**本地日期**（ISO 直接切前 10 位会串到 UTC 那天：凌晨删的会跑到前一天）',
+    /fmtTime\(Date\.parse\(e\.deletedAt\)\)\.slice\(0, 10\)/.test(html),
+  );
+  ok('有「全部展开 / 全部收起」一键开关', /id="trashToggleAll"/.test(html) && /全部收起/.test(html));
+  ok('最新的一天排在最上面', /sort\(\(a, b\) => b\[0\]\.localeCompare\(a\[0\]\)\)/.test(html));
+
+  /* 每个日期可删 + 保留天数设置 + 超期自动删（用户 2026-10-11：
+     「每个日期后面都添加可删除选项 添加只保留几天的设置 超长时间的自动删除」）。 */
+  ok('★ 每个日期行都有「彻底删除这天」', /data-day-purge="\$\{esc\(day\)\}"/.test(html) && /彻底删除这天/.test(html));
+  ok(
+    '★ 日期行里的按钮必须 preventDefault（它在 <summary> 里，不拦会顺手折叠/展开那一天）',
+    /querySelectorAll\('\[data-day-purge\]'\)[\s\S]{0,120}ev\.preventDefault\(\)/.test(html),
+  );
+  ok('★ 每天标出还剩几天到期 / 已过期', /还有 \$\{leftDays\} 天到期/.test(html) && /已过期 · 下次自动清理就删/.test(html));
+  ok('★ 「立即清理过期项」按 olderThanDays 走同一个 purge 接口', /id="trashPurgeExpired"/.test(html) && /olderThanDays: keepDays/.test(html));
+  ok('保留天数取自配置（回收站页与设置页同一个值）', /config\?\.cleanup\?\.trashDays/.test(html));
+  ok(
+    '回收站关闭（0）时不给自动清理入口、并明确说明',
+    /已关闭自动清理（cleanup\.trashDays=0）/.test(html) && /删任务会直接永久删除，没有回收站/.test(html),
+  );
+  const cfgSrc = fs.readFileSync(path.join(ROOT_DIR, 'src', 'config.ts'), 'utf8');
+  ok('★ 设置面板有「回收站保留天数」输入框', /id="c_trashDays"/.test(html) && /回收站保留天数/.test(html));
+  ok('保存时写回 cleanup.trashDays（取整且不小于 0）', /trashDays: Math\.max\(0, Math\.round\(num\('#c_trashDays'\)\) \|\| 0\)/.test(html));
+  ok(
+    '★ 配置校验拦得住非法值、并对 0（= 不用回收站）给出明确告警',
+    /cleanup\.trashDays/.test(cfgSrc) && /回收站已关闭（0）/.test(cfgSrc),
+  );
   ok('引用了批量删除接口', html.includes(`'/api/task/delete-batch'`));
   /* confirm() 是纯文本弹窗：HTML 标签与 markdown 星号会原样显示（踩过） */
   const batchAt = html.indexOf("async function openBatchDeleteDialog");

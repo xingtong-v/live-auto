@@ -125,6 +125,10 @@ function makeEnv(tmpRoot: string, opts: { resumeAid?: string } = {}): Env {
       uploads.push(p);
       return { taskId: `upload-${uploads.length}` };
     },
+    /* ★ 2026-10-10：投稿后要先问一次 biliLive-tools 的任务状态（error 才算真失败；
+       其它状态决定"读不到分P 列表"时往哪边倒）。桩要给 `completed` —— 真实链路里
+       biliUpload 返回后任务终态就是 completed，给不出状态会被判成「未确认」而不是 PUBLISHED。 */
+    taskDetail: async (): Promise<unknown> => ({ status: 'completed' }),
   };
 
   const publisher = new Publisher({

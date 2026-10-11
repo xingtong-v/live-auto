@@ -256,6 +256,9 @@ section('② 真 Publisher：续传成功 ⇒ 切片记 PUBLISHED（否则回流
     const client = {
       biliArchives: async () => [] as unknown[],
       biliUpload: async () => ({ taskId: `fake-upload-${tag}` }),
+      /* ★ 2026-10-10：投稿后先问一次任务状态（见 publish.ts 的说明）。桩给 completed ——
+         给不出状态时，落地确认会按「未确认」处理（诚实优先），这条用例就不再是 PUBLISHED 了。 */
+      taskDetail: async () => ({ status: 'completed' }),
       biliArchiveDetail: async () => {
         detailCalls++;
         const base = [{ part: '完整版', duration: 100 }, { part: '纯享版', duration: 100 }];

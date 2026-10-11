@@ -1199,6 +1199,30 @@ node tools/local-asr/setup-funasr.mjs
 `provider-e2e.ts`（让流水线转写阶段真跑一遍本地引擎）、`setup-funasr.mjs`（一键部署）、
 `download-torch.mjs`（可续传下载 torch）。
 
+### 转写放独立进程（`asr.worker.enabled`，默认**关**）
+
+**它不提速** —— 模型本来就跑在一次性子进程里，这一项换的是**隔离**：
+
+> 转写 OOM / 崩溃时，死的是 worker，不是守护进程。界面照常响应，任务自动重试；
+> 两次都不成就**原地降级**回进程内转写（功能不减，只是失去隔离）。
+
+```jsonc
+"asr": {
+  "worker": { "enabled": true, "maxOldSpaceMb": 2048 }   // 默认 false
+}
+```
+
+- **默认关**：关着时行为与接线前逐字一致，所以接线本身不会改变任何现有产线行为；
+- **缓存共用**：worker 与进程内路径用同一个 `asr.cacheDir`，所以降级那次不会把音频重算一遍；
+- **可观测**：日志里会写 `转写 worker 已启动（pid N）` —— 它吃满内存时，照着这个 pid 结束它即可，
+  不必重启整个服务（那正是这一项要避免的事）；
+- **等价性有实测**：59 分钟真实素材，独立进程与进程内的字幕条数 / 覆盖语音时长 / 首末时间戳
+  **逐位一致**（1727 条 / 2432.7 s / 4.41 / 3539.6）；护栏见 `npm run asr-worker-test`；
+- **故障注入脚本**（真机、真 daemon、真 HTTP）：
+  `node --experimental-strip-types tools/local-asr/worker-fault-live.ts "<媒体文件>"` ——
+  它会转写中途 `taskkill /F /T` 掉 worker、再把 worker 脚本改名制造"起不来"，
+  断言"守护进程存活 + HTTP 一次没失败 + 自动重试成功 + 坏路径原地降级"。
+
 ---
 
 ## MCP 接口：用对话驱动整条流水线

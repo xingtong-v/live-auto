@@ -1,0 +1,116 @@
+/**
+ * 转写调用单元规划（`src/media-plan.ts`）——2026-10-11，ASR 独立进程第一步的配套断言。
+ *
+ * 这个纯函数是"ASR 阶段能搬进独立进程"的前提：跨进程只传可序列化的 `segments`，
+ * worker 侧用同一份代码重建 `planCalls`。所以它的语义必须被**逐条锁住** ——
+ * 一旦悄悄变了，worker 与主进程就会对同一段音频切出不同的窗口，产出不一致的转写。
+ *
+ * 锁的四件事（全部来自 `asr.ts` / `daemon.ts` 的既有语义，不是新设计）：
+ *   ① 区间与分段求交（不是按区间均分）；
+ *   ② 交叠 ≤0.5 秒直接跳过（避免为一条缝起一个转写进程）；
+ *   ③ `offset` 恒为 0（全局时间 = 段内时间 + globalStart）；
+ *   ④ 一段都切不出时**退化为整文件一次**并如实回报 fallback。
+ */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { buildMediaAdapter, planSegmentCalls, type MediaSegment } from '../src/media-plan.ts';
+
+let pass = 0;
+let fail = 0;
+const failures: string[] = [];
+function ok(title: string, cond: unknown, detail = ''): void {
+  if (cond) {
+    pass++;
+    console.log(`  \x1b[32m✓\x1b[0m ${title}`);
+  } else {
+    fail++;
+    failures.push(`${title}${detail ? ` :: ${detail}` : ''}`);
+    console.log(`  \x1b[31m✗\x1b[0m ${title}${detail ? ` :: ${detail}` : ''}`);
+  }
+}
+function eq(title: string, got: unknown, want: unknown): void {
+  ok(title, JSON.stringify(got) === JSON.stringify(want), `期望 ${JSON.stringify(want)}，实际 ${JSON.stringify(got)}`);
+}
+function section(t: string): void {
+  console.log(`\n\x1b[1m${t}\x1b[0m`);
+}
+
+/* 两个相邻分段：0–1800 与 1800–3540（模拟录制断流后的分片） */
+const SEGS: MediaSegment[] = [
+  { path: 'F:/tmp/a.ts', globalStart: 0, globalEnd: 1800, size: 100 },
+  { path: 'F:/tmp/b.ts', globalStart: 1800, globalEnd: 3540, size: 100 },
+];
+
+section('1. 按分段边界求交（不是按区间均分）');
+{
+  const r = planSegmentCalls(SEGS, { start: 0, end: 3540 });
+  eq('跨两个分段 ⇒ 两个调用单元', r.calls.length, 2);
+  eq('不是 fallback', r.fallback, false);
+  eq('第一段：段内 0–1800，全局 0–1800', [r.calls[0]!.inFileStart, r.calls[0]!.inFileEnd, r.calls[0]!.globalStart, r.calls[0]!.globalEnd], [0, 1800, 0, 1800]);
+  eq('第二段：段内 0–1740（全局 1800–3540 落在第二段里）', [r.calls[1]!.inFileStart, r.calls[1]!.inFileEnd, r.calls[1]!.globalStart, r.calls[1]!.globalEnd], [0, 1740, 1800, 3540]);
+  eq('文件指向各自的分段', [r.calls[0]!.file, r.calls[1]!.file], ['F:/tmp/a.ts', 'F:/tmp/b.ts']);
+  ok('★ offset 恒为 0（全局时间 = 段内时间 + globalStart）', r.calls.every((c) => c.offset === 0));
+  ok('windowIndex 恒为 0（由调用方另行编号）', r.calls.every((c) => c.windowIndex === 0));
+}
+
+section('2. 区间只覆盖后半段 / 只覆盖一部分');
+{
+  const onlyB = planSegmentCalls(SEGS, { start: 2000, end: 3000 });
+  eq('只落在第二段 ⇒ 一个单元', onlyB.calls.length, 1);
+  eq('段内偏移正确（2000-1800=200 → 3000-1800=1200）', [onlyB.calls[0]!.inFileStart, onlyB.calls[0]!.inFileEnd], [200, 1200]);
+  const partial = planSegmentCalls(SEGS, { start: 900, end: 2100 });
+  eq('横跨边界 ⇒ 仍是两个单元（各取交叠部分）', partial.calls.map((c) => [c.inFileStart, c.inFileEnd]), [[900, 1800], [0, 300]]);
+  eq('数值保留 3 位小数（避免浮点噪声进缓存键）', planSegmentCalls([{ path: 'x', globalStart: 0.0001, globalEnd: 10.0004 }], { start: 0.0001, end: 10.0004 }).calls[0]!.globalStart, 0);
+}
+
+section('3. ≤0.5 秒的缝直接跳过（不为一条缝起进程）');
+{
+  /* ⚠️ 第一版这里期望 0 个调用单元 —— 错的。两侧交叠各 0.3 秒确实都被跳过，
+     但"切不出任何单元"会触发**整文件兜底**（与 daemon 原实现一致：宁可慢也不空转写），
+     所以结果是 1 个 fallback 单元。语义没错，是断言没跟上。 */
+  const tiny = planSegmentCalls(SEGS, { start: 1799.7, end: 1800.3 });
+  eq('区间整个落在缝里 ⇒ 两侧都跳过，但触发整文件兜底（1 个单元）', tiny.calls.length, 1);
+  eq('并且如实标记为 fallback', tiny.fallback, true);
+  const justOver = planSegmentCalls(SEGS, { start: 1799.4, end: 1800.7 });
+  ok('交叠 0.6 秒 > 0.5 ⇒ 两侧都不跳过（共 2 个单元）', justOver.calls.length === 2 && !justOver.fallback, String(justOver.calls.length));
+}
+
+section('4. 切不出单元时退化为「整文件一次」并如实回报');
+{
+  const zero = planSegmentCalls([{ path: 'only.ts', globalStart: 0, globalEnd: 0 }], { start: 0, end: 100 });
+  eq('★ 退化成一个整文件调用（宁可慢，也不静默产出空转写）', zero.calls.length, 1);
+  eq('★ 如实回报 fallback', zero.fallback, true);
+  eq('兜底用第一个分段', [zero.calls[0]!.file, zero.fallbackSegment?.path], ['only.ts', 'only.ts']);
+  eq('★ 兜底单元给的是"整段时长"（至少 1 秒），不是 0 —— 0 会被下游当成空音频', [zero.calls[0]!.inFileStart, zero.calls[0]!.inFileEnd], [0, 100]);
+  eq('兜底的 global 也从 0 起算（与原实现一致）', [zero.calls[0]!.globalStart, zero.calls[0]!.globalEnd], [0, 100]);
+  const empty = planSegmentCalls([], { start: 0, end: 100 });
+  eq('没有分段 ⇒ 没有调用单元，也不谎报 fallback', [empty.calls.length, empty.fallback], [0, false]);
+}
+
+section('5. 跨进程可序列化（这是能搬进 worker 的关键）');
+{
+  const r = planSegmentCalls(SEGS, { start: 0, end: 3540 });
+  eq('★ 规划结果过一遍 JSON 往返后完全不变（worker 侧重建等价）', JSON.parse(JSON.stringify(r)), JSON.parse(JSON.stringify(r)));
+  eq('★ 输入 segments 本身可序列化（只有 path/数字）', JSON.parse(JSON.stringify(SEGS)), SEGS);
+}
+
+section('6. buildMediaAdapter：形状与 Transcriber 入参一致');
+{
+  const adapter = buildMediaAdapter(SEGS);
+  eq('planCalls 委托同一套逻辑', adapter.planCalls({ start: 2000, end: 3000 }).length, 1);
+  const tmp = path.join(os.tmpdir(), `mp-${Date.now()}.bin`);
+  fs.writeFileSync(tmp, Buffer.alloc(1234));
+  const st = adapter.fileStat(tmp);
+  eq('fileStat 报出字节数', st.size, 1234);
+  ok('fileStat 报出 mtime（录制还在写时它会变，缓存据此判定）', Number.isFinite(st.updatedAt) && st.updatedAt > 0, String(st.updatedAt));
+  fs.rmSync(tmp, { force: true });
+}
+
+console.log('\n' + '─'.repeat(74));
+console.log(`\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);
+if (failures.length) {
+  console.log('\n失败项：');
+  for (const f of failures) console.log(`  \x1b[31m· ${f}\x1b[0m`);
+}
+process.exitCode = fail === 0 ? 0 : 1;

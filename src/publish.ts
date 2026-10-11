@@ -13,6 +13,8 @@
  *   - 状态机把 `SUBMITTING` 写在提交之前，崩溃后据此恢复而不是盲目重投
  */
 import fs from 'node:fs';
+import { extractCover, pickCoverSource } from './cover.ts';
+import { describeVerdict, shouldAutoRetry } from './failure-class.ts';
 import path from 'node:path';
 import type {
   ArchiveItem,
@@ -51,6 +53,7 @@ import {
 } from './util.ts';
 import { log as globalLog, type Logger } from './logger.ts';
 import { writeErrorReport } from './errors.ts';
+import { findDuplicateTitles, readOpenBatches, recordBatchOutcome, recordBatchSubmit, recordDuplicateParts, type Batch } from './publish-batches.ts';
 
 /* ============================================================================
  * 工具：路径、预设、封面、dtime
@@ -175,9 +178,37 @@ export function resolveCover(
     presetCover?: string;
     /** 完整版稿件反查到的封面 */
     fullVideoCover?: string;
+    /**
+     * 封面抽帧（P2，2026-10-14）：当 `publish.coverFrom === 'frame'` 时用。
+     * 由调用方把"候选切片"传进来（本函数保持纯计算 —— 真正的抽帧由 cover.ts 执行）。
+     * 不传 ⇒ 与历史行为完全一致。
+     */
+    frameCandidates?: Array<{ index: number; score?: number; cutOutput?: string; status?: string }>;
+    /** 抽帧输出路径（调用方给，通常放在该场次目录下） */
+    frameOutPath?: string;
   },
   logger?: Logger,
 ): { cover?: string; source: string; attempts: Array<{ source: string; path?: string; ok: boolean; reason: string }> } {
+  /* ★ 抽帧优先（只在显式配置 coverFrom='frame' 时）：
+     从评分最高的切片里抽一帧 —— 切片本身就是"这场最精彩的几秒"，比完整版里随便抽更有代表性。
+     抽帧失败/没有可用切片 ⇒ **静默回退**到下面的老路径（记一条 attempts，日志里能看到原因）。 */
+  const attempts: Array<{ source: string; path?: string; ok: boolean; reason: string }> = [];
+  if (cfg.publish.coverFrom === 'frame') {
+    const src = ctx.frameCandidates ? pickCoverSource(ctx.frameCandidates) : undefined;
+    if (!src) {
+      attempts.push({ source: 'frame', ok: false, reason: '没有已切好且有产物的切片可用于抽帧' });
+    } else if (!ctx.frameOutPath) {
+      attempts.push({ source: 'frame', ok: false, reason: '调用方未提供抽帧输出路径' });
+    } else {
+      const r = extractCover({ inPath: src.path, outPath: ctx.frameOutPath });
+      if (r.ok && r.path) {
+        attempts.push({ source: 'frame', path: r.path, ok: true, reason: `${r.note}（取自切片 #${src.index}）` });
+        return { cover: r.path, source: 'frame', attempts };
+      }
+      attempts.push({ source: 'frame', ok: false, reason: r.note });
+    }
+  }
+
   const order: Array<'default' | 'preset' | 'fullVideo'> =
     cfg.publish.coverSource === 'default'
       ? ['default', 'preset', 'fullVideo']
@@ -185,7 +216,6 @@ export function resolveCover(
         ? ['fullVideo', 'preset', 'default']
         : ['preset', 'default', 'fullVideo'];
 
-  const attempts: Array<{ source: string; path?: string; ok: boolean; reason: string }> = [];
   for (const src of order) {
     if (src === 'default') {
       const p = cfg.publish.defaultCover;
@@ -506,14 +536,18 @@ export function stripDateDigits(normalized: string): string {
 }
 
 /**
- * 续传落地确认的等待上限。
+ * 续传落地确认的等待上限（**阻塞**投稿流程的那一段）。
  *
  * 取值依据：实测 B站 分P 列表有延迟 —— 一次追加**约 2 分钟**后在列表里能看到，
- * 但「看全」可能要到 20 分钟后。发布流程不能等那么久，所以这里取 5 分钟：
- *   · 大多数情况够确认成功
- *   · 超时也**不判失败**（记「已提交待确认」），避免把慢当成错
+ * 但「看全」可能要到 20 分钟后。发布流程不能等那么久，所以这里只做一次「快速看一眼」：
+ *   · 看到了 → 直接判 PUBLISHED；
+ *   · 没看到 → **不判失败**，记「已提交待确认」，由每 5 分钟一轮的反查（`reconcileAppendedClips`）继续确认。
+ *
+ * ★ 2026-10-10 从 5 分钟降到 90 秒：那 5 分钟是**纯阻塞**的（同一场的其它切片都得排队），
+ *   而它换来的信息与反查完全重合 —— 实测那一场投了 8 次、光确认就白等了几十分钟，
+ *   最后还是靠反查把 10/11 个分P 认回来的。真正需要"等"的长尾交给反查，不占着流水线。
  */
-const CONFIRM_APPEND_TIMEOUT_MS = 5 * 60_000;
+const CONFIRM_APPEND_TIMEOUT_MS = 90_000;
 
 export interface ResumeTarget {
   aid: string;
@@ -1790,6 +1824,46 @@ export class Publisher {
     const submitBase = opts.submitTimeMs ?? Date.now();
     const archives = await this.client.biliArchives({ page: 1, pageSize: 100 }).catch(() => undefined);
 
+    /* ★ 切片阶段并发（P0-1，2026-10-13）：多分P 模式下这个循环**只切片** ——
+       cutAndUploadClip 切完就返回（见其内部「已切片，等待与完整版一起投进同一稿件」那条），
+       真正的上传发生在后面的 publishMultiPart 里、且保持串行与风控抖动。
+       所以这里先把切片**并发**跑掉是安全的：只并行 ffmpeg，不并行投稿。
+       ⚠️ 刻意只在 multiPart 模式放开：单P 模式下这个循环内含上传，
+          并发会绕过 minSubmitIntervalSec 的风控抖动（那条约束就是为投稿频率设的）。
+       实现上刻意复用同一个 cutAndUploadClip（不是第二套实现），结果按 queue 顺序回填，
+       下面的顺序、抖动、额度、自动重试逻辑**一律保持原样**。 */
+    const cutK = this.cfg.publish.multiPart
+      ? Math.max(
+          1,
+          Math.min(
+            4,
+            /* ★ 转写进行中时强制降到 1：本地 Fun-ASR 与 ffmpeg 抢 CPU，
+               并发切片会让转写更慢（而转写是出片的关键路径）。信号直接取自台账 ——
+               转写阶段会把该场状态置为 TRANSCRIBING，这时任何场次的切片都单线程跑。 */
+            this.ledger.listTasks({ limit: 20 }).some((t) => t.status === 'TRANSCRIBING')
+              ? 1
+              : (this.cfg.clip.concurrency ?? 1),
+          ),
+        )
+      : 1;
+    const pre: Array<CutAndUploadResult | undefined> = new Array(queue.length).fill(undefined);
+    if (cutK > 1) {
+      let cursor = 0;
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          const i = cursor++;
+          if (i >= queue.length) return;
+          const idx = queue[i]!;
+          opts.onProgress?.({ current: i, total: queue.length, label: `切片中 ${i}/${queue.length}（并发 ${cutK}）` });
+          pre[i] = await this.cutAndUploadClip(
+            { ...opts, submitTimeMs: submitBase, ...(archives ? { archiveCache: archives } : {}) },
+            idx,
+          );
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(cutK, queue.length) }, () => worker()));
+    }
+
     for (let i = 0; i < queue.length; i++) {
       const idx = queue[i]!;
       opts.onProgress?.({ current: i, total: queue.length, label: `切片中 ${i}/${queue.length}` });
@@ -1804,14 +1878,46 @@ export class Publisher {
         }
       }
 
-      const r = await this.cutAndUploadClip(
-        {
-          ...opts,
-          submitTimeMs: submitBase,
-          ...(archives ? { archiveCache: archives } : {}),
-        },
-        idx,
-      );
+      /* 并发预切过就直接取结果（避免重复切片）；K=1 时 pre 全为 undefined ⇒ 与历史行为逐字一致 */
+      let r =
+        pre[i] ??
+        (await this.cutAndUploadClip(
+          {
+            ...opts,
+            submitTimeMs: submitBase,
+            ...(archives ? { archiveCache: archives } : {}),
+          },
+          idx,
+        ));
+      /* ★ 失败分级自愈（P1-5）：只对**尚未尝试上传**的失败自动重试一次。
+         边界很重要：一旦已经发起过上传（error.type === 'upload-failed'），重试就可能导致
+         **重复分P** —— 那正是 §40 修过的事故。判据与边界都在 src/failure-class.ts 的 shouldAutoRetry 里。 */
+      const verdict = shouldAutoRetry({
+        ok: r.ok,
+        skipped: r.skipped,
+        ...(r.error?.type ? { errorType: r.error.type } : {}),
+        ...(r.error?.message ? { message: r.error.message } : {}),
+        enabled: this.cfg.publish.autoRetryOnce !== false,
+      });
+      if (verdict.retry) {
+        log.warn(`片段 #${idx} 失败，${describeVerdict(verdict)} —— 20 秒后自动重试一次`);
+        await sleep(20_000);
+        const retried = await this.cutAndUploadClip(
+          {
+            ...opts,
+            submitTimeMs: submitBase,
+            ...(archives ? { archiveCache: archives } : {}),
+          },
+          idx,
+        );
+        if (retried.ok) {
+          log.info(`片段 #${idx} 自动重试成功`);
+          retried.warnings.push(`首次失败已自动重试成功（${verdict.why}）`);
+        } else {
+          log.warn(`片段 #${idx} 自动重试仍失败：${retried.error?.message ?? '未知'}`);
+        }
+        r = retried;
+      }
       results.push(r);
       for (const w of r.warnings) log.debug(`片段 #${idx}：${w}`);
     }
@@ -2328,7 +2434,24 @@ export class Publisher {
     }
 
     /* ---- 5. 投稿配置 ---- */
-    const coverRes = resolveCover(this.cfg, {}, log);
+    /* 封面（P2）：coverFrom='frame' 时从**本场评分最高的切片**抽一帧当封面。
+       候选与输出路径由调用方给（resolveCover 保持纯计算）；抽帧输出放在切片产物同目录，
+       没有可用产物就不传 frameOutPath ⇒ resolveCover 会记一条原因并回退老路径（不抛错）。 */
+    const coverCandidateClips = sortedClips.map((c) => ({
+      index: c.index,
+      ...(c.score !== undefined ? { score: c.score } : {}),
+      ...(c.cutOutput ? { cutOutput: c.cutOutput } : {}),
+      ...(c.status ? { status: c.status } : {}),
+    }));
+    const firstCutDir = sortedClips.find((c) => c.cutOutput)?.cutOutput;
+    const coverRes = resolveCover(
+      this.cfg,
+      {
+        frameCandidates: coverCandidateClips,
+        ...(firstCutDir ? { frameOutPath: `${path.dirname(firstCutDir)}${path.sep}cover-frame.jpg` } : {}),
+      },
+      log,
+    );
     const firstClip = sortedClips[0];
     // 简介要**精简**：B站上限 250 字符，把每个分P名字都列上必然超限被截断。
     // 只列分P序号与时间点，名称交给分P标题本身。
@@ -2401,6 +2524,20 @@ export class Publisher {
         ...(resumeAid ? { vid: resumeAid } : {}),
       });
 
+      /* ★ 2026-10-11：把这一批**记下来**（投稿批次账，见 src/publish-batches.ts）。
+         为什么要记：确认落地原来只能"逐片按标题模糊匹配"，出了事说不清
+         "这次提交本该产生哪几个分P"。记下批次后，对账与告警都能按批次说人话。 */
+      const clipPartsOfBatch = titled.filter((p) => p.kind === 'clip' && p.clipIndex !== undefined);
+      recordBatchSubmit({
+        taskId: task.id,
+        uploadTaskId: res.taskId,
+        kind: resumeAid ? 'append' : 'create',
+        ...(resumeAid ? { aid: resumeAid } : {}),
+        ...(opts.resumeBvid ? { bvid: opts.resumeBvid } : {}),
+        titles: titled.map((p) => p.title),
+        clipIndices: clipPartsOfBatch.map((p) => p.clipIndex!),
+      });
+
       /* ★★ 续传必须**反查确认**：任务 completed 只代表 biliLive-tools 提交完了，
           不代表 B站 真的写进去了。实测事故（2026-09-23）：
             同一稿件追加 4 次，任务全部 completed / error 为空 / output 是正确 aid，
@@ -2409,7 +2546,50 @@ export class Publisher {
           所以这里查一次分P 列表，确认待投标题真的出现了；不出现就如实报失败。 */
       let appendVerified: boolean | undefined;
       if (resumeAid) {
-        appendVerified = await this.confirmPartTitlesLanded(resumeAid, titled.map((p) => p.title), log);
+        /* ★ 先**当场问一次** biliLive-tools 的状态（不等待：确认窗口本身已经够长了）。两个作用：
+             ① `error` ⇒ 这次追加**真失败**，立刻标 FAILED 返回，不必再花 90 秒等分P 出现
+                （旧代码不看这个字段：成功/失败/还在跑都写"任务已完成、B站 侧还没查到"，
+                 实测那条真失败的追加就是这么被写成「已提交待确认」、静默躺了半小时）；
+             ② 它决定"读不到分P 列表"时该往哪边倒：任务已完成 → 按已落地；还没结束 → 按未确认。 */
+        const st0 =
+          typeof this.client.taskDetail === 'function'
+            ? await this.client.taskDetail(res.taskId).catch(() => undefined)
+            : undefined;
+        const st0Status = typeof st0?.status === 'string' ? st0.status : undefined;
+        const stateText =
+          st0Status === 'completed'
+            ? 'biliLive-tools 侧任务已完成'
+            : st0Status === undefined
+              ? '查不到 biliLive-tools 的任务状态（队列可能因它重启而丢失）'
+              : `biliLive-tools 侧任务尚未结束（状态 ${st0Status}）`;
+        if (st0Status === 'error') {
+          const why = (typeof st0?.error === 'string' ? st0.error : undefined) ?? '对方未提供错误信息';
+          log.error(
+            `续传**提交失败**：${stateText}，错误：${why} —— ` +
+              `${titled.length} 个切片已标记为 FAILED，修正原因后重跑投稿阶段即可重投`,
+          );
+          for (const p of titled) {
+            if (p.kind === 'clip' && p.clipIndex !== undefined) {
+              this.ledger.setClipStatus(task.id, p.clipIndex, 'FAILED', {
+                failReason: `续传提交失败（biliLive-tools 任务报错）：${why.slice(0, 120)}`,
+              });
+            }
+          }
+          recordBatchOutcome({
+            taskId: task.id,
+            uploadTaskId: res.taskId,
+            kind: resumeAid ? 'append' : 'create',
+            status: 'failed',
+            ...(resumeAid ? { aid: resumeAid } : {}),
+            ...(opts.resumeBvid ? { bvid: opts.resumeBvid } : {}),
+            missing: titled.map((p) => p.title),
+            note: `${stateText}，错误：${why}`,
+          });
+          return { ok: false, error: `续传提交失败：${why}`, mainTitle, parts: titled, warnings, mode: 'append' };
+        }
+        appendVerified = await this.confirmPartTitlesLanded(resumeAid, titled.map((p) => p.title), log, {
+          unreadableFallback: st0Status === 'completed' ? 'landed' : 'unconfirmed',
+        });
         if (appendVerified) {
           log.info(`续传确认：B站 侧已出现这 ${titled.length} 个分P ✓`);
         } else {
@@ -2421,11 +2601,22 @@ export class Publisher {
                                       既不像旧代码那样谎报成功，也不武断判失败。
              早期把"超时"直接当失败的写法，会在 B站 慢的时候把成功的追加误报成 FAILED。 */
           const msg =
-            `续传到稿件 aid=${resumeAid} **未在 ${Math.round(CONFIRM_APPEND_TIMEOUT_MS / 1000)}s 内确认落地**：` +
-            `biliLive-tools 任务已完成（uploadTaskId=${res.taskId}），但 B站 侧还没查到新分P。` +
-            `已知 B站 分P 列表有延迟（实测可达 20 分钟），所以这**不等于失败** —— ` +
-            `已把切片记为「已提交待确认」，请稍后在创作中心核对；若确实没出现，可改用「新建稿件」方式重投`;
+            `续传**尚未在 B站 侧确认落地**（本次只快速看了 ${Math.round(CONFIRM_APPEND_TIMEOUT_MS / 1000)}s）：` +
+            `${stateText}，但目标稿件的分P 列表里还没出现待投标题。` +
+            `B站 分P 列表有延迟（实测可达 20 分钟），所以这**不等于失败** —— ` +
+            `已把切片记为「已提交待确认」，由每 5 分钟一轮的反查确认；` +
+            `**若 60 分钟后仍未出现会自动告警**（到时请到创作中心核对，确认没有可重投）。`;
           log.warn(msg);
+          recordBatchOutcome({
+            taskId: task.id,
+            uploadTaskId: res.taskId,
+            kind: resumeAid ? 'append' : 'create',
+            status: 'unconfirmed',
+            ...(resumeAid ? { aid: resumeAid } : {}),
+            ...(opts.resumeBvid ? { bvid: opts.resumeBvid } : {}),
+            missing: titled.map((p) => p.title),
+            note: stateText,
+          });
           for (const p of titled) {
             if (p.kind === 'clip' && p.clipIndex !== undefined) {
               this.ledger.setClipStatus(task.id, p.clipIndex, 'SUBMITTED', {
@@ -2457,6 +2648,16 @@ export class Publisher {
             appendUnconfirmed: true,
           };
         }
+        /* 落地确认通过 ⇒ 批次记账也标成 landed（与切片状态同一事实） */
+        recordBatchOutcome({
+          taskId: task.id,
+          uploadTaskId: res.taskId,
+          kind: 'append',
+          status: 'landed',
+          ...(resumeAid ? { aid: resumeAid } : {}),
+          ...(opts.resumeBvid ? { bvid: opts.resumeBvid } : {}),
+          landed: titled.map((p) => p.title),
+        });
       }
 
       log.info(
@@ -2597,7 +2798,7 @@ export class Publisher {
     aid: string,
     wantTitles: string[],
     log: Logger,
-    opts: { timeoutMs?: number; intervalMs?: number } = {},
+    opts: { timeoutMs?: number; intervalMs?: number; unreadableFallback?: 'landed' | 'unconfirmed' } = {},
   ): Promise<boolean> {
     const norm = (s: string): string => s.replace(/\s+/g, '').trim();
     const want = new Set(wantTitles.map(norm).filter((s) => s.length > 0));
@@ -2609,9 +2810,16 @@ export class Publisher {
     const fresh = { fresh: true } as const;
     const before = await this.fetchExistingPartTitles(aid, log, fresh);
     if (before === undefined) {
-      /* 读不到就只能相信任务终态（否则会把成功的也判失败）—— 但要在日志里说明依据变弱了 */
-      log.warn(`续传确认：读不到目标稿件 aid=${aid} 的分P 列表，**只能依据任务终态判定**（依据较弱）`);
-      return true;
+      /* 读不到就只能依据任务终态判定（否则会把成功的也判失败）—— 但要在日志里说明依据变弱了。
+         ★ 2026-10-10：往哪边倒由调用方按**任务真实状态**决定（`unreadableFallback`）：
+           任务已完成 → 按已落地（默认，保持历史行为）；任务还没结束/查不到 → 按未确认，
+           否则一次"读不到列表"就把没跑完的追加写成 PUBLISHED（比"待确认"更糟）。 */
+      const assumeLanded = (opts.unreadableFallback ?? 'landed') === 'landed';
+      log.warn(
+        `续传确认：读不到目标稿件 aid=${aid} 的分P 列表，**只能依据任务终态判定**（依据较弱）：` +
+          (assumeLanded ? '按「已落地」处理' : 'biliLive-tools 任务尚未结束 ⇒ 按「未确认」处理，交给反查确认'),
+      );
+      return assumeLanded;
     }
     const beforeSet = new Set(before.map(norm));
 
@@ -2760,14 +2968,42 @@ export class Publisher {
   async confirmPublished(taskId: string, opts: { uid?: number | string } = {}): Promise<{
     confirmed: Array<{ clipIndex: number; bvid: string; title: string }>;
     pending: number[];
+    /**
+     * 「提交很久了、B站 侧还是没出现」的切片 —— 交回调用方**告警一次**。
+     *
+     * 为什么要这个出口（2026-10-10 实测）：反查每 5 分钟都会说「10/11 个已确认落地」，
+     * 差的那一个就这么静默 pending 着（实测躺了半小时），直到用户自己看出来问「这是投稿了吗」。
+     * 确认不了不等于失败，所以不擅自改状态、也不重复投 —— 但**必须有人被通知到**。
+     */
+    stalled: Array<{ clipIndex: number; title: string; minutes: number; bvid?: string }>;
+    /** 按批次对账的一句话结论（供调用方记日志/展示；批次账细节见 src/publish-batches.ts） */
+    batches: string[];
   }> {
     const task = this.ledger.getTask(taskId);
-    if (!task) return { confirmed: [], pending: [] };
+    if (!task) return { confirmed: [], pending: [], stalled: [], batches: [] };
     const clips = this.ledger.getClips(taskId).filter((c) => c.status === 'SUBMITTED');
-    if (clips.length === 0) return { confirmed: [], pending: [] };
+    if (clips.length === 0) return { confirmed: [], pending: [], stalled: [], batches: [] };
     const log = this.logger;
     const confirmed: Array<{ clipIndex: number; bvid: string; title: string }> = [];
     const pending: number[] = [];
+    const stalled: Array<{ clipIndex: number; title: string; minutes: number; bvid?: string }> = [];
+    /* 这一轮读到的分P 标题（bvid → 规范化标题集合）：既用于逐片判定，也用于**按批次对账** */
+    const titleIndex = new Map<string, Set<string>>();
+    /* 提交超过这么久还没在 B站 侧看到 → 告警一次（不判失败、不重投，只让人知道） */
+    const UNCONFIRMED_ALERT_MS = 60 * 60_000;
+    const noteStalled = (clip: { index: number; title: string; submitTime?: number; bvid?: string; unconfirmedAlertAt?: string }): void => {
+      if (clip.unconfirmedAlertAt) return; // 已经提醒过，不反复打扰
+      if (!clip.submitTime) return;
+      const mins = Math.round((Date.now() - clip.submitTime) / 60_000);
+      if (Date.now() - clip.submitTime < UNCONFIRMED_ALERT_MS) return;
+      this.ledger.setClipStatus(taskId, clip.index, 'SUBMITTED', { unconfirmedAlertAt: nowIso() });
+      stalled.push({
+        clipIndex: clip.index,
+        title: clip.title,
+        minutes: mins,
+        ...(clip.bvid ? { bvid: clip.bvid } : {}),
+      });
+    };
     const norm = (s: string): string => s.replace(/\s+/g, '').trim();
 
     /* ---- 路径一：已经有 bvid（多分P 续传）→ 按**分P 标题**确认落地 ---- */
@@ -2791,9 +3027,27 @@ export class Publisher {
         continue;
       }
       const have = new Set(titles.map(norm));
+      titleIndex.set(bvid, have);
+      /* ★ 2026-10-11 优化第二批 ①：顺手查一次**重复分P**（同一稿件里标题重名 = 同一段内容被投了两次）。
+         实测就是这么发现"修复前那场被跑 8 次投稿"的遗留的（BV1oWpG69Etu 里有一对同名分P）。
+         只报告不自动删（B站 没有删单个分P 的开放接口）；记录只在重复集合变化时写，避免每轮刷日志。 */
+      {
+        const dup = findDuplicateTitles(titles);
+        if (dup.length > 0) {
+          const wrote = recordDuplicateParts({ bvid, titles: dup.map((d) => `${d.title}（${d.count} 份）`) });
+          if (wrote) {
+            log.warn(
+              `稿件 ${bvid} 有 ${dup.length} 个**重复分P**：${dup.map((d) => `${d.title}×${d.count}`).join('、')} —— ` +
+                `已进「健康面板 → 待办」，需要到创作中心删掉多余的（B站 没有删单个分P 的接口）`,
+              { taskId },
+            );
+          }
+        }
+      }
       for (const clip of list) {
         if (!have.has(norm(clip.title))) {
           pending.push(clip.index);
+          noteStalled(clip);
           continue;
         }
         this.ledger.setClipStatus(taskId, clip.index, 'PUBLISHED', { bvid, publishedAt: nowIso() });
@@ -2822,11 +3076,39 @@ export class Publisher {
       }
     }
 
+    /* ---- 路径一之后：**按批次对账**（2026-10-11，投稿批次账）----
+       逐片判定只能回答"某片在不在分P 列表里"；批次账能回答"**这次投稿**整体成没成、少了哪几个"。
+       用刚读到的标题集合把每个未结批次判一遍，并把结论写回批次账（供界面对账与事后复盘）。 */
+    const batchNotes: string[] = [];
+    for (const b of readOpenBatches(taskId)) {
+      const titles = b.bvid ? titleIndex.get(b.bvid) : undefined;
+      const missing = titles ? b.titles.filter((t) => !titles.has(norm(t))) : b.titles.slice();
+      const ageMin = Math.max(0, Math.round((Date.now() - Date.parse(b.at)) / 60_000));
+      if (titles && missing.length === 0) {
+        recordBatchOutcome({
+          taskId,
+          uploadTaskId: b.uploadTaskId,
+          kind: b.kind,
+          status: 'landed',
+          ...(b.aid ? { aid: b.aid } : {}),
+          ...(b.bvid ? { bvid: b.bvid } : {}),
+          landed: b.titles,
+        });
+        batchNotes.push(`批次 ${b.uploadTaskId.slice(0, 8)}：${b.titles.length} 个分P 全部落地`);
+      } else {
+        batchNotes.push(
+          `批次 ${b.uploadTaskId.slice(0, 8)}：提交 ${ageMin} 分钟，${b.titles.length - missing.length}/${b.titles.length} 个分P 落地` +
+            (missing.length ? `，缺：${missing.map((t) => t.slice(0, 18)).join('、')}` : '（分P 列表本轮读不到，下轮再看）'),
+        );
+      }
+    }
+    if (batchNotes.length > 0) log.info(`投稿批次对账：${batchNotes.join('；')}`, { taskId });
+
     /* ---- 路径二：没有 bvid（新建稿件）→ 按稿件标题反查 ---- */
     const noBvid = clips.filter((c) => !c.bvid);
     if (noBvid.length === 0) {
       if (confirmed.length) log.info(`反查确认 ${confirmed.length} 个切片（多分P 续传，按分P 标题确认）`, { taskId });
-      return { confirmed, pending };
+      return { confirmed, pending, stalled, batches: batchNotes };
     }
     const archives = await this.client.biliArchives({ page: 1, pageSize: 100 });
     for (const clip of noBvid) {
@@ -2883,6 +3165,7 @@ export class Publisher {
         confirmed.push({ clipIndex: clip.index, bvid: m.bvid, title: clip.title });
       } else {
         pending.push(clip.index);
+        noteStalled(clip);
       }
     }
     if (confirmed.length) {
@@ -2894,7 +3177,7 @@ export class Publisher {
       });
     }
     void opts;
-    return { confirmed, pending };
+    return { confirmed, pending, stalled, batches: batchNotes };
   }
 
   /** 崩溃恢复：处理卡在 SUBMITTING 的切片 —— 先反查，再决定是否重投 */

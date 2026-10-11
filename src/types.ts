@@ -433,6 +433,15 @@ export interface ClipRecord extends ClipCandidate {
    * 既刷屏又白费请求。记下来之后直接跳过。
    */
   archiveGoneAt?: string;
+  /**
+   * 「已提交待确认」**超时告警**已发过的时刻（ISO）。
+   *
+   * 背景（2026-10-10 实测）：续传追加在 B站 侧没落地时，切片会停在 SUBMITTED，
+   * 而反查每 5 分钟只会安静地报「10/11 已确认落地」—— 差的那一个没人提醒，
+   * 静默躺了半小时（用户是看着卡片问「这是投稿了吗」才发现的）。
+   * 现在超过 `UNCONFIRMED_ALERT_MS` 仍未落地就告警一次，并写这个字段**避免反复打扰**。
+   */
+  unconfirmedAlertAt?: string;
   /** 实际提交投稿的时刻（毫秒），dtime 的相对基准 */
   submitTime?: number;
   dtime?: number;

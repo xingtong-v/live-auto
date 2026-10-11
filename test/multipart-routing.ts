@@ -502,6 +502,46 @@ async function main(): Promise<void> {
     ok('全部报成 skipped', r.skipped >= 3, String(r.skipped));
   }
 
+  /* ==========================================================================
+   * 12. 单飞闸：同一场**不许并发/重复**投（2026-10-10 实测一场被跑了 8 次投稿阶段）
+   *     事故现场：23:17:50–23:23:13 之间同一场跑了 8 遍，每遍都真调了一次
+   *     `editMedia(append)`，其中一片被投两次（两个 uploadTaskId）而 B站 侧一条没落地；
+   *     日志里反复出现「本场已有 1 次投稿记录…本次将再投一次，B站 上会出现重复稿件」——
+   *     那不是提醒，那是重复投稿正在发生。
+   * ======================================================================== */
+  section('12. 单飞闸：同一场并发投稿只跑一次、重复入队被忽略');
+  {
+    const { orch, taskId, calls } = makeEnv(path.join(tmpRoot, 'm'), true, { fullVideoBy: 'assistant' });
+    /* publishStage 第一步要 uid（真实链路走 client.userList）；本节的假 client 只覆盖了
+       biliArchives/biliUpload，这里补上，否则会以 auth 错误提前退出、测不到单飞闸。 */
+    (orch as unknown as { client: Record<string, unknown> }).client['userList'] = async (): Promise<unknown[]> => [
+      { uid: 12345, name: 'tester' },
+    ];
+    const invokePublish = (id: string): Promise<unknown> =>
+      (orch as unknown as { publishStage: (t: string, l?: unknown) => Promise<unknown> }).publishStage(id, silentLog);
+
+    /* 并发调两次：第二次必须**等第一次**，而不是再投一遍 */
+    const [p1, p2] = await Promise.all([invokePublish(taskId), invokePublish(taskId)]);
+    eq('★ 同一场并发投两次 → publishAsMultiPart 只被调一次', calls['publishAsMultiPart']!.length, 1);
+    ok(
+      '第二次拿到的是同一次的结果（不是另投一遍）',
+      JSON.stringify(p1) === JSON.stringify(p2),
+      `${JSON.stringify(p1).slice(0, 80)} vs ${JSON.stringify(p2).slice(0, 80)}`,
+    );
+
+    /* 入队去重：**正在跑**的任务不该被再排一次（实测就是这么排了 8 次）。
+       把 runPipeline 换掉，避免真去跑流水线；只看它被调用几次。 */
+    const ran: string[] = [];
+    (orch as unknown as { runPipeline: (id: string, s: string) => Promise<void> }).runPipeline = async (id: string) => {
+      ran.push(id);
+      await new Promise((r) => setTimeout(r, 40));
+    };
+    await orch.enqueue(taskId);
+    await orch.enqueue(taskId);
+    await new Promise((r) => setTimeout(r, 160));
+    eq('★ 同一场重复入队被忽略（流水线只跑一次）', ran.length, 1);
+  }
+
   console.log(`\n\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);
   if (failures.length) {
     console.log('\x1b[31m失败项：\x1b[0m');

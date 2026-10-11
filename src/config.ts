@@ -188,6 +188,24 @@ export interface AsrConfig {
     /** 单次调用超时（秒）—— 4 小时素材在 PyTorch 路径下约 43 分钟，给足余量 */
     timeoutSec: number;
   };
+  /**
+   * ASR 拆独立进程（2026-10-11）。**默认关** —— 关着时转写走原来的进程内路径，
+   * 行为与接线前逐字一致；打开后转写跑在 `src/asr-worker.ts` 这个独立子进程里。
+   *
+   * 这一项**不提速**（模型本来就跑在一次性子进程里），换的是"ASR 出问题不拖垮主链"：
+   * 转写 OOM/崩溃只死 worker，守护进程与看门狗不受影响，任务自动重试或原地降级。
+   */
+  worker: {
+    /** 是否用独立进程跑 ASR（默认 false；OOM/崩溃只死 worker，不动主链） */
+    enabled: boolean;
+    maxOldSpaceMb: number;
+  };
+  /**
+   * 边录边转写（P1-6）：分段在录制期间闭合后立即转写，录完时只剩最后一段要跑。
+   * 默认 false —— 它改的是录制监听与状态机，先证明再默认开（可行性已实测：分段与整段
+   * 的字幕条数差 0.06%、覆盖时长差 0.01%、边界时间戳连续）。
+   */
+  incrementalEnabled?: boolean;
 }
 
 export interface LlmEndpoint {
@@ -342,6 +360,8 @@ export interface ClipConfig {
    */
   boundarySpeechTrimSec: number;
   ffmpegPresetId: string;
+  /** 切片阶段并发（有界流水线）：1 = 与历史行为逐字一致；>1 只并行 ffmpeg 切片，上传仍串行且保留风控抖动 */
+  concurrency?: number;
   burnDanmaku: boolean;
   /**
    * 是否把转写烧成字幕。
@@ -533,6 +553,13 @@ export interface PublishConfig {
    * 代价与风险见 README；试跑期建议保持 `false`。
    */
   immediatePublish: boolean;
+  /** 失败自动重试一次（仅限判据认为是临时性的失败，见 src/failure-class.ts）；失败仍如实上报 */
+  autoRetryOnce?: boolean;
+  /**
+   * 封面来源：preset = 用预设封面（现状，没预设就不传）；frame = 从评分最高的切片里抽一帧。
+   * 默认 preset ⇒ 与历史行为逐字一致（抽帧失败也会自动回退成"不传封面"）。
+   */
+  coverFrom?: 'preset' | 'frame';
 }
 
 export interface CleanupConfig {  retentionDays: number;
@@ -595,6 +622,8 @@ export interface AlertConfig {
   dingtalk: { webhook: string; secret: string };
   telegram: { botToken: string; chatId: string };
   webhook: { url: string };
+  /** 场次结束自动推送一份复盘摘要（切片数/投稿落地/待办项数）；推送失败绝不影响主流程 */
+  recapEnabled?: boolean;
 }
 
 export interface UiConfig {
@@ -766,6 +795,8 @@ function builtinDefaults(): AppConfig {
         parallel: 1,
         timeoutSec: 4 * 3600,
       },
+      // ASR 独立进程：默认关（关着 = 与接线前逐字一致的行为）
+      worker: { enabled: false, maxOldSpaceMb: 2048 },
     },
     llm: {
       preset: 'deepseek',
@@ -1027,6 +1058,20 @@ export function validateConfig(cfg: AppConfig): ConfigIssue[] {
   if (cfg.publish.clipGapSec < 7200) {
     warn('publish.clipGapSec', `相邻切片间距 ${cfg.publish.clipGapSec} 秒偏小；B站要求是相对各稿件提交时刻 >7200，取 7500 属保守余量`);
   }
+  /* 切片阶段并发（有界流水线）：默认 1 = 与历史行为逐字一致 */
+  const cutConc = cfg.clip.concurrency ?? 1;
+  if (!Number.isInteger(cutConc) || cutConc < 1 || cutConc > 4) {
+    err('clip.concurrency', '切片并发必须是 1–4 的整数', '并发只并行 ffmpeg 切片；上传仍串行并保留风控抖动');
+  } else if (cutConc >= 3) {
+    warn('clip.concurrency', `切片并发 ${cutConc} 较高`, '本地 Fun-ASR 与 ffmpeg 会抢 CPU；转写期间系统会自动降到 1');
+  }
+  /* LLM 输出上限（P2 配置面收尾：这是孤儿字段里唯一真正缺校验的高价值项 ——
+     太小会让选片结果被截断，表现为"候选数异常少"，很难往配置上想）。 */
+  if (!Number.isInteger(cfg.llm.select.maxTokens) || cfg.llm.select.maxTokens < 256) {
+    err('llm.select.maxTokens', 'LLM 输出上限太小', '低于 256 会让选片结果被截断，表现为候选数异常少');
+  } else if (cfg.llm.select.maxTokens > 32000) {
+    warn('llm.select.maxTokens', `LLM 输出上限 ${cfg.llm.select.maxTokens} 偏大`, '选片输出通常用不到这么多，白烧 token');
+  }
   if (cfg.clip.minDurationSec <= 0 || cfg.clip.maxDurationSec <= cfg.clip.minDurationSec) {
     err('clip.minDurationSec', '片段时长范围不合法', '确保 0 < minDurationSec < maxDurationSec');
   }
@@ -1143,6 +1188,24 @@ export function validateConfig(cfg: AppConfig): ConfigIssue[] {
   }
   if (cfg.cleanup.retentionDays < 1) {
     warn('cleanup.retentionDays', '缓冲期小于 1 天，事后补切/重传将无法读取源文件');
+  }
+  /* 回收站保留天数（2026-10-11 用户要求「添加只保留几天的设置 超长时间的自动删除」）：
+     这个值直接决定"误删之后还有没有后悔药"，两个方向都要说清楚 ——
+     0 不是"立刻清理"，而是**不用回收站**（删任务直接永久删），属于更危险的一侧。 */
+  if (!Number.isFinite(cfg.cleanup.trashDays) || !Number.isInteger(cfg.cleanup.trashDays) || cfg.cleanup.trashDays < 0) {
+    err(
+      'cleanup.trashDays',
+      `回收站保留天数必须是不小于 0 的整数（当前 ${String(cfg.cleanup.trashDays)}）`,
+      '例如 7；0 = 不用回收站（删除任务直接永久删除）',
+    );
+  } else if (cfg.cleanup.trashDays === 0) {
+    warn(
+      'cleanup.trashDays',
+      '回收站已关闭（0）：删除任务会**直接永久删除**，误点了也恢复不了',
+      '想保留反悔机会就设成 7（默认）',
+    );
+  } else if (cfg.cleanup.trashDays < 1) {
+    warn('cleanup.trashDays', '回收站保留不足 1 天，过夜就可能被自动清理掉');
   }
   if (cfg.asr.provider === 'whisper-cpp') {
     // 本地执行器是一个 Python 脚本（faster-whisper / CTranslate2）。

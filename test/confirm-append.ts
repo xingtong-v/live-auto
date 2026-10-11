@@ -83,7 +83,7 @@ function makePublisher(archiveResponses: Array<Array<{ part: string; duration: n
 async function confirm(
   pub: Publisher,
   want: string[],
-  opts: { timeoutMs?: number; intervalMs?: number } = {},
+  opts: { timeoutMs?: number; intervalMs?: number; unreadableFallback?: 'landed' | 'unconfirmed' } = {},
 ): Promise<boolean> {
   const m = (pub as unknown as {
     confirmPartTitlesLanded: (aid: string, t: string[], l: unknown, o?: unknown) => Promise<boolean>;
@@ -141,6 +141,12 @@ async function main(): Promise<void> {
     const { pub } = makePublisher(['no-list']);
     const r = await confirm(pub, ['新切片A']);
     ok('读不到列表时不把成功判成失败', r === true, `实际 ${r}`);
+
+    /* ★ 2026-10-10：往哪边倒由**任务真实状态**决定（调用方通过 unreadableFallback 传进来）——
+       biliLive-tools 还没跑完就"读不到列表"时一律当已落地，会把没投成的追加写成 PUBLISHED。 */
+    const { pub: pub2 } = makePublisher(['no-list']);
+    const r2 = await confirm(pub2, ['新切片A'], { unreadableFallback: 'unconfirmed' });
+    ok('★ 任务尚未结束时读不到列表 → 判「未确认」（不再一律当已落地）', r2 === false, `实际 ${r2}`);
   }
 
   section('5. 边界：空待投清单直接为 true');
@@ -163,6 +169,8 @@ async function main(): Promise<void> {
   }
 
   section('7. 「已提交待确认」的迟到确认：按**分P 标题**把它捞回来（2026-10-07 用户报的问题）');
+  /* ⚠️ 第 8 节在同一个块里：它复用本节的 `setup` 夹具工厂（放在块外就看不见了 —— 第一版就是这么报
+     `setup is not defined` 的），所以变量名用 s8a/s8b 避开本节已用的 a/b/c/d。 */
   {
     /* 背景：多分P 续传给的是**别人稿件的分P**，它的标题永远不会作为稿件标题出现在
        `/bili/archives` 里 —— 按标题反查一辈子也查不到。而续传的落地确认窗口只有 5 分钟，
@@ -280,6 +288,38 @@ async function main(): Promise<void> {
     const r4 = await d.pub.confirmPublished(d.taskId);
     ok('混合场景：两条路都走到（有 bvid 的按分P 标题、没 bvid 的按稿件标题）', r4.confirmed.length === 2, JSON.stringify(r4.confirmed));
     ok('混合场景确实查了 /bili/archives', d.calls.archives === 1, String(d.calls.archives));
+
+    /* ======================================================================
+     * 8. 「提交很久了、B站 侧还是没有」→ 必须告警一次（2026-10-10 用户问「这是投稿了吗」）
+     *    背景：反查每 5 分钟只安静地报「10/11 已确认落地」，差的那一个没人提醒 ——
+     *    实测有一条这么静默躺了半小时，用户是盯着切片卡片发现的。
+     *    确认不了 ≠ 失败，所以不擅自改状态、也不重复投，但**必须有人被通知到**。
+     * ==================================================================== */
+    section('8. 「提交很久了、B站 侧还是没有」→ 告警一次');
+    {
+      const pages = [
+        { part: '完整版', duration: 10 },
+        { part: '切片甲：已经在稿件里了', duration: 10 },
+      ];
+      const s8a = setup(pages, { second: { title: '切片乙：还没落地', bvid: 'BV1FAKE00001' } });
+      s8a.pub['ledger'].setClipStatus(s8a.taskId, 1, 'SUBMITTED', { submitTime: Date.now() - 90 * 60_000 });
+      const s8r = await s8a.pub.confirmPublished(s8a.taskId);
+      eq('★ 超时未落地的切片被单独报出来（不再只在日志里小声说）', s8r.stalled.length, 1);
+      eq('报出来的正是那一条', s8r.stalled[0]?.clipIndex, 1);
+      ok('带上了等待时长（分钟）', (s8r.stalled[0]?.minutes ?? 0) >= 89, String(s8r.stalled[0]?.minutes));
+      ok(
+        '★ 状态仍是 SUBMITTED（确认不了 ≠ 失败，绝不擅自判失败）',
+        s8a.pub['ledger'].getClip(s8a.taskId, 1)?.status === 'SUBMITTED',
+      );
+      ok('★ 台账记下 unconfirmedAlertAt（避免每 5 分钟重复打扰）', Boolean(s8a.pub['ledger'].getClip(s8a.taskId, 1)?.unconfirmedAlertAt));
+      const s8r2 = await s8a.pub.confirmPublished(s8a.taskId);
+      eq('★ 第二轮不再重复报（只提醒一次）', s8r2.stalled.length, 0);
+
+      const s8b = setup(pages, { second: { title: '切片乙：还没落地', bvid: 'BV1FAKE00001' } });
+      s8b.pub['ledger'].setClipStatus(s8b.taskId, 1, 'SUBMITTED', { submitTime: Date.now() - 5 * 60_000 });
+      const s8r3 = await s8b.pub.confirmPublished(s8b.taskId);
+      eq('刚提交 5 分钟的不报（B站 分P 列表本来就有延迟）', s8r3.stalled.length, 0);
+    }
   }
 
   console.log(`\n\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);

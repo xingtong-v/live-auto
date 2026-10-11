@@ -12,6 +12,10 @@
  *  - 日志统一脱敏 `Authorization` / passkey / cookie / API Key
  */
 import fs from 'node:fs';
+import { analyzeRecording } from './recording-health.ts';
+import { diffConfig, readOrCreateBaseline } from './config-baseline.ts';
+import { dismissTodo, readDismissals, undismissTodo } from './todo-dismiss.ts';
+import { buildRecap } from './recap.ts';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -20,6 +24,8 @@ import { spawn } from 'node:child_process';
 import { URL } from 'node:url';
 import type { Orchestrator } from './daemon.ts';
 import { APP_VERSION, retentionNote, summarizeTask } from './daemon.ts';
+import { isFixtureTask, splitFixtures } from './fixtures.ts';
+import { findDuplicateTitles, readBatches, readRecentDuplicateParts } from './publish-batches.ts';
 import type { ClipRecord, Stage, TaskRecord } from './types.ts';
 import { loadErrorReport, loadErrorReportOrEvent, readErrorEvents, renderErrorTimeline, listErrorReports, clearErrorEvents } from './errors.ts';
 import { resolveCover, validateDtime, describeDtimePlan, parseUserDtime } from './publish.ts';
@@ -721,6 +727,21 @@ export class UiServer {
         /* 配置内容版本号：界面保存时原样回传，服务端据此判断「表单是否已过期」。
            没有它，界面会拿旧快照静默覆盖外部刚改过的配置（实测丢过 llm.select.model）。 */
         configVersion: orch.store.fileVersion,
+        /* P1-7：配置基线（首次读取时以当下配置建立，之后不再覆写）。
+           界面据此算出"你改过哪些项"。基线只用于展示，绝不参与校验或保存逻辑。 */
+        configBaseline: readOrCreateBaseline({
+          dataDir: path.dirname(orch.ledger.publishLogPath),
+          current: orch.store.safeSnapshot(),
+        }).baseline,
+        /* 差异在**服务端**算（复用 src/config-baseline.ts 的纯函数）：界面只负责渲染，
+           免得同一套口径在两端各写一遍（本仓库踩过这种坑）。 */
+        configDiff: (() => {
+          const snap = orch.store.safeSnapshot();
+          const base = readOrCreateBaseline({ dataDir: path.dirname(orch.ledger.publishLogPath), current: snap }).baseline;
+          if (!base) return { count: 0, items: [] as Array<{ path: string; kind: string; from?: string; to?: string }> };
+          const d = diffConfig(base, snap);
+          return { count: d.length, items: d.slice(0, 40) };
+        })(),
         configIssues: orch.store.issues,
         mode: {
           autoPublish: liveCfg.publish.autoPublish,
@@ -965,9 +986,13 @@ export class UiServer {
         tasks = tasks.filter((t) => want.includes(t.status));
       }
       const items = tasks.map((t) => this.toTaskSummary(t));
-      // 成本月度汇总（使用期辅助功能）
-      const monthly = this.monthlyCost(tasks);
-      this.sendJson(res, 200, { tasks: items, monthly, total: tasks.length });
+      /* 成本月度汇总（使用期辅助功能）。
+         ★ 2026-10-11：**夹具不算进成本** —— 实测每天 38–45 个任务里真实直播只有 2–7 场，
+         其余是测试夹具；把它们算进「本月合计」等于让这个数字失去意义。
+         但也不静默：`fixturesExcluded` 如实报出剔了几个，界面上写清楚。 */
+      const { real, fixtures } = splitFixtures(tasks);
+      const monthly = { ...this.monthlyCost(real), fixturesExcluded: fixtures.length };
+      this.sendJson(res, 200, { tasks: items, monthly, total: tasks.length, fixtureTotal: fixtures.length });
       return;
     }
 
@@ -990,7 +1015,7 @@ export class UiServer {
       const id = decodeURIComponent(approveMatch[1]!);
       const t = orch.ledger.getTask(id);
       if (!t) throw new Error(`任务不存在：${id}`);
-      const body = (await this.readBody(req)) as { indices?: number[] };
+      const body = (await this.readBody(req)) as { indices?: number[]; includeSubmitted?: boolean };
       const clips = orch.ledger.getClips(id);
 
       // 硬约束检查：标题/简介/标签合规 + 时间范围合法
@@ -999,8 +1024,14 @@ export class UiServer {
       /* ★ 2026-10-07：「已经投过」的切片**不再进这次投稿**（用户报「勾了想投稿但没有投稿选项」时查出的隐患）。
          判据用台账状态（本地、无延迟），**不看 B站 分P 列表** —— 后者有约 20 分钟延迟，
          延迟窗口内重投会把已经投过的分P 再投一遍，在同一稿件里留下重复分P（publish.ts 里记过这次事故）。
-         SUBMITTED（已提交待确认）也算投过：上传接口已经受理，只是还没落地。 */
-      const DONE_STATUSES: string[] = ['PUBLISHED', 'SUBMITTED', 'SUBMITTING', 'SKIPPED'];
+         SUBMITTED（已提交待确认）也算投过：上传接口已经受理，只是还没落地。
+         ★ 2026-10-10 补一个**显式出口**：`includeSubmitted: true` 时才把 SUBMITTED 也放进来 ——
+           「提交了但 B站 侧始终没出现」的切片（反查 1 小时后会告警）必须能重投，
+           否则界面上那句「确认没有可重投」就是个空头支票。UI 上对应 SUBMITTED 卡片的
+           「重新投稿这一片」，点击前有二次确认（重复投递会在稿件里留下重复分P）。 */
+      const DONE_STATUSES: string[] = body.includeSubmitted
+        ? ['PUBLISHED', 'SUBMITTING', 'SKIPPED']
+        : ['PUBLISHED', 'SUBMITTED', 'SUBMITTING', 'SKIPPED'];
       const indices = requested.filter((i) => {
         const c = clips[i];
         return c !== undefined && !DONE_STATUSES.includes(c.status);
@@ -1011,7 +1042,10 @@ export class UiServer {
           error: '没有需要投稿的切片',
           problems: [
             alreadyDone > 0
-              ? `你勾选的 ${alreadyDone} 个切片都已经投过了（已提交/已发布），不会重复投。要重投请先在 B站 创作中心删掉对应分P（或解除墓碑后重跑本场）`
+              ? body.includeSubmitted
+                ? `你勾选的 ${alreadyDone} 个切片已经是「已发布」了，不会重复投`
+                : `你勾选的 ${alreadyDone} 个切片都已经投过了（已提交/已发布），不会重复投。` +
+                  `**若其中某一片在 B站 稿件里确实没出现**（「已提交待确认」卡了很久），在那一张卡片上点「重新投稿这一片」即可重投`
               : '没有勾选任何切片',
           ],
         });
@@ -1055,7 +1089,9 @@ export class UiServer {
         return;
       }
 
-      const result = await orch.publishStage(id, orch.logger);
+      const result = await orch.publishStage(id, orch.logger, {
+        ...(body.includeSubmitted ? { includeSubmitted: true } : {}),
+      });
       this.sendJson(res, 200, {
         ok: result.ok,
         stoppedAt: result.stoppedAt,
@@ -1526,6 +1562,30 @@ export class UiServer {
           errors.length > 0
             ? '术语表有错误，未写入（见 issues）'
             : `术语表已保存：主播 ${saved.glossary.anchors.length} 个、术语 ${saved.glossary.terms.length} 个、纠错规则 ${saved.glossary.replacements.length} 条 —— 下一次转写/分析即生效，无需重启`,
+      });
+      return;
+    }
+
+    /* ---------------- POST /api/task/:id/refresh-publish ----------------
+     * 「刷新投稿状态」：立刻对 B站 做一次落地反查（不等 5 分钟那一轮），
+     * 让「已提交待确认」的切片尽快变成「已发布」/「未确认」。
+     * 用户 2026-10-11 要求：「任务这里加个刷新 用于及时刷新投稿信息」。
+     * 只读 B站 + 写本地台账，**不触发任何投稿动作**（不会因此产生新分P）。 */
+    const refreshMatch = /^\/api\/task\/([^/]+)\/refresh-publish$/.exec(p);
+    if (refreshMatch && method === 'POST') {
+      const id = decodeURIComponent(refreshMatch[1]!);
+      const r = await orch.refreshPublishStatus(id);
+      this.sendJson(res, 200, {
+        ok: true,
+        ...r,
+        note:
+          r.checked === 0
+            ? '本场没有「已提交待确认」的切片，无需反查'
+            : r.confirmed > 0
+              ? `已确认 ${r.confirmed} 个切片在 B站 落地（刚变成「已发布」）` +
+                (r.pending > 0 ? `，还有 ${r.pending} 个没出现` : '')
+              : `反查完成：${r.checked} 个待确认切片仍没在 B站 出现` +
+                `（分P 列表有延迟，最长实测约 20 分钟；超过 1 小时会告警）`,
       });
       return;
     }
@@ -2043,6 +2103,343 @@ export class UiServer {
       return;
     }
 
+    /* ---------------- GET /api/todos（统一待办：把"需要人管的事"收敛成一处置） ----------------
+     * 2026-10-11（优化第一批 A4）：原来要人管的事散在三处 —— 未确认投稿在任务列表/切片卡片、
+     * 失败场次在任务列表、磁盘与错误在健康面板、待删到点在待删页。用户问"现在要我做什么"时没人能一句话回答。
+     * 这里把判据集中在一处（界面与 MCP/CLI 共用），只读、不触发任何动作。 */
+    if (p === '/api/todos' && method === 'GET') {
+      const items: Array<Record<string, unknown>> = [];
+      /* 待办闭环（P0-3）：被忽略/已处理的条目不再返回，但**如实报数**（dismissedCount）。 */
+      /* ★ 存储目录跟随本进程的 dataDir（从 publish-log 的所在目录推出）：
+         dataDirOverride 下不能写真实 data/（批次账踩过同一个坑）。 */
+      const todoDataDir = path.dirname(orch.ledger.publishLogPath);
+      const dismissals = readDismissals({ dataDir: todoDataDir });
+      const tasks = orch.ledger.listTasks({ limit: 300 }).filter((t) => !isFixtureTask(t));
+      /* ① 未确认投稿：SUBMITTED 卡着不动的切片（最需要人判断的一类） */
+      const stuckSub: Array<{ taskId: string; taskTitle: string; count: number; oldestMin: number; index: number }> = [];
+      for (const t of tasks) {
+        const subs = orch.ledger.getClips(t.id).filter((c) => c.status === 'SUBMITTED');
+        if (subs.length === 0) continue;
+        const oldest = Math.max(...subs.map((c) => (c.submitTime ? Math.round((Date.now() - c.submitTime) / 60_000) : 0)));
+        stuckSub.push({ taskId: t.id, taskTitle: t.title, count: subs.length, oldestMin: oldest, index: subs[0]!.index });
+      }
+      if (stuckSub.length > 0) {
+        const total = stuckSub.reduce((a, x) => a + x.count, 0);
+        const worst = stuckSub.sort((a, b) => b.oldestMin - a.oldestMin)[0]!;
+        items.push({
+          key: 'unconfirmed-publish',
+          level: worst.oldestMin >= 60 ? 'error' : 'warn',
+          count: total,
+          title: `${total} 个切片仍是「已提交待确认」`,
+          detail: `最久的一批已 ${worst.oldestMin} 分钟（《${worst.taskTitle}》）。不等于失败，但超过 1 小时的应当去创作中心核对一次；确认没落地就在卡片上点「重新投稿这一片」。`,
+          action: { kind: 'task', taskId: worst.taskId, view: 'tasks' },
+          actionLabel: '去这一场核对',
+        });
+      }
+      /* ② 失败场次 */
+      const failed = tasks.filter((t) => t.status === 'FAILED');
+      if (failed.length > 0) {
+        items.push({
+          key: 'failed-tasks',
+          level: 'error',
+          count: failed.length,
+          title: `${failed.length} 场任务失败`,
+          detail: `最近一场：《${failed[failed.length - 1]!.title}》。看错误报告后从失败阶段重跑即可（转写结果有缓存，重跑很便宜）。`,
+          action: { kind: 'task', taskId: failed[failed.length - 1]!.id, view: 'tasks' },
+          actionLabel: '去处理',
+        });
+      }
+      /* ③ 卡住的场次（跑了很久还停在处理中） */
+      const stuck = tasks.filter(
+        (t) => ['CLIPPING', 'CLIPPED', 'TRANSCRIBING', 'ANALYZING', 'PUBLISHING'].includes(t.status) && Date.now() - Date.parse(t.updatedAt) > 2 * 3600_000,
+      );
+      if (stuck.length > 0) {
+        items.push({
+          key: 'stuck-tasks',
+          level: 'warn',
+          count: stuck.length,
+          title: `${stuck.length} 场停在处理中超过 2 小时`,
+          detail: `例如《${stuck[0]!.title}》（状态 ${stuck[0]!.status}）。可能是进程被杀过；顶栏「修复卡住」能救，或从某阶段重跑。`,
+          action: { kind: 'tab', view: 'monitor' },
+          actionLabel: '去实时监控看',
+        });
+      }
+      /* ④ 磁盘（沿用健康面板的判据；提示语就地写，不为了一句说明去伪造 TaskRecord） */
+      const diskHint = cfg.cleanup.deleteAfterUpload.enabled
+        ? '素材清理与「用完即删」都在自动跑'
+        : '素材清理按缓冲期自动跑';
+      try {
+        const st = fs.statfsSync(ROOT_DIR);
+        const freeGB = (Number(st.bavail) * Number(st.bsize)) / 1024 ** 3;
+        if (freeGB < cfg.cleanup.diskFloorGB) {
+          items.push({
+            key: 'disk-low',
+            level: 'error',
+            count: 1,
+            title: `磁盘剩余 ${freeGB.toFixed(1)} GB，低于阈值 ${cfg.cleanup.diskFloorGB} GB`,
+            detail: `${diskHint}；也可以到「待删 / 回收站」手动清理。`,
+            action: { kind: 'tab', view: 'trash' },
+            actionLabel: '去清理',
+          });
+        }
+      } catch {
+        /* statfs 不可用就不报这一条（不是错误） */
+      }
+      /* ⑤ 重复分P（2026-10-11 优化第二批 ①）：反查时顺手记下的"同一稿件里标题重名"。
+         只读本地记录（不在这个只读端点里打 B站 接口）。 */
+      try {
+        const dups = readRecentDuplicateParts();
+        if (dups.size > 0) {
+          const list = [...dups.values()];
+          items.push({
+            key: 'duplicate-parts',
+            level: 'warn',
+            count: list.length,
+            title: `${list.length} 个稿件里有重复分P`,
+            detail:
+              `例如 ${list[0]!.bvid}：${list[0]!.titles.slice(0, 2).join('、')}。` +
+              `同一段内容被投了两次（多为修复前"重复投稿"的遗留）。B站 没有删单个分P 的接口，需要你到创作中心手动删掉多余的那一个。`,
+            action: { kind: 'tab', view: 'clips' },
+            actionLabel: '去切片库核对',
+          });
+        }
+      } catch {
+        /* 重复分P 记录读不到不影响其它待办 */
+      }
+      /* ⑤b 录制质量体检（P2）：对**最近一场有分段记录**的场次体检，异常就提示。
+         只读台账、只看分段边界（判据见 src/recording-health.ts），不做任何修复动作。 */
+      try {
+        const recent = tasks.filter((t) => (t.source?.segments?.length ?? 0) > 0)[0];
+        if (recent) {
+          const h = analyzeRecording(recent.source.segments.map((s) => ({ path: s.path, globalStart: s.globalStart, globalEnd: s.globalEnd })));
+          if (h.level !== 'ok') {
+            items.push({
+              key: 'recording-health',
+              level: h.level === 'gap' ? 'warn' : 'info',
+              count: 1,
+              title: h.level === 'gap' ? '最近一场录制有长空档' : `最近一场录制被中断过 ${h.fragmentBoundaries} 次`,
+              detail: `《${recent.title}》：${h.note}`,
+              action: { kind: 'tab', view: 'monitor' },
+              actionLabel: '去实时监控看轮询',
+            });
+          }
+        }
+      } catch {
+        /* 体检失败不影响其它待办 */
+      }
+      /* ⑥ 待删到点（宽限期内可反悔的最后提醒） */
+      try {
+        const pd = listPendingDelete();
+        if (pd.pending.length > 0 && pd.stats.nextDueAt && Date.parse(pd.stats.nextDueAt) <= Date.now() + 3600_000) {
+          items.push({
+            key: 'pending-delete-due',
+            level: 'warn',
+            count: pd.pending.length,
+            title: `${pd.pending.length} 个文件即将自动删除（1 小时内）`,
+            detail: `最早 ${fmtLocal(Date.parse(pd.stats.nextDueAt))} 执行，可释放 ${fmtBytes(pd.stats.pendingBytes)}。宽限期内点「取消删除」就不会删。`,
+            action: { kind: 'tab', view: 'trash' },
+            actionLabel: '去待删清单',
+          });
+        }
+      } catch {
+        /* 待删清单读不到不影响其它待办 */
+      }
+      this.sendJson(res, 200, {
+        items: items.filter((it) => !dismissals.has(String(it['key'] ?? ''))),
+        dismissedCount: dismissals.size,
+        clean: items.filter((it) => !dismissals.has(String(it['key'] ?? ''))).length === 0,
+        note: items.length === 0 ? '现在没有需要你处理的事：投稿都确认过了，没有失败场次，磁盘也够用。' : '',
+        scannedTasks: tasks.length,
+      });
+      return;
+    }
+
+    /* ---------------- POST /api/todos/dismiss | /api/todos/undismiss（待办闭环） ----------------
+     * 2026-10-13 P0-3：给每条待办两个动作 —— snooze（忽略 N 小时）/ done（已处理），都可恢复。
+     * 只写 data/todo-dismiss.jsonl，不改台账、不触发任何流水线动作。 */
+    if ((p === '/api/todos/dismiss' || p === '/api/todos/undismiss') && method === 'POST') {
+      const body = (await this.readBody(req)) as { key?: string; mode?: string; hours?: number; note?: string };
+      const key = String(body.key ?? '').trim();
+      if (!key) throw new Error('缺少 key');
+      if (p.endsWith('/undismiss')) {
+        undismissTodo(key, { dataDir: path.dirname(orch.ledger.publishLogPath) });
+        this.sendJson(res, 200, { ok: true, key, restored: true, dismissedCount: readDismissals({ dataDir: path.dirname(orch.ledger.publishLogPath) }).size });
+        return;
+      }
+      const mode = body.mode === 'done' ? 'done' : 'snooze';
+      const row = dismissTodo({ key, mode, ...(body.hours !== undefined ? { hours: body.hours } : {}), ...(body.note ? { note: body.note } : {}) }, { dataDir: path.dirname(orch.ledger.publishLogPath) });
+      this.sendJson(res, 200, { ok: true, key, mode: row.mode, ...(row.until ? { until: row.until } : {}), dismissedCount: readDismissals({ dataDir: path.dirname(orch.ledger.publishLogPath) }).size });
+      return;
+    }
+
+    /* ---------------- GET /api/task/:id/recap（每场复盘报告） ----------------
+     * 计算已抽到 src/recap.ts（2026-10-13，P1-5 前置）：界面与「场次结束自动推送」共用同一份口径，
+     * 这里不再保留内联副本。只读本地台账 + 表现数据。 */
+    const recapMatch = /^\/api\/task\/([^/]+)\/recap$/.exec(p);
+    if (recapMatch && method === 'GET') {
+      const id = decodeURIComponent(recapMatch[1]!);
+      this.sendJson(res, 200, buildRecap(orch.ledger, id));
+      return;
+    }
+
+    const archMatch = /^\/api\/archive\/(BV[0-9A-Za-z]+)$/.exec(p);
+    if (archMatch && method === 'GET') {
+      const bvid = archMatch[1]!;
+      const detail = await orch.client.biliArchiveDetail(bvid).catch((e) => ({ error: (e as Error).message }));
+      const view = ((detail as { View?: unknown }).View ?? detail) as { title?: string; pages?: Array<{ page?: number; part?: string; duration?: number }> };
+      const parts = (view.pages ?? []).map((x) => ({ page: x.page ?? 0, title: String(x.part ?? ''), durationSec: Math.round(Number(x.duration ?? 0)) }));
+      const dupes = findDuplicateTitles(parts.map((x) => x.title));
+      const clips: Array<Record<string, unknown>> = [];
+      for (const t of orch.ledger.listTasks({ limit: 500 })) {
+        for (const c of orch.ledger.getClips(t.id)) {
+          if (c.bvid !== bvid) continue;
+          clips.push({
+            taskId: t.id,
+            taskTitle: t.title,
+            index: c.index,
+            title: c.title,
+            status: c.status,
+            score: c.score,
+            start: c.start,
+            end: c.end,
+            ...(c.publishedAt ? { publishedAt: c.publishedAt } : {}),
+          });
+        }
+      }
+      let perf: Record<string, unknown> | undefined;
+      for (const row of orch.ledger.readPerformance({ sinceMs: Date.now() - 400 * 86400_000 }) as Array<Record<string, unknown>>) {
+        if (row['bvid'] !== bvid) continue;
+        if (!perf || String(row['date'] ?? '') >= String(perf['date'] ?? '')) perf = row;
+      }
+      /* 健康：线上分P 数 vs 本地记在这个 bvid 下的切片数（缺失 = 我们投了但线上没有） */
+      const onlineTitles = new Set(parts.map((x) => x.title.replace(/\s+/g, '').trim()));
+      const missingLocal = clips.filter((c) => ['PUBLISHED', 'SUBMITTED'].includes(String(c['status'])) && !onlineTitles.has(String(c['title']).replace(/\s+/g, '').trim()));
+      this.sendJson(res, 200, {
+        bvid,
+        url: `https://www.bilibili.com/video/${bvid}`,
+        title: String(view.title ?? ''),
+        parts,
+        clips,
+        duplicates: dupes,
+        missingLocal: missingLocal.map((c) => ({ clipIndex: c['index'], title: c['title'], status: c['status'], taskId: c['taskId'] })),
+        ...(perf ? { performance: { view: perf['view'], like: perf['like'], date: perf['date'] } } : {}),
+        ...((detail as { error?: string }).error ? { error: (detail as { error?: string }).error } : {}),
+        note: '线上分P 列表 + 本地切片 + 表现 + 健康（重复/缺失）一次给全；只读。',
+      });
+      return;
+    }
+
+    /* ---------------- GET /api/task/:id/batches（投稿批次时间线） ----------------
+     * 2026-10-11 优化第二批 ②：批次账（§51）已经记下"每次投稿本该产生哪几个分P、落地了哪几个"，
+     * 之前只在日志里。这里把它摊成时间线，界面一眼能看出"投了几次、哪次没落地、缺哪个分P"。
+     * 只读本地文件，不碰 B站。 */
+    const batchesMatch = /^\/api\/task\/([^/]+)\/batches$/.exec(p);
+    if (batchesMatch && method === 'GET') {
+      const id = decodeURIComponent(batchesMatch[1]!);
+      if (!orch.ledger.getTask(id)) throw new Error(`任务不存在：${id}`);
+      const batches = readBatches(id).map((b) => ({
+        uploadTaskId: b.uploadTaskId,
+        at: b.at,
+        kind: b.kind,
+        status: b.status,
+        parts: b.titles.length,
+        clipIndices: b.clipIndices,
+        landed: b.landed.length,
+        missing: b.missing,
+        ...(b.aid ? { aid: b.aid } : {}),
+        ...(b.bvid ? { bvid: b.bvid } : {}),
+        ...(b.note ? { note: b.note } : {}),
+      }));
+      this.sendJson(res, 200, {
+        batches,
+        note: batches.length === 0 ? '本场还没有投稿批次记录（批次账从 2026-10-11 起才有）。' : '',
+      });
+      return;
+    }
+
+    /* ---------------- GET /api/clips/library（切片库：跨场次检索） ----------------
+     * 2026-10-11（优化第一批 P0-3）：稿件是长期资产，而切片一直只能"一场场翻任务"看 ——
+     * 复盘、复用、二次创作全被卡住。这里把所有场次的切片拉平成一张可检索的表。
+     * 只读；默认最多 200 条（上限 500），并如实回报总数与是否被截断。 */
+    if (p === '/api/clips/library' && method === 'GET') {
+      const q = (url.searchParams.get('q') ?? '').trim().toLowerCase();
+      const status = (url.searchParams.get('status') ?? '').trim();
+      const sort = (url.searchParams.get('sort') ?? 'score').trim();
+      const asc = url.searchParams.get('asc') === '1';
+      const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') ?? 200) || 200));
+      /* 播放/点赞：取表现数据里每个 bvid 的最新一行（与「稿件表现」页同源） */
+      const perf = new Map<string, { view?: number; like?: number; date?: string }>();
+      for (const row of orch.ledger.readPerformance({ sinceMs: Date.now() - 400 * 86400_000 }) as Array<Record<string, unknown>>) {
+        const bvid = typeof row['bvid'] === 'string' ? row['bvid'] : '';
+        if (!bvid) continue;
+        const prev = perf.get(bvid);
+        const date = String(row['date'] ?? '');
+        if (!prev || date >= String(prev.date ?? '')) {
+          perf.set(bvid, {
+            ...(typeof row['view'] === 'number' ? { view: row['view'] } : {}),
+            ...(typeof row['like'] === 'number' ? { like: row['like'] } : {}),
+            date,
+          });
+        }
+      }
+      const rows: Array<Record<string, unknown>> = [];
+      for (const t of orch.ledger.listTasks({ limit: 500 })) {
+        for (const c of orch.ledger.getClips(t.id)) {
+          if (status && c.status !== status) continue;
+          if (q) {
+            const hay = `${c.title} ${t.title} ${t.id} ${c.bvid ?? ''}`.toLowerCase();
+            if (!hay.includes(q)) continue;
+          }
+          const p = c.bvid ? perf.get(c.bvid) : undefined;
+          rows.push({
+            taskId: t.id,
+            taskTitle: t.title,
+            taskWhen: fmtLocal(Date.parse(t.createdAt)),
+            index: c.index,
+            title: c.title,
+            start: c.start,
+            end: c.end,
+            durationSec: Math.max(0, Math.round(c.end - c.start)),
+            score: c.score,
+            status: c.status,
+            selected: c.selected,
+            ...(c.bvid ? { bvid: c.bvid, url: `https://www.bilibili.com/video/${c.bvid}` } : {}),
+            ...(c.publishedAt ? { publishedAt: c.publishedAt } : {}),
+            ...(c.cutOutput && exists(c.cutOutput) ? { hasCut: true } : {}),
+            ...(typeof p?.view === 'number' ? { view: p.view } : {}),
+            ...(typeof p?.like === 'number' ? { like: p.like } : {}),
+            ...(c.blockedByTombstone ? { tombstone: true } : {}),
+            ...(c.degraded ? { degraded: true } : {}),
+            fixture: isFixtureTask(t),
+          });
+        }
+      }
+      const dir = asc ? 1 : -1;
+      const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : Number.NEGATIVE_INFINITY);
+      rows.sort((a, b) => {
+        if (sort === 'duration') return (num(a['durationSec']) - num(b['durationSec'])) * dir;
+        if (sort === 'view') return (num(a['view']) - num(b['view'])) * dir;
+        if (sort === 'like') return (num(a['like']) - num(b['like'])) * dir;
+        if (sort === 'time') return String(a['taskWhen']).localeCompare(String(b['taskWhen'])) * dir;
+        return (num(a['score']) - num(b['score'])) * dir;
+      });
+      const total = rows.length;
+      this.sendJson(res, 200, {
+        rows: rows.slice(0, limit),
+        total,
+        truncated: total > limit,
+        limit,
+        counts: {
+          published: rows.filter((r) => r['status'] === 'PUBLISHED').length,
+          submitted: rows.filter((r) => r['status'] === 'SUBMITTED').length,
+          candidate: rows.filter((r) => r['status'] === 'CANDIDATE').length,
+          failed: rows.filter((r) => r['status'] === 'FAILED').length,
+        },
+        note: '同一份台账的拉平视图：只读，点「试看」用系统播放器打开切片产物；「去这一场」跳到任务详情。',
+      });
+      return;
+    }
+
     /* ---------------- POST /api/preview-cut（试看：定位切片产物 + 系统播放器前台播放） ----------------
      *
      * 需求最终形态（用户第 4 轮）：
@@ -2237,7 +2634,10 @@ export class UiServer {
 
     /* ---------------- POST /api/performance/refresh ---------------- */
     if (p === '/api/performance/refresh' && method === 'POST') {
-      const r = await orch.refreshPerformance();
+      /* force=true 忽略"每日一次"（表现页的「强制重拉」）；结果原样透传 —— 界面必须显示 notes/noop，
+         否则用户点了刷新只看到"什么都没发生"（2026-10-14 实测反馈）。 */
+      const body = (await this.readBody(req).catch(() => ({}))) as { force?: boolean };
+      const r = await orch.refreshPerformance({ ...(body?.force ? { force: true } : {}) });
       this.sendJson(res, 200, r);
       return;
     }
@@ -2527,6 +2927,9 @@ export class UiServer {
       ...(p ? { progress: p } : {}),
       cost: t.cost,
       fullUpload: t.fullUpload,
+      /* ★ 2026-10-11：把「这是测试夹具」这件事一路带到界面（列表默认隐藏、成本统计排除），
+         口径来自 src/fixtures.ts 的 isFixtureTask —— 只此一处，避免列表和统计互相打架。 */
+      fixture: isFixtureTask(t),
     };
   }
 

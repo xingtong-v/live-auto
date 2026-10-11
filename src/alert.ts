@@ -516,8 +516,44 @@ export class Alerter {
     });
   }
 
-  async publishFailed(info: { taskId: string; title: string; reason: string }): Promise<void> {
+  /**
+   * 「已提交待确认」超时：投出去了、但 B站 侧一直没看到这个分P。
+   *
+   * 与 {@link publishFailed} 的区别：**这不是失败**（biliLive-tools 任务可能已成功、
+   * 只是 B站 分P 列表有延迟），所以不能报"投稿失败"误导用户去重投；
+   * 但也绝不能像以前那样只在日志里小声说一句 —— 实测有一条就这么静默躺了半小时，
+   * 用户是看着卡片问「这是投稿了吗」才发现的。
+   */
+  async publishUnconfirmed(info: {
+    taskId: string;
+    title: string;
+    minutes: number;
+    bvid?: string;
+    clipIndex?: number;
+  }): Promise<void> {
+    const where = info.bvid ? `目标稿件：https://www.bilibili.com/video/${info.bvid}` : '目标稿件：bvid 尚未反查到';
     await this.fire({
+      level: 'warn',
+      key: `publish-unconfirmed:${info.taskId}:${info.clipIndex ?? info.title}`,
+      title: `投稿未确认：${info.title}`,
+      body:
+        `切片《${info.title}》提交已 ${info.minutes} 分钟，但 B站 侧的稿件分P 列表里还没看到它。\n` +
+        `${where}\n` +
+        `**这不等于失败**：B站 分P 列表有延迟（实测可达 20 分钟），系统会继续每 5 分钟反查一次。\n` +
+        `请到创作中心核对这一条到底在不在：\n` +
+        `  · 在 → 不用管，反查确认后会自动变成「已发布」；\n` +
+        `  · 不在 → 在界面上对这一片点「投稿这一片」重投（重复投递有标题去重保护，不会造出重复分P）。`,
+      taskId: info.taskId,
+      at: nowIso(),
+      fields: {
+        等待时长: `${info.minutes} 分钟`,
+        ...(info.clipIndex !== undefined ? { 片段: `#${info.clipIndex}` } : {}),
+        ...(info.bvid ? { BV号: info.bvid } : {}),
+      },
+    });
+  }
+
+  async publishFailed(info: { taskId: string; title: string; reason: string }): Promise<void> {    await this.fire({
       level: 'error',
       key: `publish-failed:${info.taskId}`,
       title: `投稿失败：${info.title}`,
@@ -525,6 +561,22 @@ export class Alerter {
       taskId: info.taskId,
       at: nowIso(),
       fields: { 原因: truncate(info.reason, 400).text },
+    });
+  }
+
+  /**
+   * 场次结束的复盘摘要（P1-5）：短版正文由 src/recap.ts 的 recapPushText 生成。
+   * 刻意用 info 级别 + 每天一场一个 key：复盘是"知会"，不是"告警"，不该触发 error 通道的紧张感。
+   */
+  async taskRecap(info: { taskId: string; title: string; text: string }): Promise<void> {
+    await this.fire({
+      level: 'info',
+      key: `task-recap:${info.taskId}`,
+      title: `本场复盘：${info.title}`,
+      body: `${info.text}\n\n（可在「直播切片助手 → 任务 → 复盘报告」看完整版）`,
+      taskId: info.taskId,
+      at: nowIso(),
+      fields: { 场次: info.title },
     });
   }
 
