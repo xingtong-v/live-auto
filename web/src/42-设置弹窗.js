@@ -312,9 +312,12 @@ async function openCfg() {
         <select class="inp" id="c_asrProvider">
           <option value="bililive-tools" ${c.asr.provider === 'bililive-tools' ? 'selected' : ''}>云端（biliLive-tools → 阿里云 DashScope）：按时长计费，最快</option>
           <option value="local-funasr" ${c.asr.provider === 'local-funasr' ? 'selected' : ''}>本地 Fun-ASR-Nano（阿里云开源）：免费，同素材实测字错率 8.8%，慢约 5 倍</option>
-          <option value="whisper-cpp" ${c.asr.provider === 'whisper-cpp' ? 'selected' : ''}>本地 faster-whisper：免费，字错率约 17%（比 Fun-ASR 差一倍）</option>
+          <option value="whisper-cpp" ${c.asr.provider === 'whisper-cpp' ? 'selected' : ''}>本地 faster-whisper：免费，字错率约 17%（比 Fun-ASR 差一倍）—— 已被 Fun-ASR 压过，不推荐</option>
         </select>
-        <div class="hintline">本地引擎需要先建好环境：Fun-ASR 用 <span class="mono-sm">node tools/local-asr/setup-funasr.mjs</span>，whisper 用 <span class="mono-sm">.venv-asr</span>。本地跑不产生任何云端费用。</div></div>
+        <div class="hintline">本地引擎需要先建好环境：Fun-ASR 用 <span class="mono-sm">node tools/local-asr/setup-funasr.mjs</span>，whisper 用 <span class="mono-sm">.venv-asr</span>。本地跑不产生任何云端费用。</div>
+        <div class="hintline">两个<b>只改配置、界面上刻意没给开关</b>的项，连同实测结论写在这儿，免得你到处找：<br>
+          · <span class="mono-sm">asr.silenceTrim.enabled</span> 静音裁剪：实测 480.4 s → 468.2 s，<b>只省 12 秒</b>（字幕条数与覆盖完全一致）⇒ <b>默认关，不建议开</b>；<br>
+          · <span class="mono-sm">asr.worker.enabled</span> 转写放独立进程：实测 549.5 s vs 进程内 466.6 s，<b>慢约 18%</b>，换来的是"ASR 崩溃/OOM 不拖垮主链" ⇒ 要崩溃隔离就开，赶时间就关。</div></div>
       <div class="field"><label>Fun-ASR 设备</label>
         <select class="inp" id="c_funasrDevice">
           <option value="auto" ${c.asr.localFunasr.device === 'auto' ? 'selected' : ''}>auto（有 CUDA 就用）</option>

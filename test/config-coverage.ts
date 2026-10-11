@@ -98,6 +98,13 @@ section('4. 提示文案必须是原生 HTML（`**x**` 在界面上会原样显�
   ok('★ 提示文案里没有未渲染的 ** 星号（要用 <b> 就用标签）', bad.length === 0, bad.join(' ｜ '));
 }
 
+section('5. 被实测证伪/待验证的开关，必须在界面上写明结论（否则用户会凭直觉乱开）');
+{
+  ok('★ 静音裁剪写明「只省 12 秒、不建议开」', /只省 12 秒/.test(uiHtml) && /不建议开/.test(uiHtml));
+  ok('★ 转写独立进程写明「慢约 18%、换崩溃隔离」', /慢约 18%/.test(uiHtml) && /崩溃隔离/.test(uiHtml));
+  ok('★ whisper-cpp 标明「已被 Fun-ASR 压过，不推荐」', /不推荐/.test(uiHtml) && /差一倍/.test(uiHtml));
+}
+
 console.log('\n' + '─'.repeat(74));
 console.log(`\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);
 if (failures.length) {
