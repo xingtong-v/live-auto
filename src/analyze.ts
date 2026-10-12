@@ -772,28 +772,18 @@ export function sanitizeClips(
     });
   }
 
-  /* ★ 默认勾选收口：最多 N 个，按评分降序取头部。
-     为什么用相对排名而不是绝对分：绝对分跨场不可比，实测一场 14 个候选**全部** ≥7.0
-     （最低正好等于门槛 7.0、均值 7.4）⇒ 门槛一个都没挡住 ⇒ 14 个全被自动切、自动投。
-     相对排名保证"自动处理的是这场最值得的几个"，其余仍保留在 clips.json 里，
-     用户可在界面手动补勾（不丢信息，只是默认不选）。 */
-  const topN = Math.max(1, opts.autoSelectTopN);
-  const byScore = [...kept].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  const autoKeep = new Set(byScore.slice(0, topN).map((c) => c.index));
-  let unselectedByRank = 0;
-  for (const c of kept) {
-    if (c.selected && !autoKeep.has(c.index)) {
-      c.selected = false;
-      unselectedByRank++;
-    }
-  }
-  if (unselectedByRank > 0) {
-    warnings.push(
-      `默认勾选上限 ${topN} 个：另有 ${unselectedByRank} 个候选评分达标但超出上限，已改为**不默认勾选**` +
-        `（仍保留在候选列表里，可在界面上手动勾选后再投）`,
-    );
-  }
+  /* ★ 2026-10-12 语义调整（用户实测反馈）：
+     这里**不再**按排名把达标的候选改回未勾选。
 
+     旧行为：先按 `autoSelectScoreFloor` 给初值，再"只保留评分前 `autoSelectTopN` 个默认勾选"，
+     其余改成未勾选。后果是**静默**的 —— 实测一场 8 个候选全部 ≥6.9（9.7…8.0…7.0），
+     第 7 名（8.0）与第 8 名被取消勾选，而那句解释只进了内存里的 warnings，
+     既没落盘也没进日志、界面上看不到 ⇒ 用户"不知道为什么 8.0 没被选中"，只能手动补。
+
+     新行为：**勾选 = 只看分数门槛**（达标就勾上，语义单一）；
+     "自动投稿只投前 N 个"改由发布阶段决定（`daemon.ts` 的自动发布分支），
+     并且**必须留下可见痕迹**（日志 + 界面标注"达标但超出自动投稿上限"）。
+     这样"哪些自动投、哪些要人点一下"是明确的，不再是暗改。 */
   kept.sort((a, b) => a.start - b.start);
   // 重排 index 以保持与数组下标一致（UI 用 idx 做 PATCH 目标）
   kept.forEach((k, i) => {
@@ -1531,6 +1521,21 @@ function topNgrams(text: string, topN: number): string[] {
     .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
     .slice(0, topN)
     .map(([w]) => w);
+}
+
+/**
+ * 自动投稿的**取头部**（纯函数，便于单测）——
+ * 语义：`selected` 已经按分数门槛定好了；"自动投多少"是另一件事，
+ * 这里按评分降序取前 `limit` 个算作**自动投**，其余算**需要人点一下**。
+ *
+ * 为什么不是"取消勾选"：旧实现把超出上限的候选改回未勾选（静默），
+ * 用户看到的是一个"莫名其妙没被选中的 8.0"。现在只在这里**分类**，
+ * 由调用方决定怎么标注与提示 —— 不改变用户在界面上看到的勾选状态。
+ */
+export function splitAutoPublish<T extends { score?: number }>(selected: T[], limit: number): { auto: T[]; manual: T[] } {
+  const n = Math.max(1, Math.floor(limit));
+  const byScore = [...selected].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  return { auto: byScore.slice(0, n), manual: byScore.slice(n) };
 }
 
 /* ============================================================================

@@ -4,7 +4,7 @@
 const BOOT = window.__BOOT__ || { csrf: '', version: '?', roomId: '', platform: '' };
 
 /** UI 构建标记：在浏览器控制台里能看到，用来确认页面是不是最新的（避免缓存导致以为功能没做） */
-const UI_BUILD = 'ui-2026-10-14-archive-and-notes';
+const UI_BUILD = 'ui-2026-10-12-autopublish-split';
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));

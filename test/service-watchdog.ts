@@ -289,10 +289,23 @@ section('⑥ 非破坏性实跑：服务在跑时，守护脚本必须什么都�
     const mem = health.health?.memory;
     ok('★ /api/health 暴露进程内存（rss/heapUsed/heapLimit）', Boolean(mem && typeof mem.rssMB === 'number' && typeof mem.heapUsedMB === 'number' && typeof mem.heapLimitMB === 'number'), JSON.stringify(mem));
     ok('★ 堆上限已被抬高（默认约 4GB；启动参数带 8192 ⇒ 明显大于 4300MB）', Number(mem?.heapLimitMB ?? 0) > 4300, String(mem?.heapLimitMB));
-    const today = new Date().toLocaleDateString('sv-SE');
-    const appLog = path.join(ROOT_DIR, 'data', 'logs', `live_auto-${today}.jsonl`);
-    const appText = fs.existsSync(appLog) ? fs.readFileSync(appLog, 'utf8') : '';
-    ok('★ 应用日志里有内存基线行（崩溃前能看到爬升）', /内存：RSS \d+MB · 堆 \d+\/\d+MB/.test(appText), appText.split('\n').filter((l) => l.includes('内存：')).slice(-1)[0]?.slice(0, 140) ?? '(没有内存行)');
+    /* 读**最新的**应用日志，而不是"按今天算的那个文件名"：
+       内存基线行每 5 分钟才写一行（启动时也写一行），而刚过本地零点的那几分钟里，
+       新一天的文件刚建、还没有内存行 ⇒ 旧写法在跨零点时会假红（2026-10-13 00:00 实测踩到）。
+       断言的本意是"崩溃前能看到内存爬升"，任何最近的应用日志都能满足。 */
+    const logDir = path.join(ROOT_DIR, 'data', 'logs');
+    const newestAppLog = fs
+      .readdirSync(logDir)
+      .filter((f) => /^live_auto-.*\.jsonl$/.test(f))
+      .map((f) => ({ f, m: fs.statSync(path.join(logDir, f)).mtimeMs }))
+      .sort((a, b) => b.m - a.m)[0];
+    const appLog = newestAppLog ? path.join(logDir, newestAppLog.f) : '';
+    const appText = appLog && fs.existsSync(appLog) ? fs.readFileSync(appLog, 'utf8') : '';
+    ok(
+      '★ 应用日志里有内存基线行（崩溃前能看到爬升）',
+      /内存：RSS \d+MB · 堆 \d+\/\d+MB/.test(appText),
+      `${newestAppLog?.f ?? '(没有应用日志)'}：${appText.split('\n').filter((l) => l.includes('内存：')).slice(-1)[0]?.slice(0, 120) ?? '(没有内存行)'}`,
+    );
   }
 }
 

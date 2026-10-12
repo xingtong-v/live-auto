@@ -37,7 +37,7 @@ import type { Ledger } from './ledger.ts';
 import { ledger as defaultLedger } from './ledger.ts';
 import type { Alerter } from './alert.ts';
 import { Alerter as DefaultAlerter } from './alert.ts';
-import { Analyzer, persistAnalysis, PromptStore } from './analyze.ts';
+import { Analyzer, persistAnalysis, PromptStore, splitAutoPublish } from './analyze.ts';
 import { AsrCache, Transcriber, isDryRunPaymentRejection, type AsrMediaAdapter } from './asr.ts';
 import { planSegmentCalls } from './media-plan.ts';
 import { transcribeInWorker } from './asr-worker-client.ts';
@@ -1499,7 +1499,30 @@ export class Orchestrator {
       }
 
       /* ================= 阶段 4/5：CLIPPED → PUBLISHED ================= */
-      return await this.publishStage(taskId, log);
+      /* ★ 自动投稿的"取头部"（2026-10-12 语义调整，用户实测反馈）：
+         `selected` 现在**只表示分数达标**（完整集合）；"自动投多少"由 `clip.autoSelectTopN` 决定。
+         超出上限的那部分**不再静默取消勾选**（用户此前只看到"8.0 没被选中"，不知道为什么），
+         而是：临时摘掉 → 只投头部 → finally 原样恢复，并留一条写明分数的日志。 */
+      const autoLimit = cfg.clip.autoSelectTopN;
+      const split = splitAutoPublish(selected, autoLimit);
+      if (split.manual.length > 0) {
+        log.warn(
+          `自动投稿上限 ${autoLimit}：本场达标 ${selected.length} 个，自动投分数前 ${split.auto.length} 个` +
+            `（${split.auto.map((c) => c.score).join('/')}）；另有 ${split.manual.length} 个保持勾选但需你手动发布` +
+            `（${split.manual.map((c) => c.score).join('/')}）`,
+        );
+        for (const c of split.manual) this.ledger.setClipStatus(taskId, c.index, c.status, { selected: false });
+      }
+      try {
+        return await this.publishStage(taskId, log);
+      } finally {
+        /* 原样恢复（按**当前**状态回写，别用过期的 c.status —— 期间它可能已从 CANDIDATE 变成 CUT）：
+           界面上的"勾选"始终等于"分数达标"，不因自动投稿的取头部而改变。 */
+        for (const c of split.manual) {
+          const now = this.ledger.getClip(taskId, c.index);
+          if (now) this.ledger.setClipStatus(taskId, c.index, now.status, { selected: true });
+        }
+      }
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e));
       /* 不是 StageError 时**不能**一律写 UNKNOWN / internal —— 那等于把报告里最有用的

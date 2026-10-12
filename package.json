@@ -89,6 +89,7 @@
     "media-plan-test": "node test/media-plan.ts",
     "asr-worker-test": "node test/asr-worker.ts",
     "worker-fault-live": "node --experimental-strip-types tools/local-asr/worker-fault-live.ts",
+    "footprint": "node --experimental-strip-types tools/local-asr/footprint.ts",
     "build:ui": "node tools/ui-modules.ts --build",
     "check:ui": "node tools/ui-modules.ts --check",
     "segment-danmaku-test": "node test/segment-danmaku.ts",
@@ -111,7 +112,8 @@
     "guard": "node tools/guard.ts",
     "pre-transcribe-test": "node test/pre-transcribe.ts",
     "pre-transcribe-tick-test": "node test/pre-transcribe-tick.ts",
-    "ui-shared-usage-test": "node test/ui-shared-usage.ts"
+    "ui-shared-usage-test": "node test/ui-shared-usage.ts",
+    "auto-publish-split-test": "node test/auto-publish-split.ts"
   },
   "dependencies": {
     "fast-xml-parser": "^5.2.5",

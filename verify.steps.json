@@ -36,6 +36,11 @@
       "fast": false
     },
     {
+      "name": "auto-publish-split-test",
+      "cmd": "npm run auto-publish-split-test",
+      "fast": true
+    },
+    {
       "name": "config-test",
       "cmd": "npm run config-test",
       "fast": false

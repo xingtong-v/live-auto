@@ -213,7 +213,8 @@ async function openCfg() {
     <p class="gdesc">控制 LLM 每场产出多少候选、哪些默认勾选；单场可在任务页临时覆盖。</p>
     <div class="fields">
       <div class="field"><label>每场最多候选切片数</label><input class="inp num" id="c_maxCandidates" value="${c.clip.maxCandidates}"></div>
-      <div class="field"><label>推荐阈值（低于此分默认不勾选）</label><input class="inp num" id="c_autoSelectScoreFloor" value="${c.clip.autoSelectScoreFloor}"></div>
+      <div class="field"><label>推荐阈值（低于此分默认不勾选）</label><input class="inp num" id="c_autoSelectScoreFloor" value="${c.clip.autoSelectScoreFloor}">
+        <div class="hintline">两个闸门分工（2026-10-12 澄清）：<b>这一项只管"勾不勾"</b> —— 分数 ≥ 它就会被勾上；<b>自动投多少</b>另由 <span class="mono-sm">clip.autoSelectTopN</span>（当前 ${c.clip.autoSelectTopN}，本页没有控件，改 config.json）决定：按评分降序只自动投前 N 个，超出部分仍保持勾选、但需要你点一下发布（会写一条含分数的日志）。想"达标就全投"就把它调大（99 = 实质不设限）。</div></div>
       <div class="field"><label>片段时长范围（秒）</label><div class="ctl">
         <input class="inp num" id="c_minDurationSec" value="${c.clip.minDurationSec}"><span style="color:var(--text-3)">—</span>
         <input class="inp num" id="c_maxDurationSec" value="${c.clip.maxDurationSec}"></div></div>

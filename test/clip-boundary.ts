@@ -339,11 +339,18 @@ section('场景 9：切片不得跨越分P 边界');
   }
 }
 
-/* ============================ 场景 10：默认勾选收口 ============================
- * 实测教训：一场 59 分钟直播 LLM 给出 14 个候选、**全部 ≥ 7.0**（最低正好卡在门槛 7.0），
- * 绝对门槛一个都没挡住 ⇒ 14 个全部自动切片并发布。改用「按评分降序取前 N 个」收口。
+/* ============================ 场景 10：勾选只看分数门槛 ============================
+ * 2026-10-12 语义调整（用户实测反馈）：这里原先验证"按评分降序只默认勾选前 N 个"。
+ * 但那实现是**静默**的 —— 解释只 push 进内存里的 warnings（不落盘、不进日志、界面看不到）：
+ * 实测一场 8 个候选全部 ≥6.9（9.7…8.0…7.0）时，第 7 名的 8.0 被取消勾选，
+ * 用户"不知道为什么 8.0 没被选中"，只能手动补勾。
+ *
+ * 现在拆成两件事：
+ *   · **勾选** = 只看 `autoSelectScoreFloor`（本场景验证）；
+ *   · **自动投稿数量** = 发布阶段按 `splitAutoPublish` 取评分前 N 个 + 写日志留痕
+ *     （见 test/auto-publish-split.ts）。
  */
-section('场景 10：默认勾选按相对排名收口（最多 N 个）');
+section('场景 10：勾选只看分数门槛（数量上限只管自动投稿）');
 {
   /* 6 个互不重叠的候选，评分故意拉开；门槛设 6 让它们全部"达标" */
   const many = [
@@ -356,22 +363,17 @@ section('场景 10：默认勾选按相对排名收口（最多 N 个）');
   ];
   const base10 = { ...BASE, autoSelectScoreFloor: 6, transcriptSegments: [] };
 
-  // ① 上限 3 → 只勾选评分最高的 3 个
-  {
-    const r = sanitizeClips(many, { ...base10, autoSelectTopN: 3 });
+  // ① 无论数量上限取多少，达标的都应被勾上（不再按排名取消勾选）
+  for (const n of [3, 99]) {
+    const r = sanitizeClips(many, { ...base10, autoSelectTopN: n });
     const sel = r.clips.filter((c) => c.selected);
-    ok('保留全部 6 个候选（不丢信息）', r.clips.length === 6, `实际 ${r.clips.length}`);
-    ok('只默认勾选 3 个', sel.length === 3, `实际 ${sel.length}`);
-    const scores = sel.map((c) => c.score).sort((a, b) => b - a);
-    ok('勾选的是评分最高的 3 个', scores.join(',') === '9,8.5,8', `实际 ${scores.join(',')}`);
-    ok('给出了收口警告', r.warnings.some((w) => /默认勾选上限/.test(w)), r.warnings.join(' | ').slice(0, 120));
-  }
-
-  // ② 上限大于候选数 → 全部勾选（不误伤）
-  {
-    const r = sanitizeClips(many, { ...base10, autoSelectTopN: 99 });
-    ok('上限足够时不收口', r.clips.filter((c) => c.selected).length === 6, `实际 ${r.clips.filter((c) => c.selected).length}`);
-    ok('未产生收口警告', !r.warnings.some((w) => /默认勾选上限/.test(w)));
+    ok(`保留全部 6 个候选（上限 ${n}，不丢信息）`, r.clips.length === 6, `实际 ${r.clips.length}`);
+    ok(`★ 达标的 6 个全部勾选（上限 ${n} 不再影响勾选状态）`, sel.length === 6, `实际 ${sel.length}`);
+    ok(
+      `上限 ${n} 时不再产生"收口"警告（该判断已移出分析阶段）`,
+      !r.warnings.some((w) => /默认勾选上限/.test(w)),
+      r.warnings.join(' | ').slice(0, 120),
+    );
   }
 
   // ③ 绝对门槛仍然有效（低于门槛的本就不该勾选）
