@@ -28,4 +28,4 @@
 
 - [x] 2026-10-11T09:40:35Z | session:9aa24b6c-aef | 代码层清理：删 5 个遗留符号（86 行）+ 死代码/静默异常分级报告 src/analyze.ts src/daemon.ts src/danmaku.ts src/ledger.ts docs/implementation-report.md | 文件：
 
-- [ ] 2026-10-12T16:09:33Z | session:9aa24b6c-aef | 自动投稿语义澄清：勾选看门槛、投稿看数量上限 src/analyze.ts src/daemon.ts src/config.ts test/auto-publish-split.ts test/clip-boundary.ts | 文件：
+- [x] 2026-10-12T16:09:33Z | session:9aa24b6c-aef | 自动投稿语义澄清：勾选看门槛、投稿看数量上限 src/analyze.ts src/daemon.ts src/config.ts test/auto-publish-split.ts test/clip-boundary.ts | 文件：
