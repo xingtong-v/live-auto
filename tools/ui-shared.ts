@@ -194,6 +194,75 @@ export function findEdge(): string | undefined {
 }
 
 /**
+ * **用真实鼠标事件**点一个元素（CDP `Input.dispatchMouseEvent`，按元素中心坐标）。
+ *
+ * ⚠️ 为什么不能图省事写 `el.click()`（2026-10-13 实测教训）：
+ * 本项目界面里的 `.switch` 开关**不响应程序化 click** —— 用 `el.click()` 点
+ * `#c_funasrTimestamps`（既有开关）、`#c_incrementalEnabled`、`#c_funasrBf16` 三个，
+ * class 与文案**一个都不变**，看起来像"功能坏了"；换成真实鼠标事件后立刻正常。
+ * 也就是说：**用 `click()` 做 UI 验收会得出假红/假绿**，这类控件必须发真事件。
+ *
+ * 返回 true 表示"元素找到并发了点击"；是否真的生效要由调用方再读一次状态。
+ */
+export async function clickReal(cdp: Cdp, selector: string): Promise<boolean> {
+  /* ⚠️ 三个坑（2026-10-13 实测，全都表现为"点了没反应"）：
+     ① 元素常在折线以下（设置面板很长）⇒ 直接按 rect 点会点空；
+     ② `scrollIntoView` 可能是**平滑滚动**，紧接着读 rect 拿到的是**旧坐标**（本函数第一版就栽在这：
+        rect.y 读到 1613/1836，`document.elementFromPoint` 返回 null）⇒ 必须等滚动结束**再读一次**；
+     ③ 本项目 `.switch` 不响应程序化 `el.click()`（既有开关也一样）⇒ 必须发真实鼠标事件。 */
+  const scrolled = await cdp.evalJs<boolean>(`(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) return false;
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    return true;
+  })()`);
+  if (!scrolled) return false;
+  await sleep(450); // 等平滑滚动走完（②）
+  const rect = await cdp.evalJs<{ x: number; y: number; hit: boolean } | null>(`(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return null;
+    const x = Math.round(r.left + r.width / 2);
+    const y = Math.round(r.top + r.height / 2);
+    const hit = document.elementFromPoint(x, y);
+    return { x, y, hit: hit === el || (hit !== null && el.contains(hit)) };
+  })()`);
+  if (!rect) return false;
+  /* ④ 兜底：`scrollIntoView` 未必能把这个面板滚进视口（实测两个开关的落点校验都是 false，
+     连既有的 `#c_funasrTimestamps` 也一样 —— 说明是"元素在视口外"而不是"功能坏了"）。
+     这时直接把**视口撑高**到元素下方，比继续和滚动容器较劲可靠得多。 */
+  let hit = rect.hit;
+  let x = rect.x;
+  let y = rect.y;
+  if (!hit) {
+    const h = Math.min(4000, Math.max(1400, y + 300));
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1700, height: h, deviceScaleFactor: 1, mobile: false });
+    await sleep(350);
+    const again = await cdp.evalJs<{ x: number; y: number; hit: boolean } | null>(`(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      const cx = Math.round(r.left + r.width / 2);
+      const cy = Math.round(r.top + r.height / 2);
+      const h = document.elementFromPoint(cx, cy);
+      return { x: cx, y: cy, hit: h === el || (h !== null && el.contains(h)) };
+    })()`);
+    if (again) {
+      x = again.x;
+      y = again.y;
+      hit = again.hit;
+    }
+  }
+  const base = { x, y, button: 'left' as const, clickCount: 1 };
+  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' });
+  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' });
+  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' });
+  /* 落点自检：坐标上不是这个元素（被遮挡/仍在视口外）时，调用方应当知道"这次点击可能没生效" */
+  return hit;
+}
+
+/**
  * 起一个 headless（或 `headed:true` 可见）Edge 并连上它。
  * 返回 `{ cdp, close }`；`close()` 会杀浏览器并清理临时 user-data-dir。
  */

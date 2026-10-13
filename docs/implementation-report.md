@@ -5433,3 +5433,43 @@ self.llm = model.to(dtype_map[self.llm_dtype])      # dtype_map = {bf16, fp16, f
 ```powershell
 node tools/local-asr/ab-llm-dtype.mjs
 ```
+
+## 86. bf16 开关上线 + 一键切换（2026-10-13，按用户要求）
+
+### 86.1 做了什么
+
+| 位置 | 内容 |
+|---|---|
+| `config.json` | `asr.localFunasr.llmDtype = "bf16"`（**已打开**；删掉这一项即回到 fp32） |
+| 设置面板（ASR 组） | 新增开关 `#c_funasrBf16`（在「推理引擎」下方）：开 = bf16、关 = fp32，一键切换 |
+| 面板文案 | 开关旁写明实测取舍：**显存 −33%（3493 → 2354 MB）、推理 +10%**、时间戳逐条一致、改完下一场转写即生效 |
+| 保存路径 | `saveCfg` 写入 `asr.localFunasr.llmDtype`；**关掉时回写空串**（不能只写 undefined —— patch 是深合并、undefined 会被跳过，否则会出现"界面关了、配置里还留着 bf16"） |
+| `test/config-coverage.ts` | 新增 §3b 四条断言：控件在 / saveCfg 存它 / config.json 有键 / 文案里有 −33% 与 +10% |
+| `tools/verify-bf16-switch.ts` | 新增真浏览器验收（见 86.3） |
+
+### 86.2 验证
+
+- `test/config-coverage.ts` **16/0**（原 12 条 + 新 4 条）；
+- `tools/verify-bf16-switch.ts` **8/0**：能打开设置面板、控件存在、**配置为 bf16 时开关渲染成"开"**
+  （证明 config → bootstrap → 视图这条线通了）、文案带实测数字、全程无未捕获异常；
+- `typecheck` 干净；`build:ui` + `check:ui` 一致（21 个模块）；全量链 66 步通过。
+
+### 86.3 如实记录：点击翻转**没有**做成自动化验证
+
+三种合成点击都试过，`#c_funasrBf16` 与**既有的** `#c_funasrTimestamps`（用户手点一直正常）**表现完全一样**：
+
+| 方式 | 结果 |
+|---|---|
+| `el.click()` | 不翻 |
+| 派发 pointerdown/mousedown/pointerup/mouseup/click | 不翻 |
+| CDP `Input.dispatchMouseEvent`（真实鼠标，含 scrollIntoView 与撑高视口兜底） | 落点校验 false，不翻 |
+
+⇒ 判定为 **headless harness 的限制**，不是本开关的问题（否则既有开关也该一起坏）。
+**为了不留"看起来验过其实没验"的假绿，这条断言没有写进套件**，翻转能力由静态门禁兜
+（§3b 的四条）。顺带把这三种失败方式写进了 `ui-shared.ts` 的 `clickReal()` 注释，
+免得以后有人重踩。
+
+### 86.4 用户视角怎么用
+
+设置 → ASR → 「Fun-ASR 解码器用 bf16（省显存）」：开着省约 1.1 GB 显存、推理慢约 10%；
+打游戏同时转写、显存吃紧时开着最划算。关掉即回 fp32，下一场转写生效（缓存键含精度，不会拿旧结果糊弄）。

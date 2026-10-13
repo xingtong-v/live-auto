@@ -78,6 +78,27 @@ section('2. 反过来：saveCfg 读的控件必须真的存在');
   ok('★ saveCfg 里没有"读了但控件不存在"的死引用', ghosts.length === 0, ghosts.join(', '));
 }
 
+section('3b. 解码器精度开关（bf16）的端到端三件套');
+{
+  /* 2026-10-13 加。这个开关踩过一次"看着开了其实没生效"：
+     llm_dtype 曾传在 generate() 里、而 funasr 只在构造模型时读它 ⇒ 静默忽略。
+     所以这里钉住四件事：控件在、saveCfg 存它、config.json 有它、
+     且**旁边写清实测数字**（省 33% 显存、推理 +10%）——否则用户没法做取舍。 */
+  const cfg = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'config.json'), 'utf8')) as {
+    asr?: { localFunasr?: Record<string, unknown> };
+  };
+  ok('① 产物里有 #c_funasrBf16 开关', /id="c_funasrBf16"/.test(uiHtml));
+  ok('② saveCfg 里真的存它（asr.localFunasr.llmDtype，关掉时回写空串）', /llmDtype:\s*on\('#c_funasrBf16'\)\s*\?\s*'bf16'\s*:\s*''/.test(saveText));
+  ok(
+    '③ config.json 里真有这个键（不然存了也没人读）',
+    cfg.asr?.localFunasr !== undefined && 'llmDtype' in (cfg.asr.localFunasr as object),
+  );
+  ok(
+    '④ 开关旁边写了实测取舍（−33% 显存 / +10% 推理）',
+    /id="c_funasrBf16"[\s\S]{0,900}?−33%/.test(uiHtml) && /id="c_funasrBf16"[\s\S]{0,900}?\+10%/.test(uiHtml),
+  );
+}
+
 section('3. 新增开关的端到端三件套（以边录边转写为例）');
 {
   const cfg = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'config.json'), 'utf8')) as { asr?: Record<string, unknown> };

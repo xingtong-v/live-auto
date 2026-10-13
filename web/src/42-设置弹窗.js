@@ -331,6 +331,10 @@ async function openCfg() {
           <option value="pytorch" ${c.asr.localFunasr.engine === 'pytorch' ? 'selected' : ''}>pytorch（实测 4 小时素材约 43 分钟）</option>
           <option value="vllm" ${c.asr.localFunasr.engine === 'vllm' ? 'selected' : ''}>vllm（官方 bench 快 16 倍，需另装）</option>
         </select></div>
+      <div class="field full"><label>Fun-ASR 解码器用 bf16（省显存）</label><div class="inline-switch">
+        <button class="switch sm ${c.asr.localFunasr.llmDtype === 'bf16' ? 'on' : ''}" id="c_funasrBf16"></button>
+        <span>${c.asr.localFunasr.llmDtype === 'bf16' ? '开启（显存 −33%，推理 +10%）' : '关闭（fp32 默认，显存多占约 1.1 GB）'}</span></div>
+        <div class="hintline">同素材实测（300 秒，GPU 空闲）：峰值显存 <b>3493 → 2354 MB（−33%）</b>，墙钟 87.8 → 89.5 秒（+2%），字幕 130 条中 128 条逐字相同、2 条同音字差异，<b>时间戳逐条完全一致</b> ⇒ 切片边界不受影响。打游戏同时转写、显存吃紧时最有用。改完<b>下一场转写即生效</b>（缓存键含精度，不会拿旧结果糊弄）。</div></div>
       <div class="field"><label>Fun-ASR 每句字数上限</label><input class="inp num" id="c_funasrMaxChars" value="${c.asr.localFunasr.maxCharsPerCue}">
         <div class="hintline">按标点切句时一条字幕最多几个字，与字幕排版保持一致</div></div>
       <div class="field"><label>Fun-ASR 模型路径（Python）</label><input class="inp" id="c_funasrPython" value="${esc(c.asr.localFunasr.pythonPath || '')}" placeholder="留空 = 项目内 .venv-funasr"></div>
@@ -622,6 +626,9 @@ function bindCfg() {
      否则"点了没反应"会被当成按钮坏了（这个坑本项目在其它开关上踩过）。 */
   tgl('#c_funasrHotwords', (on, el) => el.nextElementSibling.textContent = on ? '开启（推荐）' : '关闭');
   tgl('#c_funasrTimestamps', (on, el) => el.nextElementSibling.textContent = on ? '开启（时间戳偏差 ±0.2s，推荐）' : '关闭（退化成 VAD 段粒度，偏差 ±2s）');
+  /* 解码器精度开关：关 = 不发这个字段（fp32 默认）。文案跟着状态变，顺带把实测数字写在脸上 ——
+     "省 1.1 GB 显存、推理慢 10%"是这个开关唯一的取舍，用户不需要去翻文档。 */
+  tgl('#c_funasrBf16', (on, el) => el.nextElementSibling.textContent = on ? '开启（显存 −33%，推理 +10%）' : '关闭（fp32 默认，显存多占约 1.1 GB）');
   /* 边录边转写（P1-6）：文案跟着状态变，并在"刚打开"时明确提示要重启 ——
      否则用户点了、看着是开的，而预转写循环要等下次启动才创建（这一点在实现里是刻意的）。 */
   tgl('#c_incrementalEnabled', (on, el) => el.nextElementSibling.textContent = on ? '开启（录完只剩最后一段要转）· 需重启服务才生效' : '关闭（等整段录完才开始转）');
@@ -840,6 +847,10 @@ async function saveCfg(force) {
            漏掉就等于"界面上看着还开着、存下去却丢了"，用户下次看配置会发现它自己关了。 */
         hotwordsEnabled: on('#c_funasrHotwords'),
         hotwordsMax: num('#c_funasrHotwordsMax'),
+        /* 关掉时回写空串（= 不设这一项，执行器按 fp32 默认跑）。
+           不能只写 `undefined`：patch 是深合并、undefined 会被跳过，
+           于是"界面上关了、配置里还留着 bf16" —— 正是注释里说的那种自相矛盾。 */
+        llmDtype: on('#c_funasrBf16') ? 'bf16' : '',
       },
     },
     llm: {
