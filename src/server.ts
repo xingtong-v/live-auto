@@ -56,6 +56,20 @@ const STAGE_ORDER: Stage[] = ['IDLE', 'RECORDED', 'TRANSCRIBED', 'ANALYZED', 'CL
 const STAGE_LABELS = ['录制', '转写', '分析', '切片', '发布'];
 
 /**
+ * biliLive-tools 的配置文件路径（只用于**只读**读取，例如取它的直播间房间号）。
+ * Windows 走 %APPDATA%；其它平台按 Electron 的惯例给两个候选。找不到就抛错，由调用方降级。
+ */
+function bililiveConfigPath(): string {
+  const cands = [
+    process.env['APPDATA'] ? path.join(process.env['APPDATA'], 'biliLive-tools', 'appConfig.json') : '',
+    process.env['HOME'] ? path.join(process.env['HOME'], 'Library', 'Application Support', 'biliLive-tools', 'appConfig.json') : '',
+    process.env['HOME'] ? path.join(process.env['HOME'], '.config', 'biliLive-tools', 'appConfig.json') : '',
+  ].filter(Boolean);
+  for (const c of cands) if (fs.existsSync(c)) return c;
+  throw new Error('找不到 biliLive-tools 的配置文件（appConfig.json）—— 它装了吗？或者装在别的用户下？');
+}
+
+/**
  * 状态中文映射（2026-10-13 加，用户反馈"状态英文有时候看不明白"）。
  *
  * 取值与文案**照抄 src/types.ts 的联合类型与注释** —— 那里本来就是中文写的，
@@ -1523,6 +1537,38 @@ export class UiServer {
         /* 与监控页同一个原则：任何一块坏了都只降级成空，不让整页 500 */
         this.sendJson(res, 200, { generatedAt: new Date().toISOString(), degraded: (e as Error).message, recording: [], preTranscribe: [], preTranscribeLog: [], asrHealth: [], timeline: [] });
       }
+      return;
+    }
+
+    /* ---------------- GET /api/llc-rooms ----------------
+     * 从 biliLive-tools 的配置里读**直播间房间号**（用户 2026-10-13 要求"直接获取"而不是手打）。
+     * 来源是它的 appConfig.json 里 `webhook.rooms`（键就是房间号）—— 实测本机有两个房间，
+     * 其中一个还带备注（"腿"），所以顺带把备注/是否开启/是否自动合并分P 一起给出来，
+     * 让用户能认出"哪个是我要的那个直播间"。
+     * 只读、不改任何东西；界面拿到后**填进输入框**，仍由用户点保存（不偷偷改配置）。 */
+    if (p === '/api/llc-rooms' && method === 'GET') {
+      const out: Array<Record<string, unknown>> = [];
+      let source = '';
+      try {
+        const cfgPath = bililiveConfigPath();
+        source = cfgPath;
+        const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as {
+          webhook?: { rooms?: Record<string, { id?: string; remark?: string; open?: boolean; autoPartMerge?: boolean; danmu?: boolean }> };
+        };
+        for (const [roomId, v] of Object.entries(raw.webhook?.rooms ?? {})) {
+          out.push({
+            roomId: String(v?.id ?? roomId),
+            remark: String(v?.remark ?? ''),
+            open: v?.open !== false,
+            autoPartMerge: v?.autoPartMerge === true,
+            danmu: v?.danmu === true,
+          });
+        }
+      } catch (e) {
+        this.sendJson(res, 200, { rooms: [], error: (e as Error).message, current: cfg.room.roomId, source });
+        return;
+      }
+      this.sendJson(res, 200, { rooms: out, current: cfg.room.roomId, source });
       return;
     }
 

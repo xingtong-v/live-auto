@@ -196,6 +196,13 @@ export function findEdge(): string | undefined {
 /**
  * **用真实鼠标事件**点一个元素（CDP `Input.dispatchMouseEvent`，按元素中心坐标）。
  *
+ * ⚠️ 2026-10-13 **更正**：我最初把"程序化 click 点不动 .switch"归因成"这类控件不响应合成点击"，
+ * 并在下面写了"必须发真实鼠标事件"——**那个结论是错的**。真正的原因是设置面板的 `bindCfg()`
+ * 抛了异常（配置差异里有个 leaf 是 `b:a`，拼出非法选择器 `#c_b:a`）⇒ **所有绑定都没装上** ⇒
+ * 点谁都没反应。修好绑定后，`el.click()` 对 .switch 一样有效（真机验收已验证翻转）。
+ * 保留本函数仍然有价值：**落点自检**（元素在视口外/被遮挡时如实返回 false），这比盲点一下更可靠。
+ *
+ * 原注释（已证明是误判，留档）：
  * ⚠️ 为什么不能图省事写 `el.click()`（2026-10-13 实测教训）：
  * 本项目界面里的 `.switch` 开关**不响应程序化 click** —— 用 `el.click()` 点
  * `#c_funasrTimestamps`（既有开关）、`#c_incrementalEnabled`、`#c_funasrBf16` 三个，

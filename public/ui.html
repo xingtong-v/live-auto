@@ -3697,7 +3697,19 @@ function enhanceCfgPanel() {
              ${diff.items
                .map((it) => {
                  const leaf = String(it.path).split('.').pop() || '';
-                 const target = body.querySelector(`#c_${leaf}`) ? `c_${leaf}` : '';
+                 /* ★ 2026-10-13 真 bug：配置路径的最后一段不一定能当选择器用。
+                    实测某条差异的 leaf 是 `b:a`（含冒号）⇒ `querySelector('#c_b:a')` 抛
+                    "not a valid selector" ⇒ **bindCfg() 在这一行就炸了** ⇒ 设置面板里所有交互控件
+                    （开关/按钮/标签）全都没绑上（真机验收里表现为"点了没反应"，我一度误判成"测试环境限制"）。
+                    修法：① leaf 收敛成只含 [A-Za-z0-9_-]；② 用 getElementById 判存在（不做选择器解析，天然安全）；
+                    ③ try/catch 兜底 —— 一个坏数据绝不允许带崩整个面板的绑定。 */
+                 const safeLeaf = leaf.replace(/[^A-Za-z0-9_-]/g, '');
+                 let target = '';
+                 try {
+                   if (safeLeaf && document.getElementById(`c_${safeLeaf}`)) target = `c_${safeLeaf}`;
+                 } catch {
+                   target = '';
+                 }
                  return `<div style="white-space:nowrap">${
                    target ? `<button class="linkbtn" data-cfgjump="${esc(target)}">${esc(it.path)}</button>` : `<span class="mono-sm">${esc(it.path)}</span>`
                  } <span style="color:var(--text-3)">${it.kind === 'added' ? `新增：${esc(it.to ?? '')}` : it.kind === 'removed' ? `已删除（原 ${esc(it.from ?? '')}）` : `${esc(it.from ?? '')} → <b>${esc(it.to ?? '')}</b>`}</span></div>`;
@@ -3807,7 +3819,13 @@ async function openCfg() {
   <div class="group"><h3>直播间与录制</h3>
     <p class="gdesc">检查间隔越短，录制结束后越快被感知。轮询在任何情况下都保留 —— 它是可靠兜底。</p>
     <div class="fields">
-      <div class="field"><label>B站直播间房间号</label><input class="inp" id="c_roomId" value="${esc(c.room.roomId)}"></div>
+      <div class="field"><label>B站直播间房间号</label>
+        <div class="ctl">
+          <input class="inp" id="c_roomId" value="${esc(c.room.roomId)}">
+          <button class="btn-sm" id="btnFetchRooms" title="从 biliLive-tools 的录制配置（webhook.rooms）里读房间号，不用手打">从 biliLive-tools 读取</button>
+        </div>
+        <div class="hintline" id="roomPickHint">点右边按钮可以直接列出 biliLive-tools 里配好的直播间（含备注），选中即填入上面的输入框 —— 仍要你点「保存」才会生效。</div>
+      </div>
       <div class="field"><label>platform（必须首字母大写）</label><input class="inp" id="c_platform" value="${esc(c.room.platform)}" readonly>
         <div class="hintline">写成 bilibili 会<b>静默返回空数组</b>，触发永不生效（陷阱 #1）</div></div>
       <div class="field"><label>检查开播间隔（秒）</label><input class="inp num" id="c_pollIntervalSec" value="${c.room.pollIntervalSec}"></div>
@@ -4241,6 +4259,49 @@ function bindCfg() {
   /* 解码器精度开关：关 = 不发这个字段（fp32 默认）。文案跟着状态变，顺带把实测数字写在脸上 ——
      "省 1.1 GB 显存、推理慢 10%"是这个开关唯一的取舍，用户不需要去翻文档。 */
   tgl('#c_funasrBf16', (on, el) => el.nextElementSibling.textContent = on ? '开启（显存 −33%，推理 +10%）' : '关闭（fp32 默认，显存多占约 1.1 GB）');
+  /* 「从 biliLive-tools 读取房间号」（2026-10-13 用户要求：不要手打）。
+     只读取、只填输入框 —— 不自动保存（配置的写入仍由「保存」按钮走同一条路，行为可预期）。 */
+  {
+    const b = $('#btnFetchRooms');
+    if (b) {
+      b.onclick = async () => {
+        const hint = $('#roomPickHint');
+        const box = $('#c_roomId');
+        if (!hint || !box) return;
+        hint.textContent = '读取中…';
+        try {
+          const r = await (await fetch('/api/llc-rooms')).json();
+          const rooms = r.rooms || [];
+          if (!rooms.length) {
+            hint.innerHTML = '没读到房间号：' + esc(r.error || '（biliLive-tools 里还没配直播间）') + '。可以在它的「设置 → 录制」里先添加直播间。';
+            return;
+          }
+          if (rooms.length === 1) {
+            box.value = rooms[0].roomId;
+            hint.innerHTML = '已填入 <b>' + esc(rooms[0].roomId) + '</b>' + (rooms[0].remark ? '（备注：' + esc(rooms[0].remark) + '）' : '') + ' —— 记得点「保存」生效。';
+            return;
+          }
+          /* 多个房间：列出来让用户点（带备注与开关状态，否则认不出哪个是哪个） */
+          hint.innerHTML =
+            '读到 ' + rooms.length + ' 个直播间，点一个填入：' +
+            rooms
+              .map((x) => {
+                const tag = [x.remark ? esc(x.remark) : '', x.open === false ? '未开启' : '', x.autoPartMerge ? '自动合并分P' : ''].filter(Boolean).join(' · ');
+                return `<button class="btn-sm" data-room="${esc(x.roomId)}">${esc(x.roomId)}${tag ? '（' + tag + '）' : ''}</button>`;
+              })
+              .join(' ');
+          hint.querySelectorAll('[data-room]').forEach((el) => {
+            el.onclick = () => {
+              box.value = el.getAttribute('data-room') || '';
+              hint.innerHTML = '已填入 <b>' + esc(box.value) + '</b> —— 记得点「保存」生效。（当前配置里是 ' + esc(r.current || '空') + '）';
+            };
+          });
+        } catch (e) {
+          hint.innerHTML = '读取失败：' + esc(e.message);
+        }
+      };
+    }
+  }
   /* 边录边转写（P1-6）：文案跟着状态变，并在"刚打开"时明确提示要重启 ——
      否则用户点了、看着是开的，而预转写循环要等下次启动才创建（这一点在实现里是刻意的）。 */
   tgl('#c_incrementalEnabled', (on, el) => el.nextElementSibling.textContent = on ? '开启（录完只剩最后一段要转）· 需重启服务才生效' : '关闭（等整段录完才开始转）');

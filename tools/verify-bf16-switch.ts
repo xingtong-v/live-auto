@@ -68,7 +68,27 @@ try {
      所以这是 harness 限制，不是本开关的问题。为了不留"看起来验过其实没验"的假绿，
      这里不写这条断言；翻转能力由静态门禁兜（见 test/config-coverage.ts 的 3b：
      控件在 / saveCfg 存它 / config 有键 / 文案写明取舍）。 */
-  ok('（说明）点击翻转未做自动化验证：headless 下 .switch 对三种合成点击均无响应（既有开关亦然）', true);
+  /* ★ 2026-10-13：这条断言原来写的是"未做自动化验证（headless 下 .switch 对合成点击无响应）"——
+     那是**误判**：真正的原因是设置面板的 bindCfg() 抛异常导致**所有绑定都没装上**
+     （配置差异里有个 leaf 是 `b:a`，拼出了非法选择器 '#c_b:a'）。绑定修好后开关就能点了，
+     所以这里恢复真断言：点一下必须翻转，且文案跟着变。 */
+  const flip = await (async () => {
+    const before = await cdp.evalJs<boolean>(`document.querySelector('#c_funasrBf16').classList.contains('on')`);
+    await cdp.evalJs(`document.querySelector('#c_funasrBf16').click()`);
+    await sleep(250);
+    const after = await cdp.evalJs<{ on: boolean; text: string }>(`(() => {
+      const el = document.querySelector('#c_funasrBf16');
+      return { on: el.classList.contains('on'), text: String(el.nextElementSibling.textContent) };
+    })()`);
+    return { before, after };
+  })();
+  ok('★ 点一下开关真的会翻转（绑定生效）', flip.before !== flip.after.on, JSON.stringify(flip));
+  ok('★ 并且旁边文案跟着变（开启 ⇄ 关闭）', /开启|关闭/.test(flip.after.text), flip.after.text.slice(0, 40));
+  /* 再点回去，别把配置留成"开着"（本套件不点保存，但状态要还原成开始时那样） */
+  await cdp.evalJs(`document.querySelector('#c_funasrBf16').click()`);
+  await sleep(250);
+  const restored = await cdp.evalJs<boolean>(`document.querySelector('#c_funasrBf16').classList.contains('on')`);
+  ok('再点一下回到原状态（不留下副作用）', restored === flip.before, String(restored));
 
   /* ④ 关掉设置面板（不保存，避免把刚才的点击写进配置） */
   const closed = await cdp.evalJs<boolean>(`(() => {
