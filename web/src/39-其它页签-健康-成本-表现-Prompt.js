@@ -14,6 +14,15 @@ function switchView(v) {
   } else {
     stopMonitor();
   }
+  /* 运行观测页同理：自己带定时器，切走就停。
+     ⚠️ 必须**立即拉一次**（照监控页 startMonitor() + loadMonitor() 的写法）——
+     只开定时器的话，用户切进来会先看到 5 秒的"加载中…"（第一版就漏了这句，真机验收当场抓到）。 */
+  if (v === 'observe') {
+    startObserve();
+    loadObserve().catch(() => {});
+  } else {
+    stopObserve();
+  }
   if (!isTasks) renderOther(v);
 }
 
@@ -27,6 +36,7 @@ async function renderOther(v) {
       await loadMonitor(false);
       return;
     }
+    if (v === 'observe') return renderObserve(box);
     if (v === 'health') return renderHealth(box);
     /* 2026-10-11：待删清单与回收站合并成一页（用户：「待删清单和回收站放一起」） */
     if (v === 'trash') return renderDeletePage(box);

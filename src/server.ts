@@ -42,7 +42,10 @@ import { moveToTrash } from './trash.ts';
 import { buildMcpTools, checkMcpToken, generateMcpToken, handleMcpMessage, type JsonRpcRequest } from './mcp.ts';
 import { PREVIEW_DIR, cleanupPreviews, makePreviewClip, previewFileName } from './preview.ts';
 import { openInSystemPlayer } from './player.ts';
-import { ROOT_DIR, exists, fileSize, fmtBytes, fmtDuration, fmtLocal, nowIso, readJson } from './util.ts';
+import {ROOT_DIR, exists, fileSize, fmtBytes, fmtDuration, fmtLocal, nowIso, readJson, LOGS_DIR} from './util.ts';
+
+/* 运行观测页用：上一次扫描到的文件大小，用来判断"文件还在不在长"（进程内、无需落盘） */
+const observeSizeCache = new Map<string, number>();
 import { log as globalLog } from './logger.ts';
 
 /* ============================================================================
@@ -1453,6 +1456,17 @@ export class UiServer {
      */
     if (p === '/api/monitor' && method === 'GET') {
       this.sendJson(res, 200, await this.monitorView());
+      return;
+    }
+
+    /* ---------------- GET /api/observe（运行观测页，只读） ---------------- */
+    if (p === '/api/observe' && method === 'GET') {
+      try {
+        this.sendJson(res, 200, await this.observeView());
+      } catch (e) {
+        /* 与监控页同一个原则：任何一块坏了都只降级成空，不让整页 500 */
+        this.sendJson(res, 200, { generatedAt: new Date().toISOString(), degraded: (e as Error).message, recording: [], preTranscribe: [], preTranscribeLog: [], asrHealth: [], timeline: [] });
+      }
       return;
     }
 
@@ -2974,6 +2988,131 @@ export class UiServer {
    * 每一块都独立 try/catch 降级：面板最怕的是"因为某一跳超时整页空白"，
    * 那会让人以为助手挂了，而实际只是 biliLive-tools 忙。
    */
+  /**
+   * 运行观测页的数据（只读）。
+   *
+   * 为什么不并进 /api/monitor：这一页要读**磁盘与日志**（预转写状态文件、日志尾部的"转写体检"行），
+   * 比"台账 + 队列"贵得多 —— 分开可以让监控页保持轻快，本页失败也影响不到它。
+   *
+   * 2026-10-13 加，起因：验证「边录边转」时只能靠命令行 grep 日志，界面上一片空白。
+   */
+  private async observeView(): Promise<Record<string, unknown>> {
+    const orch = this.orch;
+    const now = Date.now();
+    /* 目录来源必须与「实时监控」页同源（orch.watcher.status()）——
+       一开始我写成 orch.health().watch.dirs，结果实测返回空数组 ⇒ 这一页永远是"没有录制文件"。
+       health 里的 watch 块与 watcher.status() 不是同一份数据。 */
+    let dirs: string[] = [];
+    try {
+      const st = orch.watcher.status() as unknown as { dirs?: string[]; watchDirs?: string[] };
+      dirs = st?.dirs ?? st?.watchDirs ?? [];
+    } catch {
+      /* 拿不到目录就只报台账与日志，不报错 */
+    }
+
+    /* 走两层的目录扫描：录制文件通常在 <根>/<主播名>/ 下，且 biliLive-tools 会切成 -PART0NN.ts */
+    const files: Array<{ path: string; name: string; sizeBytes: number; ageSec: number }> = [];
+    const walk = (dir: string, depth: number): void => {
+      if (depth > 2) return;
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) {
+          walk(full, depth + 1);
+          continue;
+        }
+        if (!/\.(ts|flv|mp4|mkv|json)$/i.test(e.name)) continue;
+        try {
+          const st = fs.statSync(full);
+          files.push({ path: full, name: e.name, sizeBytes: st.size, ageSec: Math.round((now - st.mtimeMs) / 1000) });
+        } catch {
+          /* 单个文件读不到就跳过 */
+        }
+      }
+    };
+    for (const d of dirs) walk(d, 0);
+
+    /* 录制中：最近 5 分钟还在写的**视频**文件；是否"在长"用上次采样的大小对比 */
+    const recording = files
+      .filter((f) => /\.(ts|flv|mp4|mkv)$/i.test(f.name) && f.ageSec < 300)
+      .sort((a, b) => b.sizeBytes - a.sizeBytes)
+      .slice(0, 8)
+      .map((f) => {
+        const prev = observeSizeCache.get(f.path);
+        observeSizeCache.set(f.path, f.sizeBytes);
+        return { name: f.name, sizeBytes: f.sizeBytes, ageSec: f.ageSec, growing: prev !== undefined ? f.sizeBytes > prev : f.ageSec < 90 };
+      });
+
+    /* 边录边转：每个 .pre-transcribe.json 一行；total 用同目录同前缀的 -PART 数量近似（biliLive-tools 切片的产物形态） */
+    const preTranscribe = files
+      .filter((f) => f.name === '.pre-transcribe.json')
+      .map((f) => {
+        try {
+          const j = JSON.parse(fs.readFileSync(f.path, 'utf8')) as { done?: number[]; mode?: string };
+          const dir = path.dirname(f.path);
+          const parts = fs.readdirSync(dir).filter((x) => /-PART\d+\.(ts|flv|mp4)$/i.test(x)).length;
+          return { name: path.basename(dir), done: (j.done ?? []).length, total: Math.max(parts, (j.done ?? []).length, 1), mode: j.mode ?? 'segmented', ageSec: f.ageSec };
+        } catch {
+          return { name: path.basename(path.dirname(f.path)), done: 0, total: 1, mode: 'unreadable', ageSec: f.ageSec };
+        }
+      });
+
+    /* 日志尾部：预转写判定 + 本地转写体检（只读最后 256KB，别把整天的日志读进来） */
+    const preTranscribeLog: Array<{ at: string; msg: string }> = [];
+    const asrHealth: Array<{ at: string; msg: string }> = [];
+    try {
+      const logDir = LOGS_DIR;
+      const newest = fs
+        .readdirSync(logDir)
+        .filter((f) => /^live_auto-.*\.jsonl$/.test(f))
+        .map((f) => ({ f, m: fs.statSync(path.join(logDir, f)).mtimeMs }))
+        .sort((a, b) => b.m - a.m)[0];
+      if (newest) {
+        const full = path.join(logDir, newest.f);
+        const size = fs.statSync(full).size;
+        const start = Math.max(0, size - 262144);
+        const fd = fs.openSync(full, 'r');
+        const buf = Buffer.alloc(size - start);
+        fs.readSync(fd, buf, 0, buf.length, start);
+        fs.closeSync(fd);
+        for (const line of buf.toString('utf8').split(/\r?\n/)) {
+          if (!line.startsWith('{')) continue;
+          const m = /"ts":"([^"]+)"[\s\S]*?"msg":"([^"]{0,200})/.exec(line);
+          if (!m) continue;
+          const at = String(m[1]).slice(11, 19);
+          const msg = String(m[2]);
+          if (msg.includes('预转写')) preTranscribeLog.push({ at, msg });
+          if (msg.includes('转写体检')) asrHealth.push({ at, msg });
+        }
+      }
+    } catch {
+      /* 读日志失败不影响其它块 */
+    }
+
+    /* 最近几场（端到端视角） */
+    const timeline = orch.ledger
+      .listTasks({ limit: 5 })
+      .map((x) => {
+        const clips = orch.ledger.getClips(x.id);
+        return { id: x.id, status: x.status, clips: clips.length, selected: clips.filter((c) => c.selected).length, createdAt: String(x.createdAt ?? '').slice(5, 16) };
+      });
+
+    return {
+      generatedAt: new Date().toISOString(),
+      watchDirs: dirs,
+      recording,
+      preTranscribe,
+      preTranscribeLog: preTranscribeLog.slice(-6),
+      asrHealth: asrHealth.slice(-4),
+      timeline,
+    };
+  }
+
   private async monitorView(): Promise<Record<string, unknown>> {
     const cached = this.monitorCache;
     if (cached && Date.now() - cached.at < UiServer.MONITOR_CACHE_MS) return cached.data;
