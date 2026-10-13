@@ -55,6 +55,8 @@ interface LocalAsrResult {
   compute_type?: string;
   /** 执行器自己报的耗时（毫秒），含模型加载 */
   elapsed_ms?: number;
+  /** 其中的**纯推理**耗时（毫秒），不含模型加载 —— 用来算 RTF 才不会被冷启动误导 */
+  asr_ms?: number;
   /** 实际用的推理引擎（pytorch / vllm） */
   engine?: string;
   /**
@@ -65,6 +67,14 @@ interface LocalAsrResult {
    * 事后完全无法归因。执行器明明把这些打在 stderr 上，我们却在成功时把它丢掉了。
    */
   stderrTail?: string;
+  /** 实际用的解码器精度（`fp32(默认)` / `bf16` / `fp16`）——2026-10-13 加，见 runLocalAsr 的体检行 */
+  llm_dtype?: string;
+  /** GPU 峰值显存（MB），取自执行器里 torch 的峰值计数器；CPU 跑时缺省 */
+  gpu_peak_mb?: number;
+  /** GPU 缓存池峰值（MB）——比 allocated 高，能反映"实际占住显卡"的量 */
+  gpu_reserved_mb?: number;
+  /** 执行器擦除的非法代理字符数（>0 说明模型吐了坏字节，曾被它整次跑挂） */
+  text_scrubbed?: number;
 }
 
 /** 本地 ASR 的执行参数（由配置组装） */
@@ -93,6 +103,8 @@ interface LocalAsrOptions {
    * 只是把用户已经在维护的术语表顺路带给模型 —— 而这条线此前一直没接。
    */
   hotwords?: string[];
+  /** 解码器精度（留空 = fp32 = 历史行为）；见 config.ts 的 asr.localFunasr.llmDtype */
+  llmDtype?: string;
 }
 
 /**
@@ -176,6 +188,8 @@ export function buildLocalAsrSpec(
       /* 热词为空时**不写这个字段**：让 spec 干净，也便于在日志/测试里一眼看出
          "这次到底带没带热词"（执行器那边 `spec.get("hotwords") or []` 本来就容错）。 */
       ...(opts.hotwords && opts.hotwords.length > 0 ? { hotwords: opts.hotwords } : {}),
+      /* 精度同样"只在设了才写"：不写时 spec 与历史逐字节相同（执行器那边本来就是容错的） */
+      ...(opts.llmDtype ? { llm_dtype: opts.llmDtype } : {}),
     };
   }
   return {
@@ -392,6 +406,12 @@ export function asrCacheKey(parts: {
    * 这里只在有热词时追加，没热词时键与从前逐字节相同。
    */
   hotwords?: string;
+  /**
+   * 解码器精度（只有本地 Fun-ASR 有）。**必须进键**：它实质改变输出，
+   * 不进键的话"改成 bf16 后重跑"会命中旧缓存，用户看到的是"改了设置却毫无变化"。
+   * ⚠️ 与 hotwords 一样**条件追加**：不设时键与从前逐字节相同，既有缓存不会集体失效。
+   */
+  llmDtype?: string;
 }): string {
   const base = [
     parts.videoFilePath,
@@ -404,6 +424,7 @@ export function asrCacheKey(parts: {
     parts.trim ?? '',
   ];
   if (parts.hotwords) base.push(`hw:${parts.hotwords}`);
+  if (parts.llmDtype) base.push(`dtype:${parts.llmDtype}`);
   return hashKey(base);
 }
 
@@ -811,6 +832,10 @@ export class Transcriber {
       offset: w.offset,
       trim: this.cfg.asr.silenceTrim.enabled ? `trim:${this.cfg.asr.silenceTrim.noiseDb}/${this.cfg.asr.silenceTrim.minSilenceSec}` : '',
       ...(hw ? { hotwords: hw } : {}),
+      /* 与热词同理：只有**真正会用它的 provider**才纳入，否则云端/whisper 的付费缓存会被连带失配 */
+      ...(this.provider === 'local-funasr' && this.cfg.asr.localFunasr.llmDtype
+        ? { llmDtype: this.cfg.asr.localFunasr.llmDtype }
+        : {}),
     });
   }
 
@@ -916,6 +941,7 @@ export class Transcriber {
       language: '中文',
       device: f.device || 'auto',
       computeType: 'n/a',
+      ...(f.llmDtype ? { llmDtype: f.llmDtype } : {}),
       beamSize: 0,
       vadFilter: true,
       hub: f.hub || 'ms',
@@ -1127,6 +1153,15 @@ export class Transcriber {
                 log.info(
                   `${purpose} 本地转写完成：${segments.length} 条（设备 ${local.device ?? '?'}/${local.compute_type ?? '?'}，` +
                     `引擎 ${local.engine ?? '?'}，耗时 ${usedSec.toFixed(1)}s，RTF ${rtf.toFixed(3)}）`,
+                );
+                /* ★ 精度与显存的体检行（2026-10-13 加）：
+                   此前只在 spec 里传 llm_dtype，跑完就看不出来"这次到底 fp32 还是 bf16"；
+                   显存峰值更是完全没有记录 —— 而它正是"打游戏时能不能同时转写"的关键数字。
+                   现在执行器把 torch 的峰值计数器报回来，这里记一行（缺字段时如实写"未上报"）。 */
+                log.info(
+                  `${purpose} 转写体检：精度 ${local.llm_dtype ?? '未上报'}，GPU 峰值显存 ${local.gpu_peak_mb ?? '未上报'} MB` +
+                    `（缓存池 ${local.gpu_reserved_mb ?? '—'} MB），推理 ${((local.asr_ms ?? 0) / 1000).toFixed(1)}s` +
+                    `${local.text_scrubbed ? `，非法字符已擦除 ${local.text_scrubbed} 处` : ''}`,
                 );
                 /* 明显偏慢（GPU 正常约 0.24–0.35；>0.6 说明要么退化成 CPU，要么 GPU 被别的进程抢了）
                    → 单独 warn 并把执行器 stderr 的阶段耗时带出来，便于当场定位。 */

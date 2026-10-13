@@ -52,6 +52,26 @@ _REAL_STDOUT = sys.stdout
 sys.stdout = sys.stderr
 
 
+def _scrub_surrogates(value, counter: list) -> object:
+    """把**孤立代理项**换掉（`\\udc83` 这类），保证 json.dumps 不会炸。
+
+    为什么需要：2026-10-13 实测，模型输出里混进一个孤立代理项 ⇒
+    `json.dumps(ensure_ascii=False)` 写 stdout 抛 `UnicodeEncodeError: surrogates not allowed`
+    ⇒ **整次转写失败**（素材已经跑了 20 分钟，全部白跑）。这类字符是"坏字节被解码成了半个代理对"，
+    正确的处理是替换成 U+FFFD 并**计数上报**（不静默：结果里带 `text_scrubbed`）。
+    """
+    if isinstance(value, str):
+        if any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
+            counter[0] += 1
+            return value.encode("utf-8", "replace").decode("utf-8", "replace")
+        return value
+    if isinstance(value, dict):
+        return {k: _scrub_surrogates(v, counter) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_surrogates(v, counter) for v in value]
+    return value
+
+
 def emit(obj: dict, code: int = 0) -> None:
     """
     只往**真正的 stdout** 写 JSON。
@@ -60,8 +80,30 @@ def emit(obj: dict, code: int = 0) -> None:
     模型加载与推理过程也会打进度 —— 这些会和 JSON 混在一起，调用方解析直接失败。
     所以进程一开始就把 `sys.stdout` 换成 stderr（库的杂音全部改道），
     真正的结果只写在保存下来的 `_REAL_STDOUT` 上。
+
+    ⚠️ 另一个坑（2026-10-13）：模型偶尔吐出**孤立代理项**，`ensure_ascii=False` 写出去会抛
+    `UnicodeEncodeError` ⇒ 整次转写失败。这里先擦掉并计数，且**再兜一层**：
+    万一还有别的编码问题，退回 `ensure_ascii=True`（转义后一定合法）并标注，
+    保证"跑完的活不会因为一个字符丢掉"。
     """
-    _REAL_STDOUT.write(json.dumps(obj, ensure_ascii=False))
+    counter = [0]
+    safe = _scrub_surrogates(obj, counter)
+    if isinstance(safe, dict) and counter[0] > 0:
+        safe["text_scrubbed"] = counter[0]
+        try:
+            sys.stderr.write(f"[warn] 字幕文本里有 {counter[0]} 处非法代理字符，已替换为 U+FFFD\n")
+        except Exception:
+            pass
+    try:
+        payload = json.dumps(safe, ensure_ascii=False)
+    except (UnicodeEncodeError, ValueError):
+        payload = json.dumps(safe, ensure_ascii=True)
+        safe["encoding_fallback"] = "ensure_ascii"
+        payload = json.dumps(safe, ensure_ascii=True)
+    try:
+        _REAL_STDOUT.write(payload)
+    except UnicodeEncodeError:
+        _REAL_STDOUT.write(payload.encode("utf-8", "replace").decode("utf-8", "replace"))
     _REAL_STDOUT.flush()
     sys.exit(code)
 
@@ -329,7 +371,7 @@ def main() -> None:
                     raise
                 dll_notes.append(f"vLLM 不可用，退 PyTorch：{type(e).__name__}: {e}")
         if asr is None:
-            asr = AutoModel(model=model, hub=hub, device=device, disable_update=True, disable_pbar=True)
+            asr = AutoModel(model=model, hub=hub, device=device, disable_update=True, disable_pbar=True, **_model_kwargs(spec))
 
         # ---- 逐句识别 ----
         import soundfile as sf
@@ -370,12 +412,12 @@ def main() -> None:
             kwargs["output_timestamp"] = True
         """
         推理调优（默认值不一定是这台机器上最快的）：
-        - `llm_dtype`：funasr 默认 **fp32** 跑那个 0.6B 解码器；40 系卡支持 bf16，
-          官方在 vLLM 路径里也强制 bf16（fp16 反而会产生退化重复输出）。这是最大的一档提速。
+        - `llm_dtype`：见 `_model_kwargs` —— 它是**模型级**参数，必须在 `AutoModel(...)` 里给；
+          此前错传在 `generate()` 里 ⇒ 被静默忽略（实测 fp32/bf16 显存一模一样）。
+          40 系卡支持 bf16（`dtype_map` 只认 bf16/fp16/fp32，官方在 vLLM 路径也强制 bf16；
+          fp16 反而会产生退化重复输出）。
         - `max_length`：默认 512 个 token；十几字的短句根本用不到，EOS 不干净时就是白跑。
         """
-        if spec.get("llm_dtype"):
-            kwargs["llm_dtype"] = str(spec["llm_dtype"])
         if spec.get("max_length"):
             kwargs["max_length"] = int(spec["max_length"])
 
@@ -456,6 +498,14 @@ def main() -> None:
             "timestamp_source": by_stamp,
             "raw_debug": raw_debug,
             "notes": dll_notes,
+            # 精度与显存体检（2026-10-13 加）：
+            #  · llm_dtype 回显**真正传给模型的那个值**（取自 _model_kwargs，而不是曾经的
+            #    "我往 generate 里塞了什么" —— 那个值当初被 funasr 静默忽略，回显等于自欺）；
+            #  · gpu_peak_mb 取自 torch 自己的峰值计数器 —— 比外部采样可靠得多
+            #    （实测用"Node 起 pwsh 再采样 GPU 计数器"那套嵌套方案根本起不来，
+            #     而且外部采样还会被同时运行的游戏/其它进程干扰）。
+            "llm_dtype": str(_model_kwargs(spec).get("llm_dtype") or "fp32(默认)"),
+            **_gpu_mem_stats(),
         })
     except Exception as e:
         emit({"ok": False, "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()[-2000:], "notes": dll_notes}, 1)
@@ -466,6 +516,45 @@ def main() -> None:
             shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception:
             pass
+
+
+def _model_kwargs(spec: dict) -> dict:
+    """构造 `AutoModel` 时要带的"模型级"参数（**不是** generate 参数）。
+
+    ⚠️ 2026-10-13 实测踩到的坑：`llm_dtype` 属于**模型配置**，funasr 只在
+    `funasr/models/fun_asr_nano/model.py` 的 **__init__** 里读它
+    （`llm_conf.get("llm_dtype", "fp32")` → `model.to(dtype_map[...])`），
+    而此前本项目一直把它混在 `asr.generate(**kwargs)` 里传 ⇒ **被静默忽略**：
+    实测同素材 fp32/bf16 两次跑出来**显存一模一样（3493 MB）、字幕逐字相同**，
+    只有耗时噪声 —— 也就是说"参数传了、也回显了，但根本没生效"。
+    `AutoModel.__init__` 的文档写明 "All other config.yaml fields can be overridden"，
+    所以模型级参数应当在这里给。
+    """
+    out: dict = {}
+    if spec.get("llm_dtype"):
+        out["llm_dtype"] = str(spec["llm_dtype"])
+    return out
+
+
+def _gpu_mem_stats() -> dict:
+    """CUDA 峰值显存（MB）。非 CUDA / 任何异常一律返回空 dict —— 体检信息绝不影响主流程。
+
+    为什么用 torch 的计数器而不是外部采样：
+      · 计数器覆盖**从进程启动到此刻**的峰值，正好包含模型加载这一大块；
+      · 外部采样（GPU Process Memory 性能计数器）要另起进程，实测那套嵌套方案起不来，
+        而且同机若有游戏在跑，采样值会被干扰。
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return {}
+        return {
+            "gpu_peak_mb": round(torch.cuda.max_memory_allocated() / 1048576),
+            "gpu_reserved_mb": round(torch.cuda.max_memory_reserved() / 1048576),
+        }
+    except Exception:
+        return {}
 
 
 if __name__ == "__main__":

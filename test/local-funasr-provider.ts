@@ -189,6 +189,40 @@ section('1c. 热词与 ASR 缓存键');
   ok(asrCacheKey({ ...parts, hotwords: '' }) === legacy, '空指纹等价于没热词（不留空槽位）');
 }
 
+section('1c-2. 解码器精度（llm_dtype）与缓存键、spec 的接线');
+{
+  /* 2026-10-13 加。起因：Fun-ASR-Nano 的 0.6B 解码器默认 fp32，官方在 vLLM 路径强制 bf16，
+     执行器注释把它标成"最大的一档提速"；而 TS 侧从来没传过 llm_dtype —— 又是一个"能力在线没接"。
+     接线时最容易漏的是**缓存键**：精度实质改变输出，不进键的话"改成 bf16 后重跑"会命中旧缓存，
+     用户看到的是"改了设置却毫无变化"（与热词当初踩的坑完全同类）。 */
+  const parts = {
+    videoFilePath: 'C:/rec/a.flv',
+    videoFileSize: 1024,
+    videoFileUpdatedAt: 1700000000000,
+    modelId: '',
+    startTime: 0,
+    endTime: 300,
+    offset: 0,
+  };
+  const plain = asrCacheKey(parts);
+  eq('不设精度时键与历史逐字节相同（既有缓存不许集体失效）', asrCacheKey({ ...parts, llmDtype: undefined }), plain);
+  ok(asrCacheKey({ ...parts, llmDtype: 'bf16' }) !== plain, '设了 bf16 → 键变了（不会命中 fp32 的旧缓存）');
+  ok(asrCacheKey({ ...parts, llmDtype: 'bf16' }) !== asrCacheKey({ ...parts, llmDtype: 'fp16' }), '不同精度 → 键不同');
+
+  const noDtype = buildLocalAsrSpec(funasrOpts, { file: 'C:/a.flv', startTime: 0, endTime: 300, offset: 0 });
+  eq('没设精度时 spec 里**不写** llm_dtype（保持与历史逐字节相同）', 'llm_dtype' in noDtype, false);
+  const withDtype = buildLocalAsrSpec(
+    { ...funasrOpts, llmDtype: 'bf16' },
+    { file: 'C:/a.flv', startTime: 0, endTime: 300, offset: 0 },
+  );
+  eq('设了精度时 spec 带上 llm_dtype', withDtype['llm_dtype'], 'bf16');
+  const whisperDtype = buildLocalAsrSpec(
+    { ...whisperOpts, llmDtype: 'bf16' },
+    { file: 'C:/a.flv', startTime: 0, endTime: 300, offset: 0 },
+  );
+  eq('whisper 那套字段里不许出现 llm_dtype（两套不能串）', 'llm_dtype' in whisperDtype, false);
+}
+
 section('1d. dry-run 的付费闸门不能拦本地引擎（免费的东西不该要求 --allow-paid）');
 {
   /* 实测事故（2026-09-24 切成 local-funasr 后第一次 dry-run）：闸门先于 provider 分叉执行，

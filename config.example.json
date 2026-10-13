@@ -146,12 +146,13 @@
       "readingCharsPerSec": 4,
       "fontName": "Microsoft YaHei"
     },
+    "$comment_ffmpegOptionsOverride": "切片编码参数：覆盖 biliLive-tools ffmpeg 预设里的字段。⚠️ 必须用它的**预设字段名**（encoder / bitrateControl / crf / bitrate / preset / audioCodec）—— 写 ffmpeg 原始开关（c:v、b:v、c:a…）会被它静默忽略（2026-10-13 实测：真正生效的编码器一直来自预设自带的 encoder）。默认软件编码（任何机器都能跑）：libx264 + CRF + 21 + veryfast。切 NVIDIA 硬件编码：encoder=h264_nvenc + bitrateControl=VBR + bitrate=8000 + preset=p3（实测整机 CPU 78%→33%，同画质体积约 2.8 倍；想体积与现状持平就改 bitrateControl=CQ + crf=32）。",
     "ffmpegOptionsOverride": {
-      "c:v": "libx264",
-      "preset": "veryfast",
+      "encoder": "libx264",
+      "bitrateControl": "CRF",
       "crf": "21",
-      "c:a": "aac",
-      "b:a": "192k"
+      "preset": "veryfast",
+      "audioCodec": "copy"
     },
     "fullVideoHasDanmaku": false,
     "outputDir": "data/clips",

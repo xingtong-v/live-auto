@@ -539,7 +539,10 @@ export class BiliLiveClient {
       });
     }
     // 硬约束 #5：禁止 stream copy
-    const encoder = params.ffmpegOptions['c:v'] ?? params.ffmpegOptions['vcodec'] ?? params.ffmpegOptions['codec'];
+    /* ⚠️ 必须连 `encoder` 一起查（2026-10-13 实测）：biliLive-tools 的 `genFfmpegParams()`
+       只读它的**预设字段** `encoder`，我们写 `c:v` 其实**不生效** —— 只查 c:v/vcodec/codec
+       会漏掉真正决定编码器的那一个键，于是"禁止 copy"这条硬约束形同虚设。 */
+    const encoder = params.ffmpegOptions['c:v'] ?? params.ffmpegOptions['vcodec'] ?? params.ffmpegOptions['codec'] ?? params.ffmpegOptions['encoder'];
     if (typeof encoder === 'string' && encoder.trim().toLowerCase() === 'copy') {
       throw new ApiError(
         '切片编码器为 copy —— 禁止 stream copy：① 只能切关键帧，开头会花屏/黑帧；② -copyts 只在重编码时添加，弹幕会整体错位（§4.3、硬约束 #5）',

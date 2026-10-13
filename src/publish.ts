@@ -157,7 +157,10 @@ export function buildFfmpegOptions(
   base['ss'] = Number(range.start.toFixed(3));
   base['to'] = Number(range.end.toFixed(3));
 
-  const enc = base['c:v'] ?? base['vcodec'] ?? base['codec'];
+  /* ⚠️ `encoder` 必须一起查：biliLive-tools 真正认的是它的预设字段 `encoder`，
+     写 `c:v` 会被静默忽略（2026-10-13 实测）。只查 c:v/vcodec/codec 会把
+     "预设里是 copy" 这种情况漏过去，而 copy 正是硬约束 #5 禁止的。 */
+  const enc = base['c:v'] ?? base['vcodec'] ?? base['codec'] ?? base['encoder'];
   if (typeof enc === 'string' && enc.toLowerCase() === 'copy') {
     warnings.push('编码器为 copy —— 硬约束 #5 禁止切片用 stream copy（开头花屏 + 弹幕错位），投稿前会被 api.ts 拒绝');
   }

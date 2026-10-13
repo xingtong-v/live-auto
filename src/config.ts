@@ -150,6 +150,18 @@ export interface AsrConfig {
     device: string;
     /** auto（优先 vLLM，失败退 PyTorch）| vllm | pytorch */
     engine: string;
+    /**
+     * 解码器精度：留空 = funasr 默认（**fp32**）| `bf16`（40 系卡推荐）。
+     *
+     * 为什么值得开：Fun-ASR-Nano 的 0.6B 解码器默认用 fp32 跑 —— 官方在 vLLM 路径里强制 bf16，
+     * 执行器注释也把它标成"最大的一档提速"。实测（2026-10-13，同素材 A/B）见 docs 报告；
+     * 效果是**显存约减半 + 更快**，代价是字幕文本可能出现极小差异（ASR 本身不确定）。
+     *
+     * ⚠️ 它**已纳入转写缓存键**（条件追加）：换了精度不会命中旧缓存 ——
+     * 否则会出现"改了设置却毫无变化"的静默失效（热词当初踩过同一个坑）。
+     * ⚠️ 别填 fp16：执行器注释明确说 fp16 会产生退化重复输出。
+     */
+    llmDtype?: string;
     /** 每条字幕最多几个字（按标点切句时的上限，与字幕排版保持一致） */
     maxCharsPerCue: number;
     /** 每条字幕最短显示时长（秒） */
@@ -379,6 +391,20 @@ export interface ClipConfig {
    */
   burnSubtitles: boolean;
   subtitle: SubtitleConfig;
+  /**
+   * 覆盖 ffmpeg 预设里的字段（切片编码参数）。
+   *
+   * ⚠️ **必须用 biliLive-tools 的"预设字段名"，不能写 ffmpeg 原始开关**（2026-10-13 实测踩到）：
+   * 它的 `genFfmpegParams()` 只认这几个键 ——
+   * `encoder`（→ `-c:v`）、`bitrateControl`（CRF/VBR/CQ/ICQ）、`crf`、`bitrate`（→ `-b:v <n>k`）、
+   * `preset`（x264 用 veryfast 之类；NVENC 用 p1–p7）、`audioCodec`（→ `-c:a`）、`extraOptions`。
+   * 写 `c:v` / `b:v` / `c:a` 这类原始键会被**静默忽略**（历史配置里那几条就是这么失效的：
+   * 真正的编码器一直来自预设自带的 `encoder`）。
+   *
+   * 切硬件编码的写法（本机 4070 SUPER 实测：CPU 78%→33%，同画质体积 ×2.8）：
+   * `{ "encoder": "h264_nvenc", "bitrateControl": "VBR", "bitrate": "8000", "preset": "p3", "audioCodec": "copy" }`
+   * 想体积与 x264 crf21 持平就用 `bitrateControl: "CQ"` + `crf: "32"`（→ `-rc vbr -cq 32`）。
+   */
   ffmpegOptionsOverride: Record<string, string> | null;
   fullVideoHasDanmaku: boolean;
   outputDir: string;
@@ -854,7 +880,10 @@ function builtinDefaults(): AppConfig {
         readingCharsPerSec: 4,
         fontName: 'Microsoft YaHei',
       },
-      ffmpegOptionsOverride: { 'c:v': 'libx264', preset: 'veryfast', crf: '21', 'c:a': 'aac', 'b:a': '192k' },
+      /* 默认=软件编码（任何机器都能跑）。要换硬件编码看上面 `ffmpegOptionsOverride` 的说明 ——
+         ⚠️ 必须用预设字段名（encoder/bitrateControl/crf/bitrate/preset/audioCodec），
+         原始开关（c:v/b:v…）会被 biliLive-tools 静默忽略。 */
+      ffmpegOptionsOverride: { encoder: 'libx264', bitrateControl: 'CRF', crf: '21', preset: 'veryfast', audioCodec: 'copy' },
       fullVideoHasDanmaku: false,
       outputDir: 'data/clips',
       cutTimeoutSec: 3600,
@@ -1026,6 +1055,27 @@ export function validateConfig(cfg: AppConfig): ConfigIssue[] {
     }
   } catch {
     err('bililive.baseUrl', `不是合法的 URL：${cfg.bililive.baseUrl}`);
+  }
+
+  /* 本地 Fun-ASR 的解码器精度：只认 funasr `dtype_map` 里的三个键。
+     ⚠️ 2026-10-13 实测教训：这个值曾经被传给 `generate()` 而 funasr 只在**构造模型**时读它
+     ⇒ 静默忽略，用户以为开了 bf16 其实还是 fp32（显存一模一样）。所以这里只做"值合法性"校验；
+     "到底生没生效"由转写体检行里的实际精度 + 显存峰值来证明。 */
+  if (cfg.asr.localFunasr.llmDtype) {
+    const dt = String(cfg.asr.localFunasr.llmDtype).toLowerCase();
+    if (!['bf16', 'fp16', 'fp32'].includes(dt)) {
+      err(
+        'asr.localFunasr.llmDtype',
+        `不认识的值：${cfg.asr.localFunasr.llmDtype}（funasr 只支持 bf16 / fp16 / fp32）`,
+        '填 bf16（40 系卡推荐）或删掉这一项回到 fp32 默认值',
+      );
+    } else if (dt === 'fp16') {
+      warn(
+        'asr.localFunasr.llmDtype',
+        'fp16 会产生退化重复输出（funasr 官方在 vLLM 路径也强制用 bf16），不建议',
+        '改成 bf16；或删掉这一项用默认 fp32',
+      );
+    }
   }
 
   if (!cfg.bililive.passKey || /在此填写|your[-_ ]?passkey|xxx/i.test(cfg.bililive.passKey)) {

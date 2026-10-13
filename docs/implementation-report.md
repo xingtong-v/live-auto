@@ -5321,3 +5321,87 @@ tools/local-asr 提到。⇒ 局限也如实写在索引里：**命令行手工�
   要加的话需要客户端算一遍（`bootstrap` 里有门槛与上限，可纯前端算）；
 - 反向的"取消静默"还有一处：分析阶段的其它 `warnings` 同样只进内存（不落盘、不进日志）——
   这是同类问题，建议之后统一收口。
+
+## 85. 本地 Fun-ASR 的解码器精度（llm_dtype）：接线、两个真 bug、以及实测结论（2026-10-13）
+
+### 85.1 起因
+
+用户问"bf16 有什么效果，对我的出片有影响吗"，以及"本地 Fun-ASR 能不能少占点显存"。
+实测那台机器上我们的转写进程**占 4769 MB 显存**（进程级 GPU 计数器），而游戏占 7.2 GB ⇒ 两者叠加逼近 12 GB。
+
+### 85.2 接线（本轮新增）
+
+| 位置 | 内容 |
+|---|---|
+| `src/config.ts` | 新增 `asr.localFunasr.llmDtype`（**留空 = fp32 = 历史行为**），并校验只认 bf16/fp16/fp32、对 fp16 单独 warn（官方说它会退化） |
+| `src/asr.ts` | `LocalAsrOptions.llmDtype` → `buildLocalAsrSpec` 里**只在设了才写** `llm_dtype`（不写时 spec 与历史逐字节相同） |
+| `src/asr.ts` | `asrCacheKey` 新增 `llmDtype` 并**条件追加**（`dtype:bf16`）——与热词同一模式：不设时键逐字节不变，既有缓存不失效，设了则不会命中旧缓存 |
+| `src/asr.ts` | 转写体检新增一行：**精度 + GPU 峰值显存 + 缓存池 + 推理耗时 + 擦除计数**（此前这些信息跑完就没了） |
+| `test/local-funasr-provider.ts` | 新增 8 条断言：不设时键与历史一致 / 设了键必变 / 不同精度键不同 / spec 只在设了才写 / whisper 那套字段里不许出现 llm_dtype |
+
+### 85.3 途中撞出的两个**真 bug**（都是"整次跑挂"或"静默失效"级别）
+
+**① 孤立代理项让整次转写失败**（`transcribe-funasr.py` 的 `emit`）
+
+实测报错：
+
+```
+UnicodeEncodeError: 'utf-8' codec can't encode character '\udc83' in position 7019: surrogates not allowed
+  File "transcribe-funasr.py", line 64, in emit
+    _REAL_STDOUT.write(json.dumps(obj, ensure_ascii=False))
+```
+
+模型偶尔吐出"半个代理对"的坏字节 ⇒ `json.dumps(ensure_ascii=False)` 直接抛异常 ⇒
+**20 分钟的转写全部白跑**（素材本身没问题，只是文本里有一个坏字符）。
+修法：`_scrub_surrogates()` 把孤立代理项替换成 U+FFFD，**并计数上报**（结果里带 `text_scrubbed`，
+不静默）；`emit` 再兜一层 `ensure_ascii=True` 回退。修完后同一素材两次运行都跑通了（各擦除 1 处）。
+
+**② `llm_dtype` 传错了地方 ⇒ 被 funasr 静默忽略**（这一条最隐蔽）
+
+funasr 只在**构造模型**时读它（`funasr/models/fun_asr_nano/model.py`：
+
+```python
+self.llm_dtype = llm_conf.get("llm_dtype", "fp32")
+self.llm = model.to(dtype_map[self.llm_dtype])      # dtype_map = {bf16, fp16, fp32}
+```
+
+），而本项目一直把它混在 `asr.generate(**kwargs)` 里传 ⇒ **参数传了、也回显了，就是没生效**。
+第一次 A/B 的铁证：fp32 与 bf16 **显存一模一样（3493 MB）**、130 条字幕**逐字相同**。
+修法：新增 `_model_kwargs(spec)` 把模型级参数交给 `AutoModel(...)`，并把 generate 路径那处删掉；
+回显也改成"**真正传给模型的那个值**"，不再自欺。
+
+### 85.4 修正后的 A/B 实测（300 秒基准素材，同参数只差精度）
+
+| 指标 | fp32 | bf16 | 结论 |
+|---|---|---|---|
+| **峰值显存** | 3493 MB | **2354 MB** | **降 33%**（−1139 MB） |
+| 缓存池峰值 | 3628 MB | 2418 MB | 降 33% |
+| 墙钟 | 234.4s | 255.3s | **不可信**：测量时游戏占着 99% GPU |
+| 推理耗时 | 167.2s | 188.4s | 同上，不可信 |
+| 字幕条数 | 130 | 130 | 相同 |
+| 文本差异 | — | 128 条相同 / 2 条不同（**字符差异率 0.29%**） | 同音字级 |
+| 时间戳最大偏移 | — | **0.000 秒** | 完全一致 |
+
+两条差异样例：
+
+```
+#97  @218.26s   fp32「这里不让睡觉，」      bf16「这也不让睡觉，」
+#125 @279.95s   fp32「尽惹尽日惹。」        bf16「近惹近日惹。」
+```
+
+### 85.5 对"出片"的影响（结论）
+
+| 出片环节 | 影响 |
+|---|---|
+| 视频画面 / 切片 / 烧弹幕 / 烧字幕 / 投稿 | **无**（与解码精度无关） |
+| 字幕文本 | 0.29% 字符差异，同音字级 |
+| 切片边界 | **无**：边界吸附用的是时间戳，而两次时间戳**逐条完全一致**（0.000s 偏移） |
+
+⇒ **默认仍保持 fp32（不设这一项）**；只有"经常一边打游戏一边等转写、显存吃紧"时才建议填 `bf16`
+（换 33% 显存，代价是上面那点同音字差异）。速度那一栏本次**没测准**（游戏干扰），
+要下结论得等一个 GPU 空闲的窗口重跑。
+
+### 85.6 未做
+
+- 速度对比需要在**游戏关闭**时重跑（命令已固化为 `node tools/local-asr/ab-llm-dtype.mjs`，随时可复现）；
+- vLLM 路径（`engine: vllm`）没装、没测；官方在 vLLM 里强制 bf16，若哪天装了 vLLM，这一项会自动受益。
