@@ -96,13 +96,20 @@ try {
      实测假红过一次（top:0）。凡是查本页 DOM 的断言，都得先确保本页在前台。 */
   await cdp.evalJs(`document.querySelector('#tabs .tab[data-view="observe"]').click()`);
   await sleep(3500);
-  const runs = await cdp.evalJs<{ top: number; withSteps: number; sample: string }>(`(() => {
-    const list = [...document.querySelectorAll('.obs-run')];
-    const withSteps = list.filter((r) => r.querySelectorAll('.obs-step').length >= 4).length;
-    return { top: list.length, withSteps, sample: list[0] ? String(list[0].textContent).slice(0, 160) : '' };
+  const runs = await cdp.evalJs<{ rows: number; heads: string[]; first: string; sample: string }>(`(() => {
+    const tbl = document.querySelector('.obs-tl');
+    const heads = tbl ? [...tbl.querySelectorAll('thead th')].map((h) => String(h.textContent).trim()) : [];
+    const rows = tbl ? [...tbl.querySelectorAll('tbody tr')] : [];
+    return {
+      rows: rows.length,
+      heads,
+      first: rows[0] ? String(rows[0].children[0].textContent).trim() : '',
+      sample: rows[0] ? String(rows[0].textContent).replace(/\\s+/g, ' ').slice(0, 160) : '',
+    };
   })()`);
-  ok('★ ④ 每场两行（标题 + 中文状态 / 时间·切片·短 id），不是只有 id 的表格', runs.top >= 1, JSON.stringify(runs));
-  ok('★ 场次显示的是标题/人话，不是一串 id', /[\u4e00-\u9fa5]/.test(runs.sample), runs.sample);
+  ok('★ ④ 是**表格**形态（用户明确要的），列：场次（标题）/状态/切片/开始', runs.rows >= 1 && runs.heads.length === 4, JSON.stringify(runs.heads));
+  ok('★ 第一列是**中文标题**（不是 auto-… 这种 id）', /[\u4e00-\u9fa5]/.test(runs.first) && !/^auto-/.test(runs.first), runs.first);
+  ok('★ 状态是中文（悬停才是英文原文）', /[\u4e00-\u9fa5]/.test(runs.sample), runs.sample);
   /* ★ 回归保护：第一版这里堆了五个阶段胶囊，用户说"难看而且难懂"。
      现在阶段信息由状态文案承担（"转写中 3/10"），页面上不该再出现胶囊堆叠。 */
   const pills = await cdp.evalJs<number>(`document.querySelectorAll('.obs-step').length`);

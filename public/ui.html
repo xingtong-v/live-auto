@@ -5073,13 +5073,16 @@ function ensureObserveStyle() {
 .obs-note { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-top: 1px dashed var(--border, #eee); font-size: 13px; }
 .obs-note:first-of-type { border-top: none; }
 .obs-sub { margin: 12px 0 4px; font-weight: 600; color: var(--text-3, #666); font-size: 13px; }
-.obs-runs { display: flex; flex-direction: column; }
-.obs-run { padding: 11px 2px; border-top: 1px solid var(--border, #eee); }
-.obs-run:first-child { border-top: none; }
-.obs-run-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* ④ 用表格：列清楚、一眼扫完（用户明确要的形态）。
+   table-layout:fixed + 首列省略号 ⇒ 窄窗口也不会把后面的列挤出屏幕。 */
+.obs-tl { table-layout: fixed; }
+.obs-tl th:nth-child(1), .obs-tl td:nth-child(1) { width: 42%; }
+.obs-tl th:nth-child(2), .obs-tl td:nth-child(2) { width: 17%; }
+.obs-tl th:nth-child(3), .obs-tl td:nth-child(3) { width: 16%; }
+.obs-tl th:nth-child(4), .obs-tl td:nth-child(4) { width: 25%; }
 .obs-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.obs-run-sub { margin-top: 3px; font-size: 12px; color: var(--text-3, #888); }
-.obs-run-top .badge { flex: none; }
+.obs-nowrap { white-space: nowrap; }
+.obs-dim { color: var(--text-3, #999); font-size: 12px; }
 `;
   document.head.appendChild(el);
 }
@@ -5262,26 +5265,24 @@ function renderObserve(box) {
   /* ④ 每场两行：第一行"标题 + 中文状态"，第二行"阶段链 + 切片数 + 开始时间 + 短 id"。
      为什么不用表格：窄窗口下后面的列会被切掉（用户截图里只剩"场次"一列），
      而"哪里在跑、跑到哪一步"恰恰是后面那几列的信息。 */
-  /* ④ 每场两行：**标题 + 状态**（第一行）/ **时间·切片·id**（第二行小字）。
-     ⚠️ 第一版这里堆了五个阶段胶囊（录制→转写→分析→切片→发布），用户反馈"难看而且难懂" ——
-     已完成的场次五个全亮、等于没说，而且三行并排的信息挤成一条。
-     阶段信息其实**状态文案里本来就有**（"转写中 3/10" / "切片中 2/6" / "已发布"），
-     所以直接把胶囊去掉，只留状态。相对时间也改成客户端自己算（原来读服务端没下发的
-     startedAgoSec ⇒ 界面上显示"（—）"）。 */
+  /* ④ 表格（用户 2026-10-13 明确要求这个形态："UI 做成这样呢，中文标题"）。
+     演进史，免得再走回头路：
+       ① 只有一串 id 的表格 ⇒ 看不懂；
+       ② 我改成"两行式 + 五个阶段胶囊" ⇒ 用户说"难看而且难懂"（已完成的场次五个胶囊全亮，等于没说）；
+       ③ 收成两行式（无胶囊）⇒ 用户仍要**表格**这个形态。
+     最终：**表格** + 第一列显示**中文标题**（id 放悬停） + 状态中文 + 时间本地且带"多久前"。
+     时间由客户端按 createdAt 算（服务端不再下发冗余字段）。 */
   const tlRows = tl
     .map((t) => {
       const title = t.title && t.title.length > 1 ? t.title : String(t.id).replace(/^auto-/, '');
-      const short = String(t.id).replace(/^auto-\d{8}-?/, '');
       const chip = /PUBLISHED/.test(t.status) ? 'b-done' : /FAIL|ERROR/.test(t.status) ? 'b-fail' : 'b-run';
       const startedSec = t.createdAt ? Math.max(0, Math.round((Date.now() - new Date(t.createdAt).getTime()) / 1000)) : null;
-      const bits = [esc(obsStamp(t.createdAt)), obsAgo(startedSec), `切片 ${t.clips} 片（选中 ${t.selected}）`, short];
-      return `<div class="obs-run">
-        <div class="obs-run-top">
-          <span class="obs-title" title="${esc(t.id)}">${esc(title)}</span>
-          <span class="badge ${chip}" title="${esc(t.status)}">${esc(t.statusText || obsStatusText(t.status))}</span>
-        </div>
-        <div class="obs-run-sub">${bits.filter(Boolean).join(' · ')}</div>
-      </div>`;
+      return `<tr>
+        <td class="obs-title" title="${esc(t.id)}">${esc(title)}</td>
+        <td><span class="badge ${chip}" title="${esc(t.status)}">${esc(t.statusText || obsStatusText(t.status))}</span></td>
+        <td class="obs-nowrap">${t.clips} 片 · 选中 ${t.selected}</td>
+        <td class="obs-nowrap mono-sm">${esc(obsStamp(t.createdAt))}${startedSec === null ? '' : `<span class="obs-dim">（${obsAgo(startedSec)}）</span>`}</td>
+      </tr>`;
     })
     .join('');
 
@@ -5340,7 +5341,11 @@ function renderObserve(box) {
 
     <div class="card">
       <div class="card-head"><b>④ 最近几场</b></div>
-      ${tlRows ? `<div class="obs-runs">${tlRows}</div>` : '<div class="empty">台账为空</div>'}
+      ${
+        tlRows
+          ? `<table class="tbl obs-tbl obs-tl"><thead><tr><th>场次（标题）</th><th>状态</th><th>切片</th><th>开始</th></tr></thead><tbody>${tlRows}</tbody></table>`
+          : '<div class="empty">台账为空</div>'
+      }
     </div>
 
     <div class="card">
