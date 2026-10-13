@@ -17,6 +17,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile, execFileSync, spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import type { AsrCacheEntry, RequestContext, Transcript, TranscriptGap, TranscriptSegment } from './types.ts';
 import type { AppConfig } from './config.ts';
 import { BiliLiveClient, ApiError } from './api.ts';
@@ -44,7 +45,7 @@ import { log as globalLog, type Logger } from './logger.ts';
  * ========================================================================== */
 
 /** 本地执行器的返回结构（与 tools/local-asr/transcribe.py 的 stdout 契约一致） */
-interface LocalAsrResult {
+export interface LocalAsrResult {
   ok: boolean;
   error?: string;
   segments?: Array<{ start: number; end: number; text: string }>;
@@ -107,6 +108,168 @@ interface LocalAsrOptions {
   llmDtype?: string;
 }
 
+/* ============================================================================
+ * 本地 ASR 的进程登记表 / 同窗口单飞 / 卡死看门狗（2026-10-13 实测事故后加）
+ *
+ * 事故复盘（真机，2026-10-13 20:54）：
+ *   · 预转写（`pre-…`）先对某个 59 分钟文件起了**一次**本地转写；
+ *   · 43 秒后目录轮询把它正式导入，流水线**又起了一次**（各自加载一份模型）；
+ *   · 两个进程同时动同一份 ModelScope 缓存 ⇒ 双双**卡死**（38 个线程卡在 UserRequest、
+ *     CPU 冻结、无网络、无子进程），一直占着 ~2 GB 显存；
+ *   · 台账停在 TRANSCRIBING，用户点"修复卡住"后状态回到 RECORDED，
+ *     但**没有任何人终止那两个 python** ⇒ 现场留下两个孤儿进程，越修越乱。
+ *
+ * 所以这里补三件事（缺一不可）：
+ *   ① **登记表**：谁在跑、跑哪个文件、pid 多少 —— 让"收尸"成为可能（原来子进程句柄随手就丢了）；
+ *   ② **同窗口单飞**：同一个 (引擎, 文件, 区间) 只允许一个进程在跑，第二个调用**复用**同一个 Promise
+ *      —— 这才是"两个进程抢同一份缓存"的直接解药；
+ *   ③ **卡死看门狗**：执行器会持续往 stderr 打进度（加载/VAD/推理），
+ *      若**长时间一点输出都没有**，说明它卡住了 —— 杀掉并按失败上报，让任务能干净地重试，
+ *      而不是挂着占显存直到人工发现（原来只有 4 小时的硬超时，等于没有）。
+ * ========================================================================== */
+
+export interface LocalAsrRunInfo {
+  taskId: string;
+  pid: number;
+  file: string;
+  /** 已运行秒数 */
+  elapsedSec: number;
+  /** 距**最近一次输出**多少秒（判"在跑"还是"卡死"就看它） */
+  idleSec: number;
+}
+
+interface LocalAsrRunEntry {
+  child: ChildProcess;
+  file: string;
+  startedAt: number;
+  /** 最近一次 stdout/stderr 输出的时刻（0 = 至今没有输出） */
+  lastOutputAt: number;
+}
+
+const activeLocalRuns = new Map<string, LocalAsrRunEntry>();
+
+/**
+ * 登记一个正在跑的本地转写子进程（导出是为了能被测试直接驱动）。
+ *
+ * ⚠️ 键是 **`${taskId}#${windowIndex}`**（一个任务可能有多个窗口）：所以按任务收尸必须
+ * 走 `findLocalAsrRunsForTask()` 的"精确 + 前缀"匹配，不能只 `get(taskId)`
+ * —— 上一轮就是这么漏的（修复接口按 taskId 去杀，结果什么都匹配不到）。
+ */
+export function registerLocalAsrRun(taskId: string, child: ChildProcess, file: string): LocalAsrRunEntry {
+  const entry: LocalAsrRunEntry = { child, file, startedAt: Date.now(), lastOutputAt: 0 };
+  activeLocalRuns.set(taskId, entry);
+  return entry;
+}
+
+/** 标记"这个转写还在产出"（执行器每次往 stdout/stderr 写东西都调它） */
+export function markLocalAsrRunOutput(taskId: string): void {
+  const run = activeLocalRuns.get(taskId);
+  if (run) run.lastOutputAt = Date.now();
+}
+
+export function unregisterLocalAsrRun(taskId: string): void {
+  activeLocalRuns.delete(taskId);
+}
+
+/** 当前在跑的本地转写（供诊断/界面展示） */
+export function listActiveLocalAsrRuns(): LocalAsrRunInfo[] {
+  const now = Date.now();
+  return [...activeLocalRuns.entries()].map(([taskId, r]) => ({
+    taskId,
+    pid: r.child.pid ?? -1,
+    file: r.file,
+    elapsedSec: Math.round((now - r.startedAt) / 1000),
+    idleSec: Math.round((now - (r.lastOutputAt > 0 ? r.lastOutputAt : r.startedAt)) / 1000),
+  }));
+}
+
+/** 某个任务名下的所有在跑窗口（精确 + `taskId#窗口` 前缀） */
+export function findLocalAsrRunsForTask(taskId: string): LocalAsrRunInfo[] {
+  return listActiveLocalAsrRuns().filter((r) => r.taskId === taskId || r.taskId.startsWith(`${taskId}#`));
+}
+
+/** 收掉某个任务名下的所有在跑窗口，返回收掉几个 */
+export function killLocalAsrRunsForTask(taskId: string): number {
+  let n = 0;
+  for (const r of findLocalAsrRunsForTask(taskId)) if (killLocalAsrRun(r.taskId)) n++;
+  return n;
+}
+
+/**
+ * 终止某个任务的本地转写子进程。
+ *
+ * ⚠️ 必须**连子进程树一起杀**：Windows 上 `.venv-funasr\Scripts\python.exe` 会再拉起
+ * 真实的解释器（实测两个进程），只 kill 父进程会留下真正吃显存的那个 —— 正是本次事故的形态。
+ */
+export function killLocalAsrRun(taskId: string): boolean {
+  const run = activeLocalRuns.get(taskId);
+  if (!run) return false;
+  const pid = run.child.pid;
+  try {
+    if (process.platform === 'win32' && pid) {
+      execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+    } else {
+      run.child.kill('SIGKILL');
+    }
+  } catch {
+    /* 已经退出 / 权限不足：都不该让"收尸"本身抛错 */
+    try {
+      run.child.kill('SIGKILL');
+    } catch {
+      /* ignore */
+    }
+  }
+  activeLocalRuns.delete(taskId);
+  return true;
+}
+
+/** 收掉所有本地转写（服务退出/重启前调用 —— 否则每次重启都会留下一批孤儿） */
+export function killAllLocalAsrRuns(): number {
+  const ids = [...activeLocalRuns.keys()];
+  for (const id of ids) killLocalAsrRun(id);
+  return ids.length;
+}
+
+/**
+ * 卡死判据（纯函数，便于单测）：距最后一次输出超过 limitMs 即认为卡住。
+ * 传 `lastOutputAt = 0`（从未有过输出）时按"进程启动时刻"算，避免刚起就被判死。
+ */
+export function shouldKillStalled(lastOutputAt: number, startedAt: number, now: number, limitMs: number): boolean {
+  const base = lastOutputAt > 0 ? lastOutputAt : startedAt;
+  return now - base > limitMs;
+}
+
+/** 允许"毫无输出"的最长时间：执行器正常会持续打进度，20 分钟全静音只能是卡死。
+ *  ⚠️ 这个常量是**唯一**的"在跑 vs 卡死"判据：看门狗（本文件）与「修复卡住」接口
+ *  （server.ts）都用它 —— 两处各写一个阈值，迟早会出现"界面说没卡、看门狗却杀"的矛盾。 */
+export const LOCAL_ASR_STALL_MS = 20 * 60_000;
+
+/** 同窗口单飞表：key → 正在跑的那一次 */
+const inFlightLocal = new Map<string, Promise<LocalAsrResult>>();
+
+/**
+ * 同一个窗口只跑一次：已有同 key 的转写在跑时，直接复用它的 Promise。
+ * 返回 `reused` 供调用方记一行日志（"这次没有起第二个进程"必须留痕，否则事后无法归因）。
+ */
+export function singleFlightLocal(
+  key: string,
+  start: () => Promise<LocalAsrResult>,
+): { promise: Promise<LocalAsrResult>; reused: boolean } {
+  const existing = inFlightLocal.get(key);
+  if (existing) return { promise: existing, reused: true };
+  const promise = start().finally(() => {
+    /* 只清自己那一条：期间可能已经被后来的同 key 调用替换过 */
+    if (inFlightLocal.get(key) === promise) inFlightLocal.delete(key);
+  });
+  inFlightLocal.set(key, promise);
+  return { promise, reused: false };
+}
+
+/** 供测试/诊断：当前有几个同窗口单飞条目 */
+export function inFlightLocalCount(): number {
+  return inFlightLocal.size;
+}
+
 /**
  * 调用本地 ASR 执行器（子进程 + stdin JSON 协议）。
  *
@@ -123,9 +286,12 @@ function runLocalAsr(args: {
   startTime: number;
   endTime: number;
   offset: number;
+  /** 任务号（用于登记表/收尸）；缺省时用窗口信息合成一个 */
+  taskId?: string;
 }): Promise<LocalAsrResult> {
   const { opts } = args;
   const spec = buildLocalAsrSpec(opts, args);
+  const taskKey = args.taskId ?? `${path.basename(args.file)}#${args.startTime}-${args.endTime}`;
   return new Promise<LocalAsrResult>((resolve, reject) => {
     const child = execFile(
       opts.pythonPath,
@@ -141,8 +307,17 @@ function runLocalAsr(args: {
         env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
       },
       (err, stdout, stderr) => {
+        clearInterval(stallTimer);
+        unregisterLocalAsrRun(taskKey);
         if (err && !stdout) {
-          reject(new Error(`本地 ASR 执行失败：${err.message}${stderr ? `（stderr 尾部：${String(stderr).slice(-300)}）` : ''}`));
+          const killed = (err as Error & { killed?: boolean }).killed === true;
+          reject(
+            new Error(
+              killed
+                ? `本地 ASR 被终止（卡死看门狗判定：${Math.round(LOCAL_ASR_STALL_MS / 60_000)} 分钟内没有任何输出）`
+                : `本地 ASR 执行失败：${err.message}${stderr ? `（stderr 尾部：${String(stderr).slice(-300)}）` : ''}`,
+            ),
+          );
           return;
         }
         try {
@@ -157,6 +332,29 @@ function runLocalAsr(args: {
         }
       },
     );
+    registerLocalAsrRun(taskKey, child, args.file);
+
+    /* 卡死看门狗：执行器持续往 stdout/stderr 打进度（下载/加载/VAD/推理都会打），
+       若长时间两边都静音，说明它卡住了 —— 杀掉并如实上报。
+       没有它时，唯一的兜底是 4 小时硬超时，等于"挂了就一直占着显存"（实测事故就是这样）。 */
+    const entry = activeLocalRuns.get(taskKey)!;
+    const markOutput = (): void => {
+      entry.lastOutputAt = Date.now();
+    };
+    child.stdout?.on('data', markOutput);
+    child.stderr?.on('data', markOutput);
+    const stallTimer = setInterval(() => {
+      if (!shouldKillStalled(entry.lastOutputAt, entry.startedAt, Date.now(), LOCAL_ASR_STALL_MS)) return;
+      /* 先杀进程树（venv 的 python 会再拉起真解释器），再让回调里的 err 分支走"被终止" */
+      killLocalAsrRun(taskKey);
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* ignore */
+      }
+    }, 60_000);
+    stallTimer.unref?.();
+
     child.stdin?.end(JSON.stringify(spec), 'utf8');
   });
 }
@@ -1128,13 +1326,27 @@ export class Transcriber {
               let localDevice: string | undefined;
               let localEngine: string | undefined;
               if (useLocalAsr) {
-                const local = await runLocalAsr({
-                  opts: localOpts!,
-                  file: w.file,
-                  startTime: w.inFileStart,
-                  endTime: w.inFileEnd,
-                  offset: w.globalStart,
-                });
+                /* ★ 同窗口单飞（2026-10-13 事故的解药）：预转写与流水线可能对**同一个文件同一区间**
+                   各起一次 —— 两个进程各加载一份模型、抢同一份 ModelScope 缓存，实测会双双卡死。
+                   同一个 key 只留一个进程，第二个调用复用它的结果。 */
+                const flightKey = [localOpts!.engine, localOpts!.model, w.file, w.inFileStart, w.inFileEnd, w.globalStart].join('|');
+                const flight = singleFlightLocal(flightKey, () =>
+                  runLocalAsr({
+                    opts: localOpts!,
+                    file: w.file,
+                    startTime: w.inFileStart,
+                    endTime: w.inFileEnd,
+                    offset: w.globalStart,
+                    taskId: `${taskId}#${w.windowIndex}`,
+                  }),
+                );
+                if (flight.reused) {
+                  log.info(
+                    `${purpose} 同一窗口的本地转写已在跑 —— 复用那一次，不再起第二个进程` +
+                      `（两个进程抢同一份模型缓存会双双卡死，实测过）`,
+                  );
+                }
+                const local = await flight.promise;
                 if (!local.ok) throw new Error(`本地 ASR 失败：${local.error ?? '未知错误'}`);
                 // 本地执行器已经加过 offset（= 该单元的全局起点），无需再加
                 segments = (local.segments ?? []).map((s) => ({ start: s.start, end: s.end, text: s.text }));

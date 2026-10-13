@@ -6,6 +6,11 @@
       "cmd": "npm run asr-worker-test"
     },
     {
+      "name": "asr-guard-test",
+      "fast": true,
+      "cmd": "npm run asr-guard-test"
+    },
+    {
       "name": "typecheck",
       "cmd": "npm run typecheck",
       "fast": true

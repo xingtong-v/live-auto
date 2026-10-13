@@ -38,7 +38,16 @@ import { ledger as defaultLedger } from './ledger.ts';
 import type { Alerter } from './alert.ts';
 import { Alerter as DefaultAlerter } from './alert.ts';
 import { Analyzer, persistAnalysis, PromptStore, splitAutoPublish } from './analyze.ts';
-import { AsrCache, Transcriber, isDryRunPaymentRejection, type AsrMediaAdapter } from './asr.ts';
+import {
+  AsrCache,
+  Transcriber,
+  isDryRunPaymentRejection,
+  killAllLocalAsrRuns,
+  killLocalAsrRunsForTask,
+  findLocalAsrRunsForTask,
+  listActiveLocalAsrRuns,
+  type AsrMediaAdapter,
+} from './asr.ts';
 import { planSegmentCalls } from './media-plan.ts';
 import { transcribeInWorker } from './asr-worker-client.ts';
 import { Cleaner, checkAfterUploadDelete, judgeDeletability, rotateLogs } from './cleanup.ts';
@@ -754,7 +763,16 @@ export class Orchestrator {
             });
             return map.segments;
           },
-          transcribe: async (seg) => {
+          shouldWork: () =>
+          this.busy || this.queue.length > 0
+            ? {
+                ok: false,
+                reason:
+                  `流水线正在处理 ${this.currentTaskId ?? '任务'}（队列 ${this.queue.length}）—— ` +
+                  `预转写让路，避免两个进程同时转写同一个文件（实测会双双卡死）`,
+              }
+            : { ok: true },
+        transcribe: async (seg) => {
             const dur = Math.max(1, Math.round(seg.globalEnd - seg.globalStart));
             const res = await this.transcriber.transcribe({
               taskId: `pre-${Date.now()}`,
@@ -816,6 +834,11 @@ export class Orchestrator {
   }
 
   stop(): void {
+    /* ★ 退出前收尸（2026-10-13）：本地转写子进程不随父进程退出而消失 ——
+       服务每次重启/退出都会把它们留成孤儿，继续占着显存（实测：重启后仍有两个 python
+       各占 ~1 GB 内存 + 合计 2 GB 显存，界面里再也看不到它们）。 */
+    const killed = killAllLocalAsrRuns();
+    if (killed > 0) this.logger.warn(`退出前终止了 ${killed} 个仍在跑的本地转写子进程（否则会成为孤儿进程）`, { mod: 'asr' });
     this.trigger.stop();
     this.watcher.stop();
     this.cleaner.stop();
@@ -2849,6 +2872,11 @@ export class Orchestrator {
       this.queue = this.queue.filter((q) => q.taskId !== taskId);
       this.logger.warn(`任务 ${taskId} 在队列中，已移出队列后再删除`);
     }
+    /* ★ 顺带收尸（2026-10-13）：任务被删了，它正在跑的转写子进程不该继续占着显存 ——
+       否则就是"记录删了、进程还在"，界面再也看不到它，只能去任务管理器里找。 */
+    if (killLocalAsrRunsForTask(taskId) > 0) {
+      this.logger.info('已终止该任务的本地转写子进程（任务已删除）', { taskId, mod: 'asr' });
+    }
 
     const plan = this.inspectDeletion(taskId);
     const removed: string[] = [];
@@ -3035,20 +3063,82 @@ export class Orchestrator {
   }
 
   /**
+   * 收掉某个任务**正在跑的本地转写子进程**。
+   *
+   * 为什么必须有这个（2026-10-13 实测事故）：用户点"修复卡住的任务"时，
+   * 台账状态从 TRANSCRIBING 回到了 RECORDED，但那个卡死的 python 没人管 ——
+   * 它继续占着 ~2 GB 显存，而且下次重跑会再起一个，越修越多。
+   *
+   * 与 `stopTask` 里那句"不能中断 biliLive-tools 已在跑的 ffmpeg"不冲突：
+   * 那个是**别的进程**（我们无权也不该去杀），这个是**我们自己 spawn 的**子进程。
+   */
+  cancelTranscription(taskId: string): boolean {
+    const killed = killLocalAsrRunsForTask(taskId) > 0;
+    if (killed) {
+      this.logger.info(
+        `已终止该任务的本地转写子进程（它卡住时会一直占着显存；重跑会复用已完成的缓存分段）`,
+        { taskId, mod: 'asr' },
+      );
+    }
+    return killed;
+  }
+
+  /**
+   * 这个任务此刻是不是**由本进程的流水线负责**（正在跑，或排在队列里）。
+   *
+   * 为什么不能只看转写进程登记表（2026-10-13 实测第三个洞）：任务可能正通过
+   * **预转写**那次运行在转写 —— 那个进程登记在 `pre-<时间戳>#窗口` 名下，按 taskId 查不到，
+   * 于是「修复卡住」又会把一个正在正常转写的任务改回 RECORDED（界面显示「已录制 · 待处理」）。
+   * 归属关系只有流水线自己知道，所以这里以它为准。
+   */
+  isTaskActive(taskId: string): boolean {
+    return this.currentTaskId === taskId || this.queue.some((q) => q.taskId === taskId);
+  }
+
+  /**
+   * 这个任务名下此刻有没有本地转写进程在跑、最后一次输出是多久以前。
+   *
+   * 为什么要有它（2026-10-13 用户实测踩到）：`repairStuckTask` 只看台账状态 ——
+   * 一个**正在正常转写**的任务（状态就是 TRANSCRIBING/PENDING）也会被"修复"回 RECORDED，
+   * 界面上于是显示成「已录制 · 待处理」，用户以为挂了、反复点"修复"，越点越乱。
+   * 现在有了进程登记表，"在跑"与"卡住"可以分开判：`idleSec` 小于看门狗阈值就是在跑。
+   */
+  transcriptionStatus(taskId: string): { live: boolean; pids: number[]; idleSec: number; elapsedSec: number } {
+    const runs = findLocalAsrRunsForTask(taskId);
+    return {
+      live: runs.length > 0,
+      pids: runs.map((r) => r.pid).filter((p) => p > 0),
+      idleSec: runs.length ? Math.min(...runs.map((r) => r.idleSec)) : -1,
+      elapsedSec: runs.length ? Math.max(...runs.map((r) => r.elapsedSec)) : 0,
+    };
+  }
+
+  /** 当前在跑的本地转写（诊断用：界面/日志能回答"到底谁在占显存"） */
+  activeTranscriptions(): ReturnType<typeof listActiveLocalAsrRuns> {
+    return listActiveLocalAsrRuns();
+  }
+
+  /**
    * 停止一个正在处理 / 卡住的任务，把它放回可操作的状态。
    *
    * 能做的与不能做的（必须说清楚，否则用户会以为切片被取消了）：
-   *   - 能：把它移出待处理队列；把台账从运行态修回稳定状态；清掉进度显示
+   *   - 能：把它移出待处理队列；**终止我们自己起的转写子进程**；把台账从运行态修回稳定状态；清掉进度显示
    *   - 不能：中断 biliLive-tools 里**已经在跑**的 ffmpeg 任务 ——
    *     那是对方进程内的事，本地删掉记录不会让它停下
    */
-  async stopTask(taskId: string): Promise<{ ok: boolean; from: string; to: string; reason: string; note: string }> {
+  async stopTask(taskId: string): Promise<{ ok: boolean; from: string; to: string; reason: string; note: string; killedTranscribe: boolean }> {
     const t = this.ledger.getTask(taskId);
     if (!t) throw new Error(`任务不存在：${taskId}`);
 
     const removedFromQueue = this.queue.some((q) => q.taskId === taskId);
     this.queue = this.queue.filter((q) => q.taskId !== taskId);
     this.progress.delete(taskId);
+
+    /* ★ 先收尸再改状态（2026-10-13）：登记键是 `${taskId}#${windowIndex}`，
+       所以按"精确 + 前缀"匹配（`killLocalAsrRunsForTask`）—— 上一版只按 taskId 精确匹配，
+       结果一个窗口都匹配不到，等于没收尸。 */
+    const killedTranscribe = killLocalAsrRunsForTask(taskId) > 0;
+    if (killedTranscribe) this.logger.info('已终止该任务的本地转写子进程（否则它会一直占着显存）', { taskId, mod: 'asr' });
 
     /* ★ 记下「用户主动停的」：崩溃恢复会把中断的任务修回可恢复状态（TRANSCRIBING → RECORDED），
        而"用户点停止"走的是同一条修复路径 —— 两者落到同一个状态。没有这个标记，
@@ -3060,12 +3150,14 @@ export class Orchestrator {
     }
 
     const repair = this.ledger.repairStuckTask(taskId);
-    const note = removedFromQueue
-      ? '已移出待处理队列，并修复了台账状态'
-      : repair.from === repair.to
-        ? '该任务不在处理中，台账状态无需修复'
-        : '已修复台账状态（若 biliLive-tools 里仍有 ffmpeg 在跑，它会自己跑完，不影响后续操作）';
-    return { ok: true, from: repair.from, to: repair.to, reason: repair.reason, note };
+    const note = killedTranscribe
+      ? '已终止卡住的转写子进程、移出队列并修复了台账状态'
+      : removedFromQueue
+        ? '已移出待处理队列，并修复了台账状态'
+        : repair.from === repair.to
+          ? '该任务不在处理中，台账状态无需修复'
+          : '已修复台账状态（若 biliLive-tools 里仍有 ffmpeg 在跑，它会自己跑完，不影响后续操作）';
+    return { ok: true, from: repair.from, to: repair.to, reason: repair.reason, note, killedTranscribe };
   }
 
   /**

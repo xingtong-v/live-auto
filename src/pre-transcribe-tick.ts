@@ -41,6 +41,14 @@ export interface PreTranscribeTickDeps {
   log: (msg: string, extra?: Record<string, unknown>) => void;
   /** "已闭合"的时间判据（默认：当前时刻 − RECORDING_WINDOW_SEC） */
   closedBeforeMs?: () => number;
+  /**
+   * 额外门控（可选）：返回 `{ ok: false }` 时**这一轮什么都不做**。
+   *
+   * 用途（2026-10-13 实测事故）：预转写与"正式流水线的转写"**不能同时跑** ——
+   * 那次两者对同一个 59 分钟文件各起了一个进程，各加载一份模型、抢同一份 ModelScope 缓存，
+   * 双双卡死并留下孤儿进程。所以调用方在流水线忙时应当让预转写让路（下一轮再来）。
+   */
+  shouldWork?: () => { ok: boolean; reason?: string };
 }
 
 export interface PreTranscribeTickSummary {
@@ -62,6 +70,14 @@ export async function runPreTranscribeTick(deps: PreTranscribeTickDeps): Promise
 
   /* 门控在最前面：关闭时**什么也不做**（连候选都不列）—— 这条要能被断言看到 */
   if (!deps.enabled) return summary;
+
+  /* 第二道门控（可选）：调用方说"现在别跑"（例如流水线正在转写同一个文件）。
+     放在候选之前 —— 让路时连 discover 都不做，避免白读盘。 */
+  const gate = deps.shouldWork?.();
+  if (gate && !gate.ok) {
+    summary.notes.push(`本轮让路：${gate.reason ?? '调用方门控未通过'}`);
+    return summary;
+  }
 
   let candidates: RecordingCandidateLite[] = [];
   try {

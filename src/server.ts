@@ -24,6 +24,7 @@ import { spawn } from 'node:child_process';
 import { URL } from 'node:url';
 import type { Orchestrator } from './daemon.ts';
 import { APP_VERSION, retentionNote, summarizeTask } from './daemon.ts';
+import { LOCAL_ASR_STALL_MS } from './asr.ts';
 import { isFixtureTask, splitFixtures } from './fixtures.ts';
 import { findDuplicateTitles, readBatches, readRecentDuplicateParts } from './publish-batches.ts';
 import type { ClipRecord, Stage, TaskRecord } from './types.ts';
@@ -944,17 +945,45 @@ export class UiServer {
 
     /** 一键修复所有卡住的运行态任务 */
     if (p === '/api/tasks/repair-stuck' && method === 'POST') {
-      const fixed: Array<{ taskId: string; from: string; to: string; reason: string }> = [];
+      const fixed: Array<{ taskId: string; from: string; to: string; reason: string; killedTranscribe: boolean }> = [];
+      const skipped: Array<{ taskId: string; why: string }> = [];
       for (const t of orch.ledger.listTasks({ limit: 300 })) {
+        /* ★ 第一道判据：**流水线自己**说这个任务归它管（正在跑 / 在队列里）——
+           这一条与"转写进程登记表"是两件事：任务可能正通过**预转写**那次运行在转写，
+           那个进程登记在 `pre-<时间戳>#窗口` 名下，按 taskId 根本查不到（实测第三个洞）。 */
+        if (orch.isTaskActive(t.id)) {
+          skipped.push({ taskId: t.id, why: '流水线正在处理这个任务（队列里有它或当前就是它）—— 不是卡住，未做任何修改' });
+          continue;
+        }
+        /* ★ 第二道判据：进程登记表说"它还在产出"（2026-10-13 用户实测踩到）：
+           只看台账状态会把**正在正常转写**的任务也当成卡住 —— 修完界面显示「已录制 · 待处理」，
+           用户以为挂了、反复点这个按钮，越点越乱（实测 41 秒内被点了三次）。
+           `idleSec` 小于看门狗阈值 ⇒ 它在产出，**一个字都不改**。
+           （判据与看门狗共用 `LOCAL_ASR_STALL_MS`，避免"界面说没卡、看门狗却杀"。） */
+        const st = orch.transcriptionStatus(t.id);
+        if (st.live && st.idleSec * 1000 < LOCAL_ASR_STALL_MS) {
+          skipped.push({
+            taskId: t.id,
+            why: `正在转写中（pid ${st.pids.join(',') || '?'}，已运行 ${Math.round(st.elapsedSec / 60)} 分钟，${st.idleSec} 秒前还有输出）—— 不是卡住，未做任何修改`,
+          });
+          continue;
+        }
+        /* 真的卡住（或状态里没进程）才修：有僵死进程就顺手收掉 —— 只改台账不收进程，
+           那个 python 会继续占着 ~2 GB 显存，下次重跑还会再起一个，越修越多。 */
+        const killedTranscribe = st.live ? orch.cancelTranscription(t.id) : false;
         const r = orch.ledger.repairStuckTask(t.id);
-        if (r.from !== r.to) fixed.push({ taskId: t.id, ...r });
+        if (r.from !== r.to) fixed.push({ taskId: t.id, ...r, killedTranscribe });
       }
+      const killedAny = fixed.some((f) => f.killedTranscribe);
       this.sendJson(res, 200, {
         ok: true,
         fixed,
-        note: fixed.length
-          ? `修复了 ${fixed.length} 个卡住的任务（进程被强杀后会停在「切片中」这类状态，现已回到可操作状态）`
-          : '没有发现卡住的任务',
+        skipped,
+        note:
+          (fixed.length
+            ? `修复了 ${fixed.length} 个卡住的任务（进程被强杀后会停在「切片中」这类状态，现已回到可操作状态）` +
+              (killedAny ? '；并终止了卡住的转写子进程（原来它会一直占着显存）' : '')
+            : '没有发现卡住的任务') + (skipped.length ? `；另有 ${skipped.length} 个正在转写中，已跳过（不是卡住）` : ''),
       });
       return;
     }
