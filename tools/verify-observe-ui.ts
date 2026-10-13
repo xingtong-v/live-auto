@@ -137,11 +137,24 @@ try {
     return txt;
   })()`);
   ok('★ 汇总条显示录制中（来自 biliLive-tools 录制器状态）', /录制中/.test(recLine), recLine.slice(0, 100));
-  ok(
-    '★ 页面上列出了录制器（主播 / 房间号 / 未开播或正在直播 / 上次录制）',
-    /录制器（\d+ 个）|录制器状态问不到/.test(recLine),
-    recLine.slice(0, 200),
-  );
+  /* ⚠️ 这条原来写成"有『录制器（N 个）』**或**『问不到』就通过"—— 太弱：客户端字段读错时
+     会一直走"问不到"分支照样绿（实测就绿过一次）。改成**先问接口**，再要求页面与接口一致。 */
+  const apiRec = await fetch('http://127.0.0.1:3000/api/observe')
+    .then((r) => r.json())
+    .then((raw: unknown) => {
+      const j = raw as { recorder?: { ok?: boolean; recorders?: unknown[] } };
+      return { ok: j.recorder?.ok === true, n: j.recorder?.recorders?.length ?? 0 };
+    })
+    .catch(() => ({ ok: false, n: 0 }));
+  if (apiRec.ok) {
+    ok(
+      `★ 接口说问到了（${apiRec.n} 个录制器）⇒ 页面必须列出录制器，不许退化成"问不到"`,
+      new RegExp('录制器（' + apiRec.n + ' 个）').test(recLine),
+      recLine.slice(0, 240),
+    );
+  } else {
+    ok('（说明）接口这次也没问到 ⇒ 页面显示"问不到"是正确行为', /问不到/.test(recLine), recLine.slice(0, 160));
+  }
 
   ok('全程无未捕获异常', cdp.errors.length === 0, cdp.errors[0]?.slice(0, 160));
 } finally {

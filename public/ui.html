@@ -5386,7 +5386,7 @@ function renderObserve(box) {
      原来"录制中"是数**文件正在长**的个数（事后近似）；现在优先用 biliLive-tools 录制器自报的
      `liveInfo.living` / `state`（真信号），文件那套只作交叉校验与兜底。
      两个来源不一致时把两边都写出来 —— 不一致本身就是值得看的信息。 */
-  const rec = o.recorder || { ok: false, recording: 0, live: 0, recorders: [] };
+  const rec = (o.obs && o.obs.recorder) || { ok: false, recording: 0, live: 0, recorders: [] };
   const growingN = recording.filter((r) => r.growing).length;
   const recN = rec.ok ? Number(rec.live || 0) : null;
   const recLabel = !rec.ok
