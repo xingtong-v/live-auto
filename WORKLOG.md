@@ -35,3 +35,5 @@
 - [x] 2026-10-13T11:54:38Z | session:9aa24b6c-aef | bf16 开关上线（配置已打开）+ 设置面板一键切换 + 覆盖率断言 web/src/42-设置弹窗.js test/config-coverage.ts tools/verify-bf16-switch.ts tools/ui-shared.ts | 文件：
 
 - [x] 2026-10-13T14:53:32Z | session:9aa24b6c-aef | 边录边转首次真机验证失败 + 补观测（每轮留痕、守护进程限频） src/pre-transcribe-tick.ts src/daemon.ts test/pre-transcribe-tick.ts | 文件：
+
+- [ ] 2026-10-13T14:57:43Z | session:9aa24b6c-aef | 收窄预转写让路门控：只有真正在转写时才让路 src/daemon.ts | 文件：

@@ -769,15 +769,35 @@ export class Orchestrator {
             });
             return map.segments;
           },
-          shouldWork: () =>
-          this.busy || this.queue.length > 0
-            ? {
+          /* ★ 2026-10-13 收窄门控（真机验证发现的真问题）：
+             原来是 `this.busy || this.queue.length > 0` —— **流水线只要忙就让路**。
+             实测当晚：直播正在录（.ts 持续增长），流水线在**切上一场的切片**（CLIPPING，
+             纯 ffmpeg、完全不碰 ASR），预转写被连挡 8 轮、16 分钟，一次都没跑成。
+             而这段代码的**注释本意**写的是"避免两个进程同时转写同一个文件" —— 实现比本意宽得多。
+             现在按本意收窄：**只有流水线真的在做转写（TRANSCRIBING）时才让路**（那才会抢
+             GPU/显存，实测会双双卡死）；切片段 / 上传 / 分析都不使用 ASR，不该拦。
+             保守处理：流水线忙但**阶段未知**时仍然让路（宁可少转，不可撞车）。 */
+          shouldWork: () => {
+            /* 注意：`TRANSCRIBING` 是 **status** 的取值，不是 `stage`（stage 只有
+               IDLE/RECORDED/TRANSCRIBED/ANALYZED/CLIPPED/PUBLISHED）—— 类型系统当场拦下过这个错。 */
+            const now = this.currentTaskId ? this.ledger.getTask(this.currentTaskId) : undefined;
+            const busy = this.busy || this.queue.length > 0;
+            if (now?.status === 'TRANSCRIBING') {
+              return {
                 ok: false,
                 reason:
-                  `流水线正在处理 ${this.currentTaskId ?? '任务'}（队列 ${this.queue.length}）—— ` +
-                  `预转写让路，避免两个进程同时转写同一个文件（实测会双双卡死）`,
-              }
-            : { ok: true },
+                  `流水线正在转写 ${this.currentTaskId ?? '任务'}（队列 ${this.queue.length}）—— ` +
+                  `预转写让路，避免两个进程同时转写（实测会双双卡死）`,
+              };
+            }
+            if (busy && !now) {
+              return {
+                ok: false,
+                reason: `流水线正在处理 ${this.currentTaskId ?? '任务'}（阶段未知、队列 ${this.queue.length}）—— 预转写保守让路`,
+              };
+            }
+            return { ok: true };
+          },
         transcribe: async (seg) => {
             const dur = Math.max(1, Math.round(seg.globalEnd - seg.globalStart));
             const res = await this.transcriber.transcribe({
