@@ -45,7 +45,7 @@ import { openInSystemPlayer } from './player.ts';
 import {ROOT_DIR, exists, fileSize, fmtBytes, fmtDuration, fmtLocal, nowIso, readJson, LOGS_DIR} from './util.ts';
 
 /* 运行观测页用：上一次扫描到的文件大小，用来判断"文件还在不在长"（进程内、无需落盘） */
-const observeSizeCache = new Map<string, number>();
+const observeSizeCache = new Map<string, { bytes: number; at: number }>();
 import { log as globalLog } from './logger.ts';
 
 /* ============================================================================
@@ -3044,8 +3044,17 @@ export class UiServer {
       .slice(0, 8)
       .map((f) => {
         const prev = observeSizeCache.get(f.path);
-        observeSizeCache.set(f.path, f.sizeBytes);
-        return { name: f.name, sizeBytes: f.sizeBytes, ageSec: f.ageSec, growing: prev !== undefined ? f.sizeBytes > prev : f.ageSec < 90 };
+        observeSizeCache.set(f.path, { bytes: f.sizeBytes, at: now });
+        /* 速率用两次采样的差值算（面板 5 秒一刷，足够看出"在长多快"）。
+           第一次采样没有基准 ⇒ 如实给 null，让界面显示"—"而不是编一个数。 */
+        const rateMBps = prev && prev.at && f.sizeBytes > prev.bytes ? (f.sizeBytes - prev.bytes) / 1048576 / ((now - prev.at) / 1000) : null;
+        return {
+          name: f.name,
+          sizeBytes: f.sizeBytes,
+          ageSec: f.ageSec,
+          rateMBps: rateMBps === null ? null : Math.round(rateMBps * 100) / 100,
+          growing: prev !== undefined ? f.sizeBytes > prev.bytes : f.ageSec < 90,
+        };
       });
 
     /* 边录边转：每个 .pre-transcribe.json 一行；total 用同目录同前缀的 -PART 数量近似（biliLive-tools 切片的产物形态） */
@@ -3063,8 +3072,8 @@ export class UiServer {
       });
 
     /* 日志尾部：预转写判定 + 本地转写体检（只读最后 256KB，别把整天的日志读进来） */
-    const preTranscribeLog: Array<{ at: string; msg: string }> = [];
-    const asrHealth: Array<{ at: string; msg: string }> = [];
+    const preTranscribeLog: Array<{ at: string; atIso: string; msg: string }> = [];
+    const asrHealth: Array<{ at: string; atIso: string; msg: string }> = [];
     try {
       const logDir = LOGS_DIR;
       const newest = fs
@@ -3084,10 +3093,11 @@ export class UiServer {
           if (!line.startsWith('{')) continue;
           const m = /"ts":"([^"]+)"[\s\S]*?"msg":"([^"]{0,200})/.exec(line);
           if (!m) continue;
-          const at = String(m[1]).slice(11, 19);
+          const atIso = String(m[1]);
+          const at = atIso.slice(11, 19);
           const msg = String(m[2]);
-          if (msg.includes('预转写')) preTranscribeLog.push({ at, msg });
-          if (msg.includes('转写体检')) asrHealth.push({ at, msg });
+          if (msg.includes('预转写')) preTranscribeLog.push({ at, atIso, msg });
+          if (msg.includes('转写体检')) asrHealth.push({ at, atIso, msg });
         }
       }
     } catch {
@@ -3099,13 +3109,63 @@ export class UiServer {
       .listTasks({ limit: 5 })
       .map((x) => {
         const clips = orch.ledger.getClips(x.id);
-        return { id: x.id, status: x.status, clips: clips.length, selected: clips.filter((c) => c.selected).length, createdAt: String(x.createdAt ?? '').slice(5, 16) };
+        /* ⚠️ 必须给**完整 ISO**：一开始在这里 slice(5,16) 截成 "10-13T14:56"，
+           客户端 new Date() 解析不了 ⇒ 又退回显示 UTC（截图当场看到 10-13T14:56）。
+           时区转换统一交给客户端做。 */
+        return { id: x.id, status: x.status, clips: clips.length, selected: clips.filter((c) => c.selected).length, createdAt: x.createdAt ?? '' };
       });
+
+    /* 队列明细：biliLive-tools 的字段名是 taskId / progress / output / startTime(ms) / duration(ms) ——
+       ⚠️ 不是 id（监控页那边按 id 映射，所以界面上一直是 "-"，2026-10-13 查清）。 */
+    let queue: Array<Record<string, unknown>> = [];
+    try {
+      const r = (await orch.client.taskList({ pageSize: 30, timeoutMs: 2500 })) as unknown as { list?: Array<Record<string, unknown>> };
+      queue = (r.list ?? [])
+        .filter((x) => ['running', 'pending', 'waiting', 'paused'].includes(String(x['status'])))
+        .slice(0, 10)
+        .map((x) => {
+          const started = Number(x['startTime'] ?? 0);
+          const total = Number(x['duration'] ?? 0);
+          const pct = Number(x['progress'] ?? 0);
+          /* ETA：有 startTime + progress 才能估；估不出就如实给 null（界面显示"—"） */
+          let etaSec: number | null = null;
+          if (started > 0 && pct > 3 && pct < 100) {
+            const elapsed = (Date.now() - started) / 1000;
+            etaSec = Math.round((elapsed / pct) * (100 - pct));
+          }
+          void total;
+          return {
+            taskId: String(x['taskId'] ?? x['id'] ?? ''),
+            name: String(x['name'] ?? ''),
+            type: String(x['type'] ?? ''),
+            status: String(x['status'] ?? ''),
+            progress: Number.isFinite(pct) ? pct : null,
+            output: String(x['output'] ?? ''),
+            elapsedSec: started > 0 ? Math.round((Date.now() - started) / 1000) : null,
+            etaSec,
+          };
+        });
+    } catch {
+      /* 队列拿不到不影响其它块 */
+    }
+
+    /* 进程内存：直接用 process.memoryUsage()。
+       原来客户端读 mon.health.memory —— 实测那个字段是空的（监控页的内存块也不显示），
+       与其去追 health 的组装，不如这里直接给。 */
+    const mu = process.memoryUsage();
+    const memory = {
+      rssMB: Math.round(mu.rss / 1048576),
+      heapUsedMB: Math.round(mu.heapUsed / 1048576),
+      heapTotalMB: Math.round(mu.heapTotal / 1048576),
+      uptimeSec: Math.round(process.uptime()),
+    };
 
     return {
       generatedAt: new Date().toISOString(),
       watchDirs: dirs,
       recording,
+      queue,
+      memory,
       preTranscribe,
       preTranscribeLog: preTranscribeLog.slice(-6),
       asrHealth: asrHealth.slice(-4),

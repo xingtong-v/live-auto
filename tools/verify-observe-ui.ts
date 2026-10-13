@@ -47,10 +47,29 @@ try {
     ['正在录制的文件', /正在录制的文件/],
     ['边录边转（预转写）', /边录边转（预转写）/],
     ['压制 / 上传队列', /压制 \/ 上传队列/],
-    ['最近几场（端到端）', /最近几场（端到端）/],
+    ['最近几场', /最近几场/],
     ['资源与 ASR 体检', /资源与 ASR 体检/],
   ] as Array<[string, RegExp]>) {
     ok('页面含「' + name + '」一块', pat.test(page.text));
+  }
+  ok('顶部有总览条（先给结论再看细节）', /录制中/.test(page.text) && /边录边转/.test(page.text), page.text.slice(0, 120));
+
+  /* ★ 时区：日志里存的是 UTC，界面必须转成本地时间。
+     2026-10-13 第二版修的就是这个 —— 原来直接显示 UTC，比用户的钟慢 8 小时。
+     这里用"页面上的 HH:MM:SS 与浏览器本地时间相差不超过 10 分钟"来卡（最新判定就是刚发生的）。 */
+  const shown = await cdp.evalJs<string[]>(`[...document.querySelectorAll('.obs-note .mono-sm, .obs-sum, .card-head .mono-sm')]
+    .map((e) => String(e.textContent || '').trim())
+    .filter((s) => /^\\d{2}:\\d{2}:\\d{2}$/.test(s)).slice(0, 4)`);
+  if (shown.length > 0) {
+    const now = new Date();
+    const near = shown.some((s) => {
+      const [hh, mm] = s.split(':').map(Number);
+      const diffMin = Math.abs((hh * 60 + mm) - (now.getHours() * 60 + now.getMinutes()));
+      return Math.min(diffMin, 1440 - diffMin) <= 10;
+    });
+    ok('★ 页面上的时间是**本地时区**（与浏览器当前时间相差 ≤10 分钟）', near, '页面显示 ' + shown.join(' / ') + '；本地现在 ' + now.toLocaleTimeString('zh-CN', { hour12: false }));
+  } else {
+    ok('（说明）页面上暂时没有可校验的时间文本，跳过时区断言', true);
   }
   ok('有暂停刷新的按钮（守着看时不想一直请求）', page.hasPause);
 
