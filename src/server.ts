@@ -3113,44 +3113,43 @@ export class UiServer {
         };
       });
 
-    /* 边录边转：每个 .pre-transcribe.json 一行；total 用同目录同前缀的 -PART 数量近似（biliLive-tools 切片的产物形态） */
-    const preTranscribe = files
-      .filter((f) => f.name === '.pre-transcribe.json')
-      .map((f) => {
-        const dir = path.dirname(f.path);
-        try {
-          const j = JSON.parse(fs.readFileSync(f.path, 'utf8')) as { done?: number[]; mode?: string; updatedAt?: string };
-          /* 录像文件的**主体名**：去掉 -PART### 与扩展名。
-             原来这里写的是目录名（某主播目录）—— 那是**主播名**，界面上一行"某主播目录"
-             根本看不出在转哪一场；而一场直播会被 biliLive-tools 切成
-             「…配十八个币，你别生气.ts」「…-PART001.ts」这样的多个分段，
-             所以主体名 + 分段数才是用户要的信息。 */
-          /* ⚠️ 取**最新**的那个录像文件，不是 readdir 的第一个：
-               一个主播目录里躺着几十场的历史录像，取第一个会显示成上个月那场
-               （实测第一次就显示成 "2026-09-24 …【3D】真心话？大冒险"，完全看不出在说哪一场）。 */
-          const recs = fs
-            .readdirSync(dir)
-            .filter((x) => /\.(ts|flv|mp4)$/i.test(x) && !/-弹幕版|-纯享版|-切片/.test(x))
-            .map((x) => ({ x, m: fs.statSync(path.join(dir, x)).mtimeMs }))
-            .sort((a, b) => b.m - a.m)
-            .map((y) => y.x);
-          const base = (recs[0] ?? path.basename(dir)).replace(/-PART\d+/i, '').replace(/\.[a-z0-9]+$/i, '');
-          const stillWriting = files.some((x) => path.dirname(x.path) === dir && x.ageSec < 120 && /\.(ts|flv|mp4)$/i.test(x.name));
-          return {
-            name: base,
-            dir: path.basename(dir),
-            done: (j.done ?? []).length,
-            total: Math.max(recs.length, (j.done ?? []).length, 1),
-            parts: recs.length,
-            stillWriting,
-            updatedAt: j.updatedAt ?? '',
-            mode: j.mode ?? 'segmented',
-            ageSec: f.ageSec,
-          };
-        } catch {
-          return { name: path.basename(dir), dir: path.basename(dir), done: 0, total: 1, parts: 0, stillWriting: false, updatedAt: '', mode: 'unreadable', ageSec: f.ageSec };
-        }
-      });
+    /* 边录边转：读**按场次**存储的 v2 状态（键 = 分段清单指纹）。
+       ⚠️ v1 是"一个录像目录一份 done 索引"，同目录 18-25 场录像共用 ⇒ 新录像被误判"第 0 段已转"，
+       界面上的"已完成 N/M 段 / 更新于"也必然对不上是哪一场（用户 2026-10-13 就是问这个："是最新的吗"）。
+       v1 数据无法归属到具体场次 ⇒ 界面**不显示**（宁可显示空，也不给错的信息）。 */
+    type StateV2 = { version?: number; recordings?: Record<string, { done?: number[]; updatedAt?: string; mode?: string; segments?: string[] }> };
+    const preTranscribe: Array<Record<string, unknown>> = [];
+    for (const f of files) {
+      if (f.name !== '.pre-transcribe.json') continue;
+      const dir = path.dirname(f.path);
+      let j: StateV2;
+      try {
+        j = JSON.parse(fs.readFileSync(f.path, 'utf8')) as StateV2;
+      } catch {
+        continue;
+      }
+      if (j.version !== 2 || !j.recordings) continue;
+      const stillWriting = files.some((x) => path.dirname(x.path) === dir && x.ageSec < 120 && /\.(ts|flv|mp4)$/i.test(x.name));
+      for (const [key, rec] of Object.entries(j.recordings)) {
+        const segs = rec.segments ?? [];
+        const base = (segs[0] ?? '').replace(/-PART\d+/i, '').replace(/\.[a-z0-9]+$/i, '');
+        const ageSec = rec.updatedAt ? Math.max(0, Math.round((now - Date.parse(rec.updatedAt)) / 1000)) : f.ageSec;
+        preTranscribe.push({
+          name: base || path.basename(dir),
+          dir: path.basename(dir),
+          done: (rec.done ?? []).length,
+          total: Math.max(segs.length, 1),
+          parts: segs.length,
+          stillWriting,
+          updatedAt: rec.updatedAt ?? '',
+          mode: rec.mode ?? 'incremental',
+          ageSec,
+          key,
+        });
+      }
+    }
+    /* 最近更新的排最前 —— 用户问"是最新的吗"，那就让最新的一眼在最上面 */
+    preTranscribe.sort((a, b) => Number(a['ageSec']) - Number(b['ageSec']));
 
     /* 日志尾部：预转写判定 + 本地转写体检（只读最后 256KB，别把整天的日志读进来） */
     const preTranscribeLog: Array<{ at: string; atIso: string; msg: string }> = [];

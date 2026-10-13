@@ -21,7 +21,7 @@ import { runDataBackup, summarizeBackup } from './backup.ts';
 import path from 'node:path';
 import { buildMediaAdapter } from './media-plan.ts';
 import { runPreTranscribeTick } from './pre-transcribe-tick.ts';
-import { usePreTranscribed } from './pre-transcribe.ts';
+import {usePreTranscribed, decodePreTranscribeState, encodePreTranscribeState, preTranscribeKey, type PreTranscribeStateV2 } from './pre-transcribe.ts';
 
 /**
  * 预转写状态文件名（P1-6）：放在**录像同目录**，因为预转写发生在任务建立**之前**（那正是它的价值），
@@ -220,6 +220,25 @@ export class Orchestrator {
   private waitTimer?: NodeJS.Timeout;
   /** 稿件表现数据回流定时器 */
   private perfTimer?: NodeJS.Timeout;
+  /**
+   * 把某个录像展开成"这一场的分段清单"（文件名数组）—— 只用于给预转写状态算指纹。
+   * 与 tick 里的 discoverSegments 用**同一套扫法**（discoverRecordingFiles + buildSegmentMap），
+   * 否则算出来的键会和实际转写的段对不上。
+   */
+  private preTranscribeSegmentsOf(videoPath: string): string[] {
+    try {
+      const d = discoverRecordingFiles(videoPath, { skipFreshWithinSec: RECORDING_WINDOW_SEC, stitch: this.cfg.import.stitch });
+      const ffprobe = findFfprobe();
+      const map = buildSegmentMap(d.files, {
+        ...(ffprobe ? { ffprobePath: ffprobe } : {}),
+        maxSegments: this.cfg.segmented.maxSegments,
+      });
+      return map.segments.map((s) => s.path);
+    } catch {
+      return [];
+    }
+  }
+
   /** 预转写循环的定时器（P1-6，2026-10-14）：只有 asr.incrementalEnabled=true 时才会被创建 */
   private preTranscribeTimer?: NodeJS.Timeout;
   /**
@@ -228,6 +247,9 @@ export class Orchestrator {
    * 每次都打印又会每 2 分钟刷一行、24/7 下太吵 ⇒ 折中为**每 10 分钟最多一行**。
    */
   private lastPreTranscribeIdleLogAt = 0;
+  /** 「本轮让路」的上次原因与时间（同一原因 10 分钟内只记一条，见 preTranscribeTick） */
+  private lastPreTranscribeYieldReason = '';
+  private lastPreTranscribeYieldLogAt = 0;
   /** 配置文件变更监听定时器 */
   private cfgTimer?: NodeJS.Timeout;
   /** 「用完即删」的执行循环（每 10 分钟检查待删清单） */
@@ -816,12 +838,18 @@ export class Orchestrator {
               return undefined;
             }
           },
+          /* ★ 2026-10-13 改为**按场次**存取（v2）：键 = 分段清单指纹。
+             原因见 pre-transcribe.ts 里 PreTranscribeStateV2 的注释：v1 是"一个目录一份"，
+             同一主播的十几二十场录像共用同一份 done 索引 ⇒ 新录像刚开录就会被误判"第 0 段已转"
+             （实测两个目录各只有一个 v1 文件，其中一个还是前一天的）。 */
           loadDone: (videoPath) => {
             try {
+              const segs = this.preTranscribeSegmentsOf(videoPath);
+              if (segs.length === 0) return undefined;
               const f = path.join(path.dirname(videoPath), PRE_TRANSCRIBE_STATE_FILE);
               if (!fs.existsSync(f)) return undefined;
-              const j = JSON.parse(fs.readFileSync(f, 'utf8')) as { done?: number[] };
-              return Array.isArray(j.done) ? j.done : undefined;
+              const hit = decodePreTranscribeState(JSON.parse(fs.readFileSync(f, 'utf8')), preTranscribeKey(segs));
+              return hit?.done;
             } catch {
               return undefined;
             }
@@ -829,7 +857,15 @@ export class Orchestrator {
           saveState: (videoPath, r) => {
             const f = path.join(path.dirname(videoPath), PRE_TRANSCRIBE_STATE_FILE);
             const done = r.state.segments.map((s, i) => (s.status === 'done' ? i : -1)).filter((i) => i >= 0);
-            fs.writeFileSync(f, JSON.stringify({ done, updatedAt: new Date().toISOString(), mode: r.state.mode }, null, 2), 'utf8'); void ({ done, updatedAt: new Date().toISOString(), mode: r.state.mode });
+            let prev: PreTranscribeStateV2 | undefined;
+            try {
+              const raw = fs.existsSync(f) ? (JSON.parse(fs.readFileSync(f, 'utf8')) as PreTranscribeStateV2) : undefined;
+              prev = raw && raw.version === 2 ? raw : undefined; // v1 无法归属到具体场次 ⇒ 丢弃重来
+            } catch {
+              prev = undefined;
+            }
+            const segs = this.preTranscribeSegmentsOf(videoPath);
+            fs.writeFileSync(f, JSON.stringify(encodePreTranscribeState(prev, preTranscribeKey(segs), segs, done, r.state.mode), null, 2), 'utf8');
           },
           log: (m) => this.logger.info(m, { mod: 'asr' }),
         });
@@ -844,6 +880,19 @@ export class Orchestrator {
         if (idle.length > 0 && Date.now() - this.lastPreTranscribeIdleLogAt > 10 * 60 * 1000) {
           this.lastPreTranscribeIdleLogAt = Date.now();
           for (const n of idle) this.logger.info(`预转写：${n}`, { mod: 'asr' });
+        }
+        /* ★ 「让路」也限频（2026-10-13 用户截图：面板里连着四行一模一样的让路）：
+           同一原因的第一次照打（用户要知道"为什么没在预转写"），之后 10 分钟内不重复；
+           换了原因（换了任务/换了阶段）立刻再打一行 —— 不丢信息，只去噪声。 */
+        if (sum.yielded) {
+          const same = sum.yielded === this.lastPreTranscribeYieldReason;
+          if (!same || Date.now() - this.lastPreTranscribeYieldLogAt > 10 * 60 * 1000) {
+            this.lastPreTranscribeYieldReason = sum.yielded;
+            this.lastPreTranscribeYieldLogAt = Date.now();
+            this.logger.info(`预转写：本轮让路：${sum.yielded}`, { mod: 'asr' });
+          } else {
+            this.logger.debug(`预转写：本轮仍让路（同一原因，10 分钟内不重复记）：${sum.yielded}`, { mod: 'asr' });
+          }
         }
       } catch (e) {
         /* 预转写是"锦上添花"：失败绝不影响录制、导入与既有流程 */
@@ -1052,13 +1101,68 @@ export class Orchestrator {
    *   · 源素材已经不在磁盘上的（清理删过）只记一条 warning，不入队，免得刷一屏失败报告；
    *   · 已经在队列里的不重复入队。
    */
-  async recoverUnfinishedTasks(): Promise<{ requeued: string[]; skippedMissing: string[]; refused: string[]; blocked: string[] }> {
+  async recoverUnfinishedTasks(): Promise<{
+    requeued: string[];
+    skippedMissing: string[];
+    refused: string[];
+    blocked: string[];
+    repaired: Array<{ id: string; from: string; to: string }>;
+  }> {
+    /* ★ ① 先修「停在中间态」的任务（2026-10-13 用户报「卡了有一会了，为什么不继续切片了」）。
+     *
+     * 现场：服务在一次切片进行中被重启（重启前日志停在"开始切片"，重启后只有一行
+     * 「崩溃恢复：检查 1 个卡住的切片」），任务状态留在 `CLIPPING`，而下面这段恢复**只捡 RECORDED** ——
+     * 于是它永远躺在中间态：界面上看不出在跑、也没有进度，切片再也不会继续。
+     * 那一步只会修**切片级**的 SUBMITTING（`publisher.recoverStuck`），任务级的状态没人管。
+     *
+     * 所以启动时先把运行态的任务修回可恢复状态（`repairStuckTask` 会按实际产出挑落点，
+     * 例如 CLIPPING + 已有切片 → ANALYZED），再在 ② 里按修好的阶段接着跑。
+     * 用户主动停过的（stoppedByUserAt）不碰。 */
+    const runningStates: TaskStatus[] = ['PENDING', 'TRANSCRIBING', 'TRANSCRIBED', 'ANALYZING', 'CLIPPING', 'PUBLISHING'];
+    const repaired: Array<{ id: string; from: string; to: string }> = [];
+    for (const t of this.ledger.listTasks({ limit: 500 })) {
+      if (!runningStates.includes(t.status)) continue;
+      if (t.stoppedByUserAt) continue;
+      const r = this.ledger.repairStuckTask(t.id);
+      if (r.from !== r.to) repaired.push({ id: t.id, from: r.from, to: r.to });
+    }
+    if (repaired.length > 0) {
+      this.logger.info(
+        `启动恢复：把 ${repaired.length} 个停在中间态的任务修回可恢复状态（上次是在这些阶段被重启打断的）`,
+        { data: { repaired: repaired.slice(0, 10) } },
+      );
+    }
+
     const candidates = this.ledger.requeueCandidates();
+    /* 修好之后要按**修到哪一步**接着跑，而不是一律从头：
+       RECORDED → 从头（ASR 缓存会复用）；TRANSCRIBED → 只重跑分析与切片；
+       ANALYZED → 从切片开始（**半自动模式不自动跑**，那是等用户确认的状态，绝不越过审核）；
+       CLIPPED  → 只重跑发布（切片级崩溃恢复已确认过哪些切片投出去了）。 */
+    const resumeStageOf = (status: TaskStatus): Stage | undefined => {
+      if (status === 'RECORDED') return 'RECORDED';
+      if (status === 'TRANSCRIBED') return 'TRANSCRIBED';
+      if (status === 'ANALYZED') return this.cfg.publish.autoPublish ? 'ANALYZED' : undefined;
+      if (status === 'CLIPPED') return 'CLIPPED';
+      return undefined;
+    };
+    const todo: Array<{ id: string; title: string; updatedAt: string; stage: Stage }> = candidates.map((c) => ({
+      ...c,
+      stage: 'RECORDED' as Stage,
+    }));
+    for (const r of repaired) {
+      if (todo.some((x) => x.id === r.id)) continue;
+      const stage = resumeStageOf(r.to as TaskStatus);
+      if (!stage) continue;
+      const rec = this.ledger.getTask(r.id);
+      todo.push({ id: r.id, title: rec?.title ?? '', updatedAt: rec?.updatedAt ?? '', stage });
+    }
+    todo.sort((a, b) => String(a.updatedAt).localeCompare(String(b.updatedAt)));
+
     const requeued: string[] = [];
     const skippedMissing: string[] = [];
     const refused: string[] = [];
     const blocked: string[] = [];
-    for (const c of candidates) {
+    for (const c of todo) {
       if (this.queue.some((q) => q.taskId === c.id)) {
         refused.push(c.id);
         continue;
@@ -1089,15 +1193,15 @@ export class Orchestrator {
       }
       requeued.push(c.id);
       this.ledger.updateTask(c.id, { autoResumeCount: tries + 1 });
-      await this.enqueue(c.id, 'RECORDED');
+      await this.enqueue(c.id, c.stage);
     }
     if (requeued.length) {
       this.logger.info(
-        `启动恢复：重新入队 ${requeued.length} 个「已录制但未处理」的任务（上次是在处理它们时停的，接着跑）`,
+        `启动恢复：重新入队 ${requeued.length} 个未完成的任务（上次是在处理它们时被重启打断的，接着跑）`,
         { data: { tasks: requeued.slice(0, 10) } },
       );
     }
-    return { requeued, skippedMissing, refused, blocked };
+    return { requeued, skippedMissing, refused, blocked, repaired };
   }
 
   private async drainQueue(): Promise<void> {

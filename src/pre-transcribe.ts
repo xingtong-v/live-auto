@@ -181,6 +181,60 @@ export interface PreTranscribeDeps {
   alreadyDone?: number[];
 }
 
+/**
+ * 状态文件的**按场次**编码（v2）。
+ *
+ * 为什么必须按场次：v1 是「一个录像目录一个文件、只存 `done: number[]`」——
+ * 而真实目录里躺着 18–25 场录像（同一主播），于是**所有场次共用同一份 done 索引**：
+ * 新录像刚开录就会被判"第 0 段已转"而跳过（实测 2026-10-13：两个目录各只有一个 v1 文件，
+ * 其中一个还是前一天的）。更糟的是界面上"已完成 N/M 段"根本对不上是哪一场。
+ *
+ * v2 用**分段清单的指纹**做键：分段列表不同 ⇒ 天然是另一场 ⇒ 不会串。
+ * 顺带解决"分段增删后索引错位"：键不匹配就整条忽略（宁可重转一段，不可漏转）。
+ */
+export interface PreTranscribeStateV2 {
+  version: 2;
+  /** key = 分段清单指纹 → 该场的进度 */
+  recordings: Record<string, { done: number[]; updatedAt: string; mode: string; segments: string[] }>;
+}
+
+/** 分段清单指纹：只看文件名与顺序（路径前缀会随目录变化，不进指纹） */
+export function preTranscribeKey(segmentPaths: string[]): string {
+  const names = segmentPaths.map((p) => p.replace(/\\/g, '/').split('/').pop() ?? p);
+  let h = 2166136261;
+  for (const n of names.join('|')) {
+    h ^= n.charCodeAt(0);
+    h = Math.imul(h, 16777619);
+  }
+  return names.length + '-' + (h >>> 0).toString(36);
+}
+
+export function encodePreTranscribeState(
+  prev: PreTranscribeStateV2 | undefined,
+  key: string,
+  segments: string[],
+  done: number[],
+  mode: string,
+): PreTranscribeStateV2 {
+  const recordings = { ...(prev?.recordings ?? {}) };
+  recordings[key] = { done, updatedAt: new Date().toISOString(), mode, segments: segments.slice(0, 200) };
+  /* 只留最近 40 场，避免文件无限增长（一个目录一年下来几百场） */
+  const keys = Object.keys(recordings);
+  if (keys.length > 40) {
+    for (const k of keys.slice(0, keys.length - 40)) delete recordings[k];
+  }
+  return { version: 2, recordings };
+}
+
+/** 解析：v1（旧格式）一律返回 undefined —— 无法归属到具体场次，宁可重转也别串场 */
+export function decodePreTranscribeState(raw: unknown, key: string): { done: number[]; mode: string; updatedAt: string } | undefined {
+  const j = raw as Partial<PreTranscribeStateV2> & { done?: unknown };
+  if (!j || typeof j !== 'object' || j.version !== 2 || !j.recordings) return undefined;
+  const hit = j.recordings[key];
+  if (!hit || !Array.isArray(hit.done)) return undefined;
+  return { done: hit.done, mode: String(hit.mode ?? 'incremental'), updatedAt: String(hit.updatedAt ?? '') };
+}
+
 export interface PreTranscribeAttempt {
   index: number;
   ok: boolean;

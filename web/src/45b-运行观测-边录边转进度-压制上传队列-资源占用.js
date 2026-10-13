@@ -294,7 +294,7 @@ function renderObserve(box) {
       ${
         preRows
           ? `<table class="tbl obs-tbl"><thead><tr><th>场次</th><th>已完成</th><th>路径</th><th>更新</th></tr></thead><tbody>${preRows}</tbody></table>`
-          : '<div class="empty">还没有场次留下进度。若正在直播却为空，看下面的"最近判定"——多半是让路，或候选判定没命中。</div>'
+          : '<div class="empty">还没有场次留下进度（旧格式的历史状态不再显示——它没法区分是哪一场，显示出来只会误导）。若正在直播却为空，看下面的"最近判定"：多半是让路，或候选判定没命中。</div>'
       }`
       + `
       <div class="hintline">粒度：biliLive-tools 会把一场直播切成多个分段文件（<span class="mono-sm">.ts</span> / <span class="mono-sm">-PART001.ts</span>…）。<b>正在写的那个分段不会转</b>（末次写入距今不到 2 分钟即视为"仍在写入"），写完之后的下一次检查就会转它 —— 所以一场 4 小时的直播，下播时通常只剩最后一个分段要转。

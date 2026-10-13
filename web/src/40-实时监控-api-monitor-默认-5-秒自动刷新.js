@@ -260,7 +260,7 @@ function renderMonitor(box) {
       html += `<div class="impgroup" data-g="health-products" data-n="${products.length}" title="展开这 ${products.length} 个压制产物">
           <span class="caret">▸</span><span>压制产物（-弹幕版/-纯享版，完整版由 biliLive-tools 投）</span><span class="cnt">${products.length} 个</span></div>
         <div id="healthProducts" style="display:none">${healthTable(products, 60)}</div>
-        <p class="hintline">这些是 biliLive-tools 压出来的完整版（画面已烧弹幕），**不归切片助手处理** ——
+        <p class="hintline">这些是 biliLive-tools 压出来的完整版（画面已烧弹幕），<b>不归切片助手处理</b> ——
           列出来只是让你能核对"哪一场的完整版已经出来了"，不需要任何操作。</p>`;
     }
   } else {

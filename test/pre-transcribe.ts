@@ -14,6 +14,10 @@ import { markSegmentFailed, planIncremental } from '../src/incremental-asr.ts';
 import { mergeSegmentedTranscript, runPreTranscribe } from '../src/pre-transcribe.ts';
 import type { MediaSegment } from '../src/media-plan.ts';
 
+/* ★ 2026-10-13：状态"按场次"存取（v2）的断言。
+   背景：v1 是"一个录像目录一份 done 索引"，同目录 18-25 场录像共用 ⇒ 新录像被误判"第 0 段已转"。 */
+import { decodePreTranscribeState, encodePreTranscribeState, preTranscribeKey } from '../src/pre-transcribe.ts';
+
 let pass = 0;
 let fail = 0;
 const failures: string[] = [];
@@ -175,6 +179,28 @@ section('6. ★ C 步合并：分段字幕平移到全局时间轴（含拒绝�
   /* 空分段 ⇒ 拒绝 */
   ok('没有分段 ⇒ 拒绝', !mergeSegmentedTranscript([], [], st).used);
 }
+
+
+section('状态按场次存取（v2）：不同场次的 done 不许互相污染');
+{
+  const segA = ['/rec/甲/2026-10-13 21-00 某场.ts', '/rec/甲/2026-10-13 21-00 某场-PART001.ts'];
+  const segB = ['/rec/甲/2026-10-13 23-30 另一场.ts', '/rec/甲/2026-10-13 23-30 另一场-PART001.ts'];
+  const keyA = preTranscribeKey(segA);
+  const keyB = preTranscribeKey(segB);
+  ok('同一份分段清单 ⇒ 指纹稳定', preTranscribeKey(segA) === keyA);
+  ok('★ 不同场次 ⇒ 指纹不同（这才不会串场）', keyA !== keyB, keyA + ' vs ' + keyB);
+  ok('路径前缀变化不影响指纹（只看文件名）', preTranscribeKey(segA.map((x) => x.replace('/rec/甲/', '/other/'))) === keyA);
+
+  let st = encodePreTranscribeState(undefined, keyA, segA, [0], 'incremental');
+  eq('刚写入时能读回自己的进度', JSON.stringify(decodePreTranscribeState(st, keyA)?.done), '[0]');
+  eq('★ 另一场读不到这一场的进度（v1 就是在这里出错的）', decodePreTranscribeState(st, keyB), undefined);
+  st = encodePreTranscribeState(st, keyB, segB, [], 'incremental');
+  eq('两场各自的进度互不影响（甲）', JSON.stringify(decodePreTranscribeState(st, keyA)?.done), '[0]');
+  eq('两场各自的进度互不影响（乙）', JSON.stringify(decodePreTranscribeState(st, keyB)?.done), '[]');
+  eq('★ v1 旧格式一律忽略（无法归属 ⇒ 宁可重转）', decodePreTranscribeState({ done: [0], mode: 'incremental' }, keyA), undefined);
+  eq('空/坏数据不炸', decodePreTranscribeState(null, keyA), undefined);
+}
+
 
 console.log('\n' + '─'.repeat(74));
 console.log(`\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);
