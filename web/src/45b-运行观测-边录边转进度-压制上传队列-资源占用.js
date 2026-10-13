@@ -178,6 +178,11 @@ function renderObserve(box) {
   const queue = obs.queue || [];
   const tl = obs.timeline || [];
 
+  /* 现在有没有在录（录制器自报 + 文件是否在长）。
+     ⚠️ 必须在这里声明：下面的判定行过滤要用它；漏声明会导致整个 renderObserve 抛 ReferenceError，
+     页面永远停在“加载中…”（这个坑我踩过一次，靠“用了却没声明”的静态自查才发现）。 */
+  const liveNow = Number((obs.recorder && obs.recorder.live) || 0) > 0 || recording.some((r) => r.growing);
+
   const notes = (obs.preTranscribeLog || [])
     .filter((l) => !/循环已启动/.test(l.msg))
     .slice(-6)
@@ -210,7 +215,10 @@ function renderObserve(box) {
     )
     .join('');
 
-  const preRows = pre
+  // 「进行中」= 仍在写或最近 30 分钟更新过；历史进度文件不计入（它只是缓存，不占界面）。
+  // 必须声明在 preRows / preHistory 之前 —— 放后面就是 TDZ，整页渲染抛异常。
+  const preActive = pre.filter((p) => p.stillWriting || Number(p.ageSec) <= 1800);
+  const preRows = preActive
     .map((p) => {
       const pct = p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
       /* 每条记录都打状态标签（2026-10-14 用户两次问「没在录了为什么还有进度」）：
@@ -238,10 +246,12 @@ function renderObserve(box) {
     .join('');
   /* 「进行中」只算**仍在写或最近 30 分钟更新过**的；其余算历史记录（保留在表里，但不计入数字）——
      否则一场直播结束、任务也被策略清理之后，这一栏会永远挂着"1 场有进度"。 */
-  const preActive = pre.filter((p) => p.stillWriting || Number(p.ageSec) <= 1800);
   const preHistory = pre.length - preActive.length;
 
-  const noteRows = notes
+  /* 空闲时把“本轮跳过”这类纯噪声收起来（用户要求“干净、没有误解的界面”）；
+     有直播时照常逐条显示，便于排障。 */
+  const NOISE = new RegExp(["没有直播在录", "本轮跳过", "循环已启动", "本轮无事", "本轮无新段可转"].join("|"));
+  const noteRows = (liveNow ? notes : notes.filter((l) => !NOISE.test(String(l.msg || ""))))
     .map((l) => {
       const k = obsNoteKind(l.msg);
       return `<div class="obs-note"><span class="badge ${k.cls}">${k.label}</span><span class="mono-sm">${obsTime(l.atIso || l.at)}</span><span>${esc(l.msg)}</span></div>`;
@@ -296,7 +306,9 @@ function renderObserve(box) {
        原来只写「边录边转 N 场」，会被读成"正在录 N 场"—— 但它其实是**有预转写进度记录**的场次数，
        与"此刻在不在录"无关（录制结束后那一条会一直留着，等导入时命中）。
        现在写成「有进度 N 场（录制中 M 场）」，一眼能分清。 */
-    `边录边转 <b>${pre.length}</b> 场有进度${pre.length ? `（其中本段仍在写 <b>${pre.filter((p) => p.stillWriting).length}</b> 场）` : ''}`,
+    preActive.length
+      ? `边录边转 <b>${preActive.length}</b> 场进行中${pre.filter((p) => p.stillWriting).length ? `（仍在写 <b>${pre.filter((p) => p.stillWriting).length}</b> 场）` : ''}`
+      : '边录边转 <b>空闲</b>',
     `压制/上传 <b>${queue.length}</b> 个`,
     `内存 <b>${mem.rssMB ?? '—'}</b> MB`,
     `同步于 ${o.at.toLocaleTimeString('zh-CN', { hour12: false })}`,
@@ -332,11 +344,11 @@ function renderObserve(box) {
     </div>
 
     <div class="card">
-      <div class="card-head"><b>② 边录边转（预转写）</b><span class="badge ${preActive.length ? 'b-done' : ''}">${preActive.length} 场进行中${preHistory ? ` · 另有 ${preHistory} 条历史记录` : ''}</span></div>
+      <div class="card-head"><b>② 边录边转（预转写）</b><span class="badge ${preActive.length ? 'b-done' : ''}">${preActive.length ? preActive.length + ' 场进行中' : '当前空闲'}${preActive.length && preHistory ? ` · 另有 ${preHistory} 条历史记录` : ''}</span></div>
       ${
         preRows
           ? `<table class="tbl obs-tbl"><thead><tr><th>场次</th><th>已完成</th><th>路径</th><th>更新</th></tr></thead><tbody>${preRows}</tbody></table>`
-          : '<div class="empty">还没有场次留下进度（旧格式的历史状态不再显示——它没法区分是哪一场，显示出来只会误导）。若正在直播却为空，看下面的"最近判定"：多半是让路，或候选判定没命中。</div>'
+          : '<div class="empty">当前没有直播在录，也没有进行中的转写 —— 这里就该是空的。</div>'
       }`
       + `
       <div class="hintline">粒度：biliLive-tools 会把一场直播切成多个分段文件（<span class="mono-sm">.ts</span> / <span class="mono-sm">-PART001.ts</span>…）。<b>正在写的那个分段不会转</b>（末次写入距今不到 2 分钟即视为"仍在写入"），写完之后的下一次检查就会转它 —— 所以一场 4 小时的直播，下播时通常只剩最后一个分段要转。

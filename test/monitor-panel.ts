@@ -139,6 +139,15 @@ const html = fs.readFileSync(htmlPath, 'utf8');
      （用户截图 + 原话「这里的显示的太多了 而且是导入过的 优化他」）。
      规则：需要留意的才直接列表，已导入过的**默认收起**，重跑办法整块只写一次。 */
   ok('已导入过的那类被单独分出来', /const isImportedSkip = \(o\) =>/.test(html));
+  /* 「边录边转 N 场」必须写清是"有进度"而不是"正在录"（2026-10-14 用户截图问
+     「当检测到录制中时这里才会运行」—— 那一栏当时被读成"正在录 1 场"）。 */
+  ok('★ 「边录边转」那栏写清进行中场次（空闲时写"空闲"）', /边录边转 <b>空闲<\/b>|边录边转 <b>\$\{preActive\.length\}<\/b> 场进行中/.test(html) && /pre\.filter\(\(p\) => p\.stillWriting\)/.test(html));
+  /* C 方案（2026-10-14 用户连问两次"没在录了为什么还有进度"）：
+  ok('★ 徽标只数"进行中"；空闲时写"当前空闲"（用户要求空闲界面干净）', /当前空闲/.test(html) && /preActive\.length \? preActive\.length \+ ' 场进行中' : '当前空闲'/.test(html));
+     ② 每条打状态标签（仍在写 / 已导入 / 历史），并说明它读的是**进度文件**而非录制状态。 */
+  ok('★ 徽标：空闲写"当前空闲"；有进行中时写"N 场进行中"并按需带历史条数', /当前空闲/.test(html) && /preActive\.length && preHistory \?/.test(html));
+  ok('★ 每条记录带状态标签（仍在写 / 已导入 / 历史）', /badge b-run">仍在写</.test(html) && /badge b-done">已导入</.test(html) && />历史</.test(html));
+  ok('★ "进行中"的判据 = 仍在写 或 最近 30 分钟更新（历史不计入）', /preActive = pre\.filter\(\(p\) => p\.stillWriting \|\| Number\(p\.ageSec\) <= 1800\)/.test(html));
   /* 压制产物（`-弹幕版` / `-纯享版`）同样单独分出来（2026-10-13 用户截图：
      9 行"压制产物…完整版由 biliLive-tools 投"把「其它」占满，真正在录的那一行被淹没）。 */
   ok('★ 压制产物被单独分出来，且不参与「其它」计数', /const isProductSkip = \(o\) =>/.test(html) && /!isImportedSkip\(o\) && !isProductSkip\(o\)/.test(html));
