@@ -129,6 +129,20 @@ try {
   ok('★ 没有重新长出"五个阶段胶囊"那种噪声（阶段信息靠状态文案表达）', pills === 0, '胶囊数 ' + pills);
   ok('★ 时间列不再出现空的"（—）"', !/\(—\)/.test(String(runs.sample)), runs.sample.slice(0, 120));
 
+  /* ★ 2026-10-13 用户："做一个检测 biliLive-tools 的直播录制检测；当没有直播时边录边转的逻辑要对"。
+     判据：① 汇总条里的"录制中"必须来自录制器自报（不是文件近似）——问不到时如实写"问不到"；
+           ② 页面上要能看到每个录制器的主播/房间号/状态。 */
+  const recLine = await cdp.evalJs<string>(`(() => {
+    const txt = String(document.getElementById('otherPage').textContent || '');
+    return txt;
+  })()`);
+  ok('★ 汇总条显示录制中（来自 biliLive-tools 录制器状态）', /录制中/.test(recLine), recLine.slice(0, 100));
+  ok(
+    '★ 页面上列出了录制器（主播 / 房间号 / 未开播或正在直播 / 上次录制）',
+    /录制器（\d+ 个）|录制器状态问不到/.test(recLine),
+    recLine.slice(0, 200),
+  );
+
   ok('全程无未捕获异常', cdp.errors.length === 0, cdp.errors[0]?.slice(0, 160));
 } finally {
   await close();

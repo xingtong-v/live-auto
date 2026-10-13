@@ -239,6 +239,17 @@ export class Orchestrator {
     }
   }
 
+  /** 问一次 biliLive-tools：有没有在录（失败保持上一次的值，避免误判） */
+  private async refreshRecorderLiving(): Promise<void> {
+    try {
+      const list = await this.client.recorderList();
+      if (!Array.isArray(list) || list.length === 0) return;
+      this.lastRecorderLiving = list.some((r) => r.liveInfo?.living === true || /recording/i.test(String(r.state ?? '')));
+    } catch {
+      /* 问不到：保持上一次的值（首次仍为 null ⇒ tick 不拦） */
+    }
+  }
+
   /** 预转写循环的定时器（P1-6，2026-10-14）：只有 asr.incrementalEnabled=true 时才会被创建 */
   private preTranscribeTimer?: NodeJS.Timeout;
   /**
@@ -247,6 +258,12 @@ export class Orchestrator {
    * 每次都打印又会每 2 分钟刷一行、24/7 下太吵 ⇒ 折中为**每 10 分钟最多一行**。
    */
   private lastPreTranscribeIdleLogAt = 0;
+  /**
+   * biliLive-tools 自报的"有没有在录"（null = 还没问过/问不到）。
+   * 由预转写循环每轮刷新一次（异步），tick 只读这个值 —— 这样门控是同步的、且不会因为
+   * 一次接口异常就误判成"没在录"（异常保持上一次的值，仍为 null 时不拦）。
+   */
+  private lastRecorderLiving: boolean | null = null;
   /** 「本轮让路」的上次原因与时间（同一原因 10 分钟内只记一条，见 preTranscribeTick） */
   private lastPreTranscribeYieldReason = '';
   private lastPreTranscribeYieldLogAt = 0;
@@ -767,6 +784,8 @@ export class Orchestrator {
        默认 asr.incrementalEnabled=false ⇒ 这个循环**根本不启动**（零行为变化）。 */
     const preTranscribeTick = async (): Promise<void> => {
       try {
+        /* 每轮先问一次 biliLive-tools 的录制状态，tick 的门控只读结果（同步、不受接口抖动影响） */
+        await this.refreshRecorderLiving();
         const sum = await runPreTranscribeTick({
           enabled: true, // 只有开启时才会启动这个循环
           recordingCandidates: () =>
@@ -799,6 +818,9 @@ export class Orchestrator {
              现在按本意收窄：**只有流水线真的在做转写（TRANSCRIBING）时才让路**（那才会抢
              GPU/显存，实测会双双卡死）；切片段 / 上传 / 分析都不使用 ASR，不该拦。
              保守处理：流水线忙但**阶段未知**时仍然让路（宁可少转，不可撞车）。 */
+          /* ★ 2026-10-13：把"有没有在录"交给 biliLive-tools 自己回答（录制器状态），
+             而不是靠文件时间推断。查不到（网络/接口异常）返回 undefined ⇒ tick 不会因此跳过本轮。 */
+          liveNow: () => (this.lastRecorderLiving === null ? undefined : this.lastRecorderLiving),
           shouldWork: () => {
             /* 注意：`TRANSCRIBING` 是 **status** 的取值，不是 `stage`（stage 只有
                IDLE/RECORDED/TRANSCRIBED/ANALYZED/CLIPPED/PUBLISHED）—— 类型系统当场拦下过这个错。 */

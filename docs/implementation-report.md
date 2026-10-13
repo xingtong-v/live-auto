@@ -5915,3 +5915,49 @@ const target = body.querySelector(`#c_${leaf}`) ? `c_${leaf}` : '';   // leaf = 
 真机验收（并入 `tools/verify-llc-rooms-ui.ts`）：**10/0**，新增两条断言 ——
 顶栏出现"轮询覆盖 N 个直播间"、设置里有"目录轮询覆盖全部主播"的说明。
 全量链 **67 步通过**。
+
+## 92. 接上 biliLive-tools 的真实录制状态（2026-10-13）
+
+用户要求：「运行检测 做一个检测 biliLive-tools 的直播录制检测；当没有直播时，边录边转的逻辑要对」。
+
+### 92.1 真信号：`GET /recorder/list`
+
+找的过程（都记下来，免得下次再找）：
+
+| 试探 | 结果 |
+|---|---|
+| `/record-history/recording` | **405**（路由在，但不是这个用法） |
+| `/record-history/list` | 200，但只列**已完成**的记录（每条都有 `record_end_time`）⇒ 判不了"此刻在录" |
+| **`/recorder/list`** | **200** ✓ 就是它 |
+
+返回结构（`payload.data[]`，每个录制器）：
+
+```
+channelId: "22886883"   remarks: "星瞳_Official"   state: "idle"
+liveInfo: { living: false, owner, title, liveStartTime, recordStartTime }
+extra:    { lastRecordTime: 1791902494036 }
+```
+
+### 92.2 接进系统的四处
+
+| 位置 | 改动 |
+|---|---|
+| `src/api.ts` | 新增 `recorderList()`（注意结构是 `payload.data`，不是常见的 `data`） |
+| `src/server.ts` | 新增 `recorderStatus()`（汇总 `recording`/`live` + 每个录制器的明细），放进 `/api/observe` 的 `recorder` |
+| 运行观测页 | 汇总条的「录制中」**优先用录制器自报**；问不到时如实写"问不到"，并退回文件是否在写；再列一行"录制器（N 个）：主播 · 房间号 · 未开播/正在直播 · 上次录制 X 前" |
+| 预转写门控 | `liveNow()` 注入：**false ⇒ 连候选都不列**（省掉无谓扫盘），日志写"当前没有直播在录（录制器全部空闲）"；**undefined（问不到）⇒ 不拦**（接口抖动不该让边录边转空转） |
+
+### 92.3 更正一条我先前说错的结论
+
+我在 §90 说过"我们配置的房间号与 biliLive-tools 里的房间号**都不是同一个数字**（可能短号/长号）"——**这是错的**。
+`/recorder/list` 的 `channelId` 正是 **22886883**，与我们配置**完全一致**；
+`webhook.rooms` 的键（另两个数字）是**另一套 id**（webhook/主播维度），不是录制器的频道号。抱歉。
+
+### 92.4 验收
+
+| 项 | 结果 |
+|---|---|
+| `test/pre-transcribe-tick.ts` | **31/0**（新增 4 组：没有直播时不列候选 / 问不到不拦 / 在播照常 / 未注入行为不变） |
+| `tools/verify-observe-ui.ts` | **24/0**（新增：汇总条显示录制中、页面列出录制器明细） |
+| 全量链 | **67 步 / 261.9 秒 / 退出码 0** |
+| 真机对照 | 录制器 `living=false, state=idle` 与"磁盘上没有文件在写"一致（两个来源互相印证） |

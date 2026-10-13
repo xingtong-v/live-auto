@@ -804,6 +804,36 @@ export class BiliLiveClient {
     return [];
   }
 
+  /**
+   * GET /recorder/list —— biliLive-tools 的**录制器列表**（2026-10-13 找到的真信号）。
+   *
+   * 为什么重要：在那之前，"有没有在录"只能靠"文件最近有没有被写"这种近似推断；
+   * 而这个接口直接给出每个录制器的 `liveInfo.living`（在不在播）与 `state`（idle/recording…），
+   * 还有 `channelId`（就是房间号）、`remarks`（主播名）、`extra.lastRecordTime`（上次录制时间）。
+   * 实测：两个录制器 living=false / state=idle，与磁盘上"没有文件在写"完全一致。
+   *
+   * ⚠️ 返回结构是 `{ payload: { data: [...] } }`（不是常见的 `{ data }`）。
+   */
+  async recorderList(): Promise<
+    Array<{
+      id?: string;
+      providerId?: string;
+      channelId?: string;
+      remarks?: string;
+      channelURL?: string;
+      state?: string;
+      liveInfo?: { living?: boolean; owner?: string; title?: string; liveStartTime?: string; recordStartTime?: string };
+      extra?: { lastRecordTime?: number };
+    }>
+  > {
+    const res = await this.request<{ payload?: { data?: unknown }; data?: unknown }>('/recorder/list', {
+      purpose: '检查直播录制状态',
+      tag: 'recorder',
+    });
+    const arr = (res?.payload?.data ?? res?.data ?? []) as unknown;
+    return Array.isArray(arr) ? (arr as Array<Record<string, unknown>>).map((x) => x as never) : [];
+  }
+
   /** 取投稿用 uid（取第一个账号） */
   async primaryUid(): Promise<BiliUser | undefined> {
     const users = await this.userList();

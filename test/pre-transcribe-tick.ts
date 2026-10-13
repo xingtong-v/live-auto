@@ -200,6 +200,53 @@ section('6. loadDone 生效 + 仍在写的分段如实标注');
 }
 
 console.log('\n' + '─'.repeat(74));
+
+section('★ biliLive-tools 录制状态门控（2026-10-13：用户要求"没有直播时边录边转的逻辑要对"）');
+{
+  /* 夹具形状照抄本文件既有的用法：tick 先列候选（recordingCandidates），再对每个候选扫分段（discoverSegments） */
+  const mk = (liveNow?: () => boolean | undefined) => ({
+    enabled: true,
+    recordingCandidates: () => [{ videoPath: 'x.flv', title: '某场' }],
+    discoverSegments: () => SEGS,
+    transcribe: async () => ({ cues: 1, coveredSec: 1 }),
+    statOf: closed,
+    loadDone: () => undefined,
+    saveState: () => undefined,
+    log: noopLog,
+    ...(liveNow ? { liveNow } : {}),
+  });
+  /* ① 明确"没有直播在录" ⇒ 连候选都不列，并说明白原因 */
+  {
+    let listCalls = 0;
+    const base = mk(() => false);
+    const r = await runPreTranscribeTick({
+      ...base,
+      recordingCandidates: () => {
+        listCalls++;
+        return [{ videoPath: 'x.flv' }];
+      },
+    });
+    eq('没有直播时连候选都不列（省掉无谓扫盘）', listCalls, 0);
+    eq('汇总全 0', [r.scanned, r.worked, r.ready], [0, 0, 0]);
+    ok('并如实说明原因（录制器全部空闲）', /没有直播在录|全部空闲/.test(r.notes.join(' ')), r.notes.join(' '));
+  }
+  /* ② 问不到（undefined）⇒ 不许拦：接口抖动不该让边录边转空转 */
+  {
+    const r = await runPreTranscribeTick(mk(() => undefined));
+    eq('问不到录制状态时照常扫候选（不拦）', r.scanned, 1);
+  }
+  /* ③ 明确"在播" ⇒ 照常干活 */
+  {
+    const r = await runPreTranscribeTick(mk(() => true));
+    eq('在播时照常扫候选', r.scanned, 1);
+    eq('并且真的转了（2 段）', r.worked, 1);
+  }
+  /* ④ 旧调用方没注入 liveNow ⇒ 行为不变 */
+  {
+    const r = await runPreTranscribeTick(mk());
+    eq('没注入 liveNow 时行为不变', r.scanned, 1);
+  }
+}
 console.log(`\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);
 if (failures.length) {
   console.log('\n失败项：');

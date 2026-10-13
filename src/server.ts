@@ -3191,6 +3191,26 @@ export class UiServer {
           total: Math.max(segs.length, 1),
           parts: segs.length,
           stillWriting,
+          /* ★ 这一场是否**已经导入过**（2026-10-14 用户两次问「没在录了为什么还有进度」）：
+             面板读的是录像目录里的**进度文件**，录制结束、任务也被策略清理之后它仍然在，
+             于是那一栏会永远挂着"N 场有进度"。带上这个标记，界面才能把
+             "还在录 / 已导入 / 历史" 分开说清楚，而不是让人以为还有活在跑。
+             判据：台账里有没有以这些分段为源的任务（路径大小写不敏感）。 */
+          imported: (() => {
+            try {
+              const want = new Set(segs.map((p) => String(p).toLowerCase()));
+              if (want.size === 0) return false;
+              return this.orch.ledger.listTasks({ limit: 500 }).some((t) => {
+                const files = [
+                  ...(t.source?.segments ?? []).map((s) => String(s.path)),
+                  ...(t.source?.rawFiles ?? []),
+                ].map((p) => p.toLowerCase());
+                return files.some((f) => want.has(f));
+              });
+            } catch {
+              return false; // 台账读不到就当"没导入"，只是一个标签，不影响主流程
+            }
+          })(),
           updatedAt: rec.updatedAt ?? '',
           mode: rec.mode ?? 'incremental',
           ageSec,
@@ -3235,6 +3255,11 @@ export class UiServer {
     }
 
     /* 最近几场（端到端视角） */
+    /* biliLive-tools 的真实录制状态（用户 2026-10-13 要求："做一个检测 biliLive-tools 的直播录制检测"）。
+       有了它，"现在到底有没有在录"不再靠文件时间猜；文件那套仍然保留作**交叉校验**，
+       两者不一致时页面上如实标出来（比只显示一个来源更有说服力）。 */
+    const recorder = await this.recorderStatus();
+
     const timeline = orch.ledger
       .listTasks({ limit: 5 })
       .map((x) => {
@@ -3311,7 +3336,43 @@ export class UiServer {
       preTranscribeLog: preTranscribeLog.slice(-6),
       asrHealth: asrHealth.slice(-4),
       timeline,
+      /** biliLive-tools 自报的录制状态（真信号；ok=false 表示这次没问到） */
+      recorder,
     };
+  }
+
+  /**
+   * 问 biliLive-tools：现在有没有在录制。返回**每个录制器**的状态 + 一个汇总。
+   *
+   * 为什么不用文件时间推断：那是"事后近似"（一个刚写完的文件与一个正在写的文件看起来一样）。
+   * 这个接口给的是录制器自己的 `liveInfo.living` / `state`。
+   * ⚠️ 问不到时**不要**据此判定"没在录"（宁可退回文件信号，也不误报"没有直播"而让预转写空转）。
+   */
+  private async recorderStatus(): Promise<{
+    ok: boolean;
+    recording: number;
+    live: number;
+    recorders: Array<{ channelId: string; owner: string; living: boolean; state: string; lastRecordSec: number | null }>;
+    error?: string;
+  }> {
+    try {
+      const list = await this.orch.client.recorderList();
+      const recorders = list.map((r) => ({
+        channelId: String(r.channelId ?? ''),
+        owner: String(r.remarks ?? r.liveInfo?.owner ?? ''),
+        living: r.liveInfo?.living === true,
+        state: String(r.state ?? ''),
+        lastRecordSec: typeof r.extra?.lastRecordTime === 'number' ? Math.max(0, Math.round((Date.now() - r.extra.lastRecordTime) / 1000)) : null,
+      }));
+      return {
+        ok: true,
+        recording: recorders.filter((x) => /recording/i.test(x.state)).length,
+        live: recorders.filter((x) => x.living).length,
+        recorders,
+      };
+    } catch (e) {
+      return { ok: false, recording: 0, live: 0, recorders: [], error: (e as Error).message };
+    }
   }
 
   /**

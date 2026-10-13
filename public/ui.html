@@ -5317,17 +5317,33 @@ function renderObserve(box) {
   const preRows = pre
     .map((p) => {
       const pct = p.total > 0 ? Math.round((p.done / p.total) * 100) : 0;
+      /* 每条记录都打状态标签（2026-10-14 用户两次问「没在录了为什么还有进度」）：
+         这一栏读的是录像目录里的**进度文件**，不是"当前录制状态"，所以必须说清它属于哪种：
+           · 仍在写 → 这一场正在录；
+           · 已导入 → 那场已经进过流水线（记录留着只为命中缓存），不会再变；
+           · 历史   → 超过 1 小时没更新且没查到对应任务（多半是旧场次留下的）。 */
+      const state = p.stillWriting
+        ? '<span class="badge b-run">仍在写</span>'
+        : p.imported
+          ? '<span class="badge b-done">已导入</span>'
+          : p.ageSec > 3600
+            ? '<span class="badge">历史</span>'
+            : '<span class="badge b-done">最近</span>';
       return `<tr>
         <td><span class="obs-strong">${esc(p.name)}</span><span class="obs-dim">${p.dir ? ' · ' + esc(p.dir) : ''}</span></td>
         <td>${obsBar(pct, 'ok')} <span class="mono-sm">${p.done}/${p.total} 段</span></td>
         <td>
           ${p.mode === 'fallback' ? '<span class="badge b-fail">已回退整段</span>' : '<span class="badge b-done">分段增量</span>'}
-          ${p.stillWriting ? '<span class="badge b-run">这一场仍在录</span>' : ''}
+          ${state}
         </td>
         <td class="mono-sm">${obsAgo(p.ageSec)}</td>
       </tr>`;
     })
     .join('');
+  /* 「进行中」只算**仍在写或最近 30 分钟更新过**的；其余算历史记录（保留在表里，但不计入数字）——
+     否则一场直播结束、任务也被策略清理之后，这一栏会永远挂着"1 场有进度"。 */
+  const preActive = pre.filter((p) => p.stillWriting || Number(p.ageSec) <= 1800);
+  const preHistory = pre.length - preActive.length;
 
   const noteRows = notes
     .map((l) => {
@@ -5366,8 +5382,20 @@ function renderObserve(box) {
     .map((h) => `<div class="obs-note"><span class="mono-sm">${obsTime(h.atIso || h.at)}</span><span>${esc(h.msg)}</span></div>`)
     .join('');
 
+  /* ★ 2026-10-13 用户要求"做一个检测 biliLive-tools 的直播录制检测"。
+     原来"录制中"是数**文件正在长**的个数（事后近似）；现在优先用 biliLive-tools 录制器自报的
+     `liveInfo.living` / `state`（真信号），文件那套只作交叉校验与兜底。
+     两个来源不一致时把两边都写出来 —— 不一致本身就是值得看的信息。 */
+  const rec = o.recorder || { ok: false, recording: 0, live: 0, recorders: [] };
+  const growingN = recording.filter((r) => r.growing).length;
+  const recN = rec.ok ? Number(rec.live || 0) : null;
+  const recLabel = !rec.ok
+    ? `录制中 <b>?</b>（biliLive-tools 问不到）`
+    : recN === 0 && growingN === 0
+      ? `录制中 <b>0</b>（录制器全部空闲）`
+      : `录制中 <b>${recN}</b>${growingN && growingN !== recN ? `（文件在写 ${growingN}）` : ''}`;
   const summary = [
-    `录制中 <b>${recording.filter((r) => r.growing).length}</b>`,
+    recLabel,
     /* ⚠️ 措辞必须把"两种场次"分开（2026-10-14 用户截图问「当检测到录制中时这里才会运行」）：
        原来只写「边录边转 N 场」，会被读成"正在录 N 场"—— 但它其实是**有预转写进度记录**的场次数，
        与"此刻在不在录"无关（录制结束后那一条会一直留着，等导入时命中）。
@@ -5386,6 +5414,16 @@ function renderObserve(box) {
         <button class="btn-sm" id="obsPause">${state.obs.paused ? '继续刷新' : '暂停刷新'}</button>
       </div>
       <div class="hintline">只读页：边录边转进度、压制/上传明细、资源与 ASR 体检。时间一律<b>本地时区</b>（日志里存的是 UTC）。</div>
+      ${rec.ok && rec.recorders.length
+        ? `<div class="hintline">biliLive-tools 录制器（${rec.recorders.length} 个）：${rec.recorders
+            .map(
+              (x) =>
+                `<b>${esc(x.owner || x.channelId)}</b> 房间 ${esc(x.channelId)} · ${
+                  x.living ? '<span class="badge b-run">正在直播</span>' : '<span class="badge">未开播</span>'
+                } · 录制器 ${esc(x.state || '?')}${x.lastRecordSec === null ? '' : ` · 上次录制 ${obsAgo(x.lastRecordSec)}`}`,
+            )
+            .join('　|　')}</div>`
+        : `<div class="hintline">biliLive-tools 录制器状态问不到（${esc(rec.error || '接口异常')}）—— 此时"录制中"退回按文件是否在写判断，不影响边录边转。</div>`}
     </div>
 
     <div class="card">
@@ -5398,7 +5436,7 @@ function renderObserve(box) {
     </div>
 
     <div class="card">
-      <div class="card-head"><b>② 边录边转（预转写）</b><span class="badge ${pre.length ? 'b-done' : ''}">${pre.length} 场有进度</span></div>
+      <div class="card-head"><b>② 边录边转（预转写）</b><span class="badge ${preActive.length ? 'b-done' : ''}">${preActive.length} 场进行中${preHistory ? ` · 另有 ${preHistory} 条历史记录` : ''}</span></div>
       ${
         preRows
           ? `<table class="tbl obs-tbl"><thead><tr><th>场次</th><th>已完成</th><th>路径</th><th>更新</th></tr></thead><tbody>${preRows}</tbody></table>`

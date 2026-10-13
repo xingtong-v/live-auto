@@ -34,6 +34,11 @@ export interface PreTranscribeTickDeps {
   discoverSegments: (videoPath: string) => MediaSegment[];
   transcribe: (seg: MediaSegment) => Promise<{ cues: number; coveredSec: number }>;
   statOf: (p: string) => { mtimeMs: number } | undefined;
+  /**
+   * "现在有没有直播在录"（注入）。返回 `undefined` = 问不到 ⇒ **不拦本轮**
+   * （接口抖动不该让边录边转空转）。真实现问 biliLive-tools 的录制器状态，见 daemon.ts。
+   */
+  liveNow?: () => boolean | undefined;
   /** 读该场已做过的分段（避免重复转写）；返回 undefined 表示没做过 */
   loadDone: (videoPath: string) => number[] | undefined;
   /** 保存结果（调用方决定落盘位置） */
@@ -60,12 +65,25 @@ export interface PreTranscribeTickSummary {
   ready: number;
   /** 给人看的说明（进日志） */
   notes: string[];
+  /**
+   * 本轮因为"让路"而没跑（原因原文）。
+   *
+   * ⚠️ 单独一个字段、**不塞进 notes**（2026-10-13 用户截图）：这个循环每 120 秒一轮，
+   * 而一场转写要十几分钟 —— 让路原因若每轮都进 notes，就会连刷十几行，
+   * 把「最近判定」面板整块占满。怎么记、隔多久重复记，交给调用方决定（daemon 里限频）。
+   */
+  yielded?: string;
 }
 
 /**
  * 跑一轮。**不抛错**（单场失败记进 notes，不影响其它场、更不影响录制/导入）。
  */
 export async function runPreTranscribeTick(deps: PreTranscribeTickDeps): Promise<PreTranscribeTickSummary> {
+  /* 没有直播在录 ⇒ 直接跳过（依据是 biliLive-tools 的录制器状态；问不到就不拦，见 deps.liveNow） */
+  if (deps.liveNow && deps.liveNow() === false) {
+    return { scanned: 0, worked: 0, ready: 0, notes: ['当前没有直播在录（biliLive-tools 录制器全部空闲），本轮跳过'] };
+  }
+
   const summary: PreTranscribeTickSummary = { scanned: 0, worked: 0, ready: 0, notes: [] };
 
   /* 门控在最前面：关闭时**什么也不做**（连候选都不列）—— 这条要能被断言看到 */
@@ -75,7 +93,7 @@ export async function runPreTranscribeTick(deps: PreTranscribeTickDeps): Promise
      放在候选之前 —— 让路时连 discover 都不做，避免白读盘。 */
   const gate = deps.shouldWork?.();
   if (gate && !gate.ok) {
-    summary.notes.push(`本轮让路：${gate.reason ?? '调用方门控未通过'}`);
+    summary.yielded = gate.reason ?? '调用方门控未通过';
     return summary;
   }
 
@@ -92,7 +110,14 @@ export async function runPreTranscribeTick(deps: PreTranscribeTickDeps): Promise
      "是它没在跑、还是跑了但没候选、还是候选都不满足条件" —— 因为原来只有"做了事"才 push note。
      加这一条之后，每 2 分钟至少有一行"本轮无事：…"，验证时一眼能看出判定路径。 */
   if (candidates.length === 0) {
-    summary.notes.push('本轮无事：没有候选场次（当前没有正在录制的场次）');
+    /* ★ 2026-10-13 用户要求"当没有直播时，边录边转的逻辑要对"：
+       区分「没有直播在录」与「有直播但没有可转的新段」——
+       前者是正常休息，后者才需要盯着看（可能候选判定没命中）。 */
+    summary.notes.push(
+      deps.liveNow && deps.liveNow() === false
+        ? '本轮无事：biliLive-tools 的录制器全部空闲（当前没有直播在录）'
+        : '本轮无事：没有候选场次（当前没有正在录制的场次）',
+    );
   }
 
   const closedBefore = deps.closedBeforeMs ? deps.closedBeforeMs() : Date.now() - 120_000;
