@@ -29,6 +29,27 @@ import {usePreTranscribed, decodePreTranscribeState, encodePreTranscribeState, p
  * 内容只有 { done: number[], updatedAt, mode }，是**可重建**的进度文件（丢了最多重转一段）。
  */
 const PRE_TRANSCRIBE_STATE_FILE = '.pre-transcribe.json';
+
+/**
+ * 预转写轮询的两个节奏（2026-10-13 用户问"当文件不长了，这里还需要一直轮询吗"）。
+ *
+ * 为什么要轮询：biliLive-tools **不会**主动告诉我们"开播了"（除非配它的 webhook），
+ * 所以必须周期性地问一句；但"没直播的时候"没必要问得那么勤。
+ *
+ * 所以：连续 N 轮都是"没有直播在录" ⇒ 降频到 10 分钟；一旦发现**在播** ⇒ 立刻回到 120 秒。
+ * 代价：一场直播开始后，最坏情况要等一个降频周期才发现（≤10 分钟）—— 但第一个分段本来就
+ * 要写完 + 静默 2 分钟才会被转，而且**压制/上传/切片都不走这条循环**（它们由目录轮询驱动），
+ * 所以对出片时间没有影响。
+ */
+const PRE_TRANSCRIBE_ACTIVE_MS = 120_000;
+const PRE_TRANSCRIBE_IDLE_MS = 600_000;
+/** 连续几轮"没直播"才降频（避免开播前的抖动来回切） */
+const PRE_TRANSCRIBE_IDLE_ROUNDS = 3;
+
+/** 下一轮该等多久（纯函数，可单测） */
+export function nextPreTranscribeDelayMs(idleRounds: number): number {
+  return idleRounds >= PRE_TRANSCRIBE_IDLE_ROUNDS ? PRE_TRANSCRIBE_IDLE_MS : PRE_TRANSCRIBE_ACTIVE_MS;
+}
 import v8 from 'node:v8';
 import { BiliLiveClient } from './api.ts';
 import type { AppConfig } from './config.ts';
@@ -264,6 +285,10 @@ export class Orchestrator {
    * 一次接口异常就误判成"没在录"（异常保持上一次的值，仍为 null 时不拦）。
    */
   private lastRecorderLiving: boolean | null = null;
+  /** 连续多少轮"没有直播在录"（用于空闲降频；见 nextPreTranscribeDelayMs） */
+  private preTranscribeIdleRounds = 0;
+  /** 上一次记录的节奏（用于只在切换时打一行，别每轮刷） */
+  private preTranscribeIdleMode = false;
   /** 「本轮让路」的上次原因与时间（同一原因 10 分钟内只记一条，见 preTranscribeTick） */
   private lastPreTranscribeYieldReason = '';
   private lastPreTranscribeYieldLogAt = 0;
@@ -896,8 +921,14 @@ export class Orchestrator {
            · "本轮无事 / 本轮无新段可转"这类**说明性**的，每 10 分钟最多打一行 —— 既保留了
              "别每 2 分钟刷屏"的老语义，又不至于像这次真机验证那样事后一片空白
              （分不清是没在跑、没候选、还是候选都不满足条件）。 */
-        const idle = sum.notes.filter((n) => /本轮无事|本轮无新段可转/.test(n));
-        const busy = sum.notes.filter((n) => !/本轮无事|本轮无新段可转/.test(n));
+        /* ⚠️ 2026-10-13：新加的"当前没有直播在录…本轮跳过"也必须算**说明性噪声** ——
+           否则它会每 2 分钟刷一行（用户截图里就是连着四行）。 */
+        const idle = sum.notes.filter((n) => /本轮无事|本轮无新段可转|没有直播在录/.test(n));
+        const busy = sum.notes.filter((n) => !/本轮无事|本轮无新段可转|没有直播在录/.test(n));
+        /* 更新空闲轮数：这一轮到底有没有直播在录（tick 的说明里写着） */
+        const noLive = sum.notes.some((n) => /没有直播在录/.test(n));
+        this.preTranscribeIdleRounds = noLive ? this.preTranscribeIdleRounds + 1 : 0;
+
         for (const n of busy) this.logger.info(`预转写：${n}`, { mod: 'asr' });
         if (idle.length > 0 && Date.now() - this.lastPreTranscribeIdleLogAt > 10 * 60 * 1000) {
           this.lastPreTranscribeIdleLogAt = Date.now();
@@ -920,14 +951,29 @@ export class Orchestrator {
         /* 预转写是"锦上添花"：失败绝不影响录制、导入与既有流程 */
         this.logger.warn('预转写一轮异常（不影响录制/导入）', { data: { error: (e as Error).message } });
       }
-      this.preTranscribeTimer = setTimeout(() => void preTranscribeTick(), 120_000);
+      /* 空闲降频（见 nextPreTranscribeDelayMs）：连续几轮没直播 ⇒ 放到 10 分钟；
+         一发现"在播"就回到 120 秒。切换时各打一行，平时不刷。 */
+      const nowIdle = this.preTranscribeIdleRounds >= PRE_TRANSCRIBE_IDLE_ROUNDS;
+      if (nowIdle !== this.preTranscribeIdleMode) {
+        this.preTranscribeIdleMode = nowIdle;
+        this.logger.info(
+          nowIdle
+            ? `预转写：连续 ${this.preTranscribeIdleRounds} 轮没有直播在录 ⇒ 降频为每 10 分钟问一次（开播后自动恢复 120 秒）`
+            : '预转写：检测到在录制 ⇒ 恢复每 120 秒问一次',
+          { mod: 'asr' },
+        );
+      }
+      this.preTranscribeTimer = setTimeout(() => void preTranscribeTick(), nextPreTranscribeDelayMs(this.preTranscribeIdleRounds));
       this.preTranscribeTimer.unref?.();
     };
     if (this.cfg.asr.incrementalEnabled === true) {
       /* 启动时明确记一条：这一段是给"我到底起没起来"留的证据 ——
          没有它，用户开了开关、重启了服务，也只能靠"日志里有没有 预转写 行"反推，
          而那个循环在没在录的时候**什么都不会打印**（刻意的：不做无事可做的噪声）。 */
-      this.logger.info('预转写循环已启动（每 120 秒检查一次；只在有场次正在录制时才会有输出）', { mod: 'asr' });
+      this.logger.info(
+        `预转写循环已启动（有直播时每 ${PRE_TRANSCRIBE_ACTIVE_MS / 1000} 秒问一次；连续 ${PRE_TRANSCRIBE_IDLE_ROUNDS} 轮没有直播就降频到 ${PRE_TRANSCRIBE_IDLE_MS / 60000} 分钟，开播后自动恢复）`,
+        { mod: 'asr' },
+      );
       this.preTranscribeTimer = setTimeout(() => void preTranscribeTick(), 60_000);
       this.preTranscribeTimer.unref?.();
     } else {

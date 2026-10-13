@@ -9,6 +9,7 @@
  *   ⑤ 仍在写的分段如实记"仍在写"（不是失败，是等它闭合）。
  */
 import { runPreTranscribeTick } from '../src/pre-transcribe-tick.ts';
+import { nextPreTranscribeDelayMs } from '../src/daemon.ts';
 import type { MediaSegment } from '../src/media-plan.ts';
 
 let pass = 0;
@@ -246,6 +247,15 @@ section('★ biliLive-tools 录制状态门控（2026-10-13：用户要求"没�
     const r = await runPreTranscribeTick(mk());
     eq('没注入 liveNow 时行为不变', r.scanned, 1);
   }
+}
+
+section('★ 空闲降频：没直播时不必要每 2 分钟问一次（2026-10-13 用户提问）');
+{
+  eq('刚开播/在播 ⇒ 120 秒', nextPreTranscribeDelayMs(0), 120_000);
+  eq('空闲 1 轮 ⇒ 仍是 120 秒（别被抖动来回切）', nextPreTranscribeDelayMs(1), 120_000);
+  eq('空闲 2 轮 ⇒ 仍是 120 秒', nextPreTranscribeDelayMs(2), 120_000);
+  eq('★ 连续 3 轮没直播 ⇒ 降到 10 分钟', nextPreTranscribeDelayMs(3), 600_000);
+  eq('★ 空闲再久也还是 10 分钟（不会无限拉长）', nextPreTranscribeDelayMs(99), 600_000);
 }
 console.log(`\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);
 if (failures.length) {
