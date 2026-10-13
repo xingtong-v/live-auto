@@ -3117,13 +3117,38 @@ export class UiServer {
     const preTranscribe = files
       .filter((f) => f.name === '.pre-transcribe.json')
       .map((f) => {
+        const dir = path.dirname(f.path);
         try {
-          const j = JSON.parse(fs.readFileSync(f.path, 'utf8')) as { done?: number[]; mode?: string };
-          const dir = path.dirname(f.path);
-          const parts = fs.readdirSync(dir).filter((x) => /-PART\d+\.(ts|flv|mp4)$/i.test(x)).length;
-          return { name: path.basename(dir), done: (j.done ?? []).length, total: Math.max(parts, (j.done ?? []).length, 1), mode: j.mode ?? 'segmented', ageSec: f.ageSec };
+          const j = JSON.parse(fs.readFileSync(f.path, 'utf8')) as { done?: number[]; mode?: string; updatedAt?: string };
+          /* 录像文件的**主体名**：去掉 -PART### 与扩展名。
+             原来这里写的是目录名（某主播目录）—— 那是**主播名**，界面上一行"某主播目录"
+             根本看不出在转哪一场；而一场直播会被 biliLive-tools 切成
+             「…配十八个币，你别生气.ts」「…-PART001.ts」这样的多个分段，
+             所以主体名 + 分段数才是用户要的信息。 */
+          /* ⚠️ 取**最新**的那个录像文件，不是 readdir 的第一个：
+               一个主播目录里躺着几十场的历史录像，取第一个会显示成上个月那场
+               （实测第一次就显示成 "2026-09-24 …【3D】真心话？大冒险"，完全看不出在说哪一场）。 */
+          const recs = fs
+            .readdirSync(dir)
+            .filter((x) => /\.(ts|flv|mp4)$/i.test(x) && !/-弹幕版|-纯享版|-切片/.test(x))
+            .map((x) => ({ x, m: fs.statSync(path.join(dir, x)).mtimeMs }))
+            .sort((a, b) => b.m - a.m)
+            .map((y) => y.x);
+          const base = (recs[0] ?? path.basename(dir)).replace(/-PART\d+/i, '').replace(/\.[a-z0-9]+$/i, '');
+          const stillWriting = files.some((x) => path.dirname(x.path) === dir && x.ageSec < 120 && /\.(ts|flv|mp4)$/i.test(x.name));
+          return {
+            name: base,
+            dir: path.basename(dir),
+            done: (j.done ?? []).length,
+            total: Math.max(recs.length, (j.done ?? []).length, 1),
+            parts: recs.length,
+            stillWriting,
+            updatedAt: j.updatedAt ?? '',
+            mode: j.mode ?? 'segmented',
+            ageSec: f.ageSec,
+          };
         } catch {
-          return { name: path.basename(path.dirname(f.path)), done: 0, total: 1, mode: 'unreadable', ageSec: f.ageSec };
+          return { name: path.basename(dir), dir: path.basename(dir), done: 0, total: 1, parts: 0, stillWriting: false, updatedAt: '', mode: 'unreadable', ageSec: f.ageSec };
         }
       });
 
