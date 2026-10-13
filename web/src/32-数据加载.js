@@ -29,7 +29,16 @@ async function loadBootstrap() {
   $('#modeSwitch').classList.toggle('on', b.mode.autoPublish);
   $('#modeText').textContent = b.mode.autoPublish ? '全自动 · 免确认发布' : '半自动 · 需确认后发布';
   renderSubtitleSwitch();
-  $('#brandText').textContent = `房间 ${b.roomId} · v${b.version}` + (b.mode.isOnlySelf ? ' · 仅自己可见' : '') + (b.seasonConfigured ? '' : ' · 未配置合集');
+  /* 房间号只有一个（它只用于"开播触发"这条次要路径），而**导入走目录轮询**、
+     覆盖录制根目录下的全部主播 ⇒ 把覆盖数一并显示，免得看起来像"只处理一个直播间"
+     （2026-10-13 用户就是照这里问的："只能单个直播间吗，我想两个都显示"）。 */
+  const covered = Number(b.coveredStreamers || 0);
+  $('#brandText').textContent =
+    `房间 ${b.roomId}` +
+    (covered > 1 ? `（触发）· 轮询覆盖 ${covered} 个直播间` : covered === 1 ? ' · 轮询覆盖 1 个直播间' : '') +
+    ` · v${b.version}` +
+    (b.mode.isOnlySelf ? ' · 仅自己可见' : '') +
+    (b.seasonConfigured ? '' : ' · 未配置合集');
 }
 
 async function loadTasks() {

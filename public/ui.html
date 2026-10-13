@@ -638,7 +638,16 @@ async function loadBootstrap() {
   $('#modeSwitch').classList.toggle('on', b.mode.autoPublish);
   $('#modeText').textContent = b.mode.autoPublish ? '全自动 · 免确认发布' : '半自动 · 需确认后发布';
   renderSubtitleSwitch();
-  $('#brandText').textContent = `房间 ${b.roomId} · v${b.version}` + (b.mode.isOnlySelf ? ' · 仅自己可见' : '') + (b.seasonConfigured ? '' : ' · 未配置合集');
+  /* 房间号只有一个（它只用于"开播触发"这条次要路径），而**导入走目录轮询**、
+     覆盖录制根目录下的全部主播 ⇒ 把覆盖数一并显示，免得看起来像"只处理一个直播间"
+     （2026-10-13 用户就是照这里问的："只能单个直播间吗，我想两个都显示"）。 */
+  const covered = Number(b.coveredStreamers || 0);
+  $('#brandText').textContent =
+    `房间 ${b.roomId}` +
+    (covered > 1 ? `（触发）· 轮询覆盖 ${covered} 个直播间` : covered === 1 ? ' · 轮询覆盖 1 个直播间' : '') +
+    ` · v${b.version}` +
+    (b.mode.isOnlySelf ? ' · 仅自己可见' : '') +
+    (b.seasonConfigured ? '' : ' · 未配置合集');
 }
 
 async function loadTasks() {
@@ -3825,6 +3834,7 @@ async function openCfg() {
           <button class="btn-sm" id="btnFetchRooms" title="从 biliLive-tools 的录制配置（webhook.rooms）里读房间号，不用手打">从 biliLive-tools 读取</button>
         </div>
         <div class="hintline" id="roomPickHint">点右边按钮可以直接列出 biliLive-tools 里配好的直播间（含备注），选中即填入上面的输入框 —— 仍要你点「保存」才会生效。</div>
+        <div class="hintline">这个房间号只用于<b>开播触发</b>（次要路径，按它去查 B站 的 recent-clips）。<b>录像导入走的是目录轮询</b>：它扫描 biliLive-tools 的录制根目录，<b>包含全部主播子目录</b> ⇒ 多个直播间的录像都会被处理，<b>不需要</b>在这里逐个填。触发那条路要覆盖多个房间，需要把房间号扩成列表（目前没做）。</div>
       </div>
       <div class="field"><label>platform（必须首字母大写）</label><input class="inp" id="c_platform" value="${esc(c.room.platform)}" readonly>
         <div class="hintline">写成 bilibili 会<b>静默返回空数组</b>，触发永不生效（陷阱 #1）</div></div>
@@ -5358,7 +5368,11 @@ function renderObserve(box) {
 
   const summary = [
     `录制中 <b>${recording.filter((r) => r.growing).length}</b>`,
-    `边录边转 <b>${pre.length}</b> 场`,
+    /* ⚠️ 措辞必须把"两种场次"分开（2026-10-14 用户截图问「当检测到录制中时这里才会运行」）：
+       原来只写「边录边转 N 场」，会被读成"正在录 N 场"—— 但它其实是**有预转写进度记录**的场次数，
+       与"此刻在不在录"无关（录制结束后那一条会一直留着，等导入时命中）。
+       现在写成「有进度 N 场（录制中 M 场）」，一眼能分清。 */
+    `边录边转 <b>${pre.length}</b> 场有进度${pre.length ? `（其中本段仍在写 <b>${pre.filter((p) => p.stillWriting).length}</b> 场）` : ''}`,
     `压制/上传 <b>${queue.length}</b> 个`,
     `内存 <b>${mem.rssMB ?? '—'}</b> MB`,
     `同步于 ${o.at.toLocaleTimeString('zh-CN', { hour12: false })}`,

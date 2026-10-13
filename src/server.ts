@@ -838,6 +838,10 @@ export class UiServer {
         })(),
         stageLabels: STAGE_LABELS,
         roomId: cfg.room.roomId,
+        /* 轮询覆盖了几个直播间（= 录制根目录下的主播子目录数，且里面有录像）。
+           为什么值得显示：房间号只有一个，但**导入走的是目录轮询**（扫整个录制根目录，覆盖全部主播），
+           用户看到"房间 X"会以为只处理一个直播间（2026-10-13 用户就是照这个问的）。 */
+        coveredStreamers: this.countCoveredStreamers(),
         platform: cfg.room.platform,
         seasonConfigured: cfg.publish.seasonId > 0,
         // 排期预览：让界面能直接回答「首片什么时候发、最后一片什么时候发、
@@ -3308,6 +3312,37 @@ export class UiServer {
       asrHealth: asrHealth.slice(-4),
       timeline,
     };
+  }
+
+  /**
+   * 轮询实际覆盖了几个直播间：录制根目录下的**主播子目录**里，至少有一个录像文件的算一个。
+   * 只走一层（便宜），失败一律 0 —— 顶栏显示个数字而已，绝不该因为它影响页面加载。
+   */
+  private countCoveredStreamers(): number {
+    try {
+      const st = this.orch.watcher.status() as unknown as { dirs?: string[] };
+      let n = 0;
+      for (const dir of st.dirs ?? []) {
+        let entries: fs.Dirent[] = [];
+        try {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const e of entries) {
+          if (!e.isDirectory()) continue;
+          try {
+            const inner = fs.readdirSync(path.join(dir, e.name));
+            if (inner.some((x) => /\.(ts|flv|mp4|mkv)$/i.test(x) && !/-弹幕版|-纯享版/.test(x))) n++;
+          } catch {
+            /* 单个目录读不到就跳过 */
+          }
+        }
+      }
+      return n;
+    } catch {
+      return 0;
+    }
   }
 
   private async monitorView(): Promise<Record<string, unknown>> {

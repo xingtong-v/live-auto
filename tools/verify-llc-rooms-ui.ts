@@ -50,6 +50,21 @@ try {
     }))()`);
     ok('★ 点候选后房间号被填入输入框', realRooms.includes(picked.value), picked.value + ' / ' + picked.hint.slice(0, 60));
   }
+  /* ★ 2026-10-13 用户："只能单个直播间吗，我想两个都显示"。
+     结论：**导入走目录轮询，本来就覆盖全部主播**；房间号只用于"开播触发"。
+     所以界面要说清这件事 —— 顶栏给出覆盖数，设置里给出范围说明。 */
+  const bar = await cdp.evalJs<string>(`String((document.getElementById('brandText') || {}).textContent || '')`);
+  ok('★ 顶栏显示了"轮询覆盖 N 个直播间"（不再只像在说一个房间）', /轮询覆盖 \d+ 个直播间/.test(bar), bar);
+
+  await cdp.evalJs(`(() => { const b=[...document.querySelectorAll('button')].find((e)=>/^设置$/.test(String(e.textContent||'').trim()) && e.offsetParent!==null); if(b) b.click(); return true; })()`);
+  await sleep(1600);
+  const hint = await cdp.evalJs<string>(`(() => {
+    const i = document.getElementById('c_roomId');
+    const field = i ? i.closest('.field') : null;
+    return field ? String(field.textContent) : '';
+  })()`);
+  ok('★ 设置里说明了"房间号只管开播触发、导入靠目录轮询覆盖全部主播"', /目录轮询/.test(hint) && /全部主播/.test(hint), hint.slice(0, 160));
+
   ok('全程无未捕获异常', cdp.errors.length === 0, cdp.errors[0]?.slice(0, 160));
 } finally {
   await close();

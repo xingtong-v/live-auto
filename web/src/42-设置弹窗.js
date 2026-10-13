@@ -213,6 +213,7 @@ async function openCfg() {
           <button class="btn-sm" id="btnFetchRooms" title="从 biliLive-tools 的录制配置（webhook.rooms）里读房间号，不用手打">从 biliLive-tools 读取</button>
         </div>
         <div class="hintline" id="roomPickHint">点右边按钮可以直接列出 biliLive-tools 里配好的直播间（含备注），选中即填入上面的输入框 —— 仍要你点「保存」才会生效。</div>
+        <div class="hintline">这个房间号只用于<b>开播触发</b>（次要路径，按它去查 B站 的 recent-clips）。<b>录像导入走的是目录轮询</b>：它扫描 biliLive-tools 的录制根目录，<b>包含全部主播子目录</b> ⇒ 多个直播间的录像都会被处理，<b>不需要</b>在这里逐个填。触发那条路要覆盖多个房间，需要把房间号扩成列表（目前没做）。</div>
       </div>
       <div class="field"><label>platform（必须首字母大写）</label><input class="inp" id="c_platform" value="${esc(c.room.platform)}" readonly>
         <div class="hintline">写成 bilibili 会<b>静默返回空数组</b>，触发永不生效（陷阱 #1）</div></div>
