@@ -90,6 +90,21 @@ try {
   ok('★ 状态显示为中文（没有裸露的英文枚举值）', leaked.length === 0, leaked.join(', ') || '—');
   ok('页面里能看到中文状态词（已发布/切片中/待确认 之类）', /已发布|切片中|待确认|已录完|转写中/.test(page.text), page.text.slice(0, 160));
 
+  /* ★ ④ 最近几场必须"人话"：每场是两行（标题 + 中文状态 / 阶段链 + 切片数 + 开始时间），
+     而不是一串 id。窄窗口下表格会把后面的列切掉，这也正是改成两行式的原因。 */
+  /* ⚠️ 必须先切回本页：这段断言原本插在"切到实时监控页"之后 ⇒ 页面上当然没有 .obs-run，
+     实测假红过一次（top:0）。凡是查本页 DOM 的断言，都得先确保本页在前台。 */
+  await cdp.evalJs(`document.querySelector('#tabs .tab[data-view="observe"]').click()`);
+  await sleep(3500);
+  const runs = await cdp.evalJs<{ top: number; withSteps: number; sample: string }>(`(() => {
+    const list = [...document.querySelectorAll('.obs-run')];
+    const withSteps = list.filter((r) => r.querySelectorAll('.obs-step').length >= 4).length;
+    return { top: list.length, withSteps, sample: list[0] ? String(list[0].textContent).slice(0, 160) : '' };
+  })()`);
+  ok('★ ④ 用两行式列表渲染（不是只有 id 的表格）', runs.top >= 1, JSON.stringify(runs));
+  ok('★ 每场都带阶段链（录制→转写→分析→切片→发布）', runs.withSteps === runs.top && runs.top > 0, JSON.stringify(runs));
+  ok('★ 场次显示的是标题/人话，不是一串 id', /[\u4e00-\u9fa5]/.test(runs.sample), runs.sample);
+
   ok('全程无未捕获异常', cdp.errors.length === 0, cdp.errors[0]?.slice(0, 160));
 } finally {
   await close();

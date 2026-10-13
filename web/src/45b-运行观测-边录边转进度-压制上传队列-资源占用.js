@@ -40,6 +40,16 @@ function ensureObserveStyle() {
 .obs-note { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-top: 1px dashed var(--border, #eee); font-size: 13px; }
 .obs-note:first-of-type { border-top: none; }
 .obs-sub { margin: 12px 0 4px; font-weight: 600; color: var(--text-3, #666); font-size: 13px; }
+.obs-runs { display: flex; flex-direction: column; }
+.obs-run { padding: 10px 2px; border-top: 1px dashed var(--border, #eee); }
+.obs-run:first-child { border-top: none; }
+.obs-run-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.obs-run-meta { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 5px; font-size: 13px; color: var(--text-3, #666); }
+.obs-steps { display: inline-flex; align-items: center; gap: 4px; }
+.obs-step { padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border, #e5e7eb); font-size: 12px; color: var(--text-3, #999); }
+.obs-step.done { border-color: #10b981; color: #047857; }
+.obs-step.on { border-color: #3b82f6; background: #3b82f6; color: #fff; font-weight: 600; }
+.obs-step-arrow { color: var(--border, #ddd); font-size: 11px; }
 `;
   document.head.appendChild(el);
 }
@@ -141,6 +151,17 @@ function obsQueueStatusText(raw) {
   return obsLabel((state.obs && state.obs.data && state.obs.data.mon && state.obs.data.mon.llcStatusLabels) || null, raw);
 }
 
+/** 阶段链：录制 → 转写 → 分析 → 切片 → 发布（当前步骤高亮，已过为实心） */
+function obsSteps(idx, labels) {
+  const steps = labels && labels.length ? labels : ['录制', '转写', '分析', '切片', '发布'];
+  return steps
+    .map((s, i) => {
+      const cls = idx === i ? 'on' : idx > i ? 'done' : 'off';
+      return `<span class="obs-step ${cls}">${esc(s)}</span>`;
+    })
+    .join('<span class="obs-step-arrow">→</span>');
+}
+
 function obsNoteKind(msg) {
   if (/让路/.test(msg)) return { cls: 'b-wait', label: '让路' };
   if (/已转 \d+\/\d+/.test(msg)) return { cls: 'b-done', label: '已转' };
@@ -215,15 +236,27 @@ function renderObserve(box) {
     })
     .join('');
 
+  /* ④ 每场两行：第一行"标题 + 中文状态"，第二行"阶段链 + 切片数 + 开始时间 + 短 id"。
+     为什么不用表格：窄窗口下后面的列会被切掉（用户截图里只剩"场次"一列），
+     而"哪里在跑、跑到哪一步"恰恰是后面那几列的信息。 */
   const tlRows = tl
-    .map(
-      (t) => `<tr>
-        <td class="mono-sm" title="${esc(t.id)}">${esc(String(t.id).replace(/^auto-/, ''))}</td>
-        <td><span class="badge ${/PUBLISHED/.test(t.status) ? 'b-done' : /FAIL|ERROR/.test(t.status) ? 'b-fail' : 'b-run'}" title="${esc(t.status)}">${esc(obsStatusText(t.status))}</span></td>
-        <td>${t.clips} 片 · 选中 ${t.selected}</td>
-        <td class="mono-sm">${esc(obsStamp(t.createdAt))}</td>
-      </tr>`,
-    )
+    .map((t) => {
+      const title = t.title && t.title.length > 1 ? t.title : String(t.id).replace(/^auto-/, '');
+      const short = String(t.id).replace(/^auto-\d{8}/, '');
+      const chip = /PUBLISHED/.test(t.status) ? 'b-done' : /FAIL|ERROR/.test(t.status) ? 'b-fail' : 'b-run';
+      return `<div class="obs-run">
+        <div class="obs-run-top">
+          <span class="obs-strong" title="${esc(t.id)}">${esc(obsFile(title, 46))}</span>
+          <span class="badge ${chip}" title="${esc(t.status)}">${esc(t.statusText || obsStatusText(t.status))}</span>
+        </div>
+        <div class="obs-run-meta">
+          <span class="obs-steps">${obsSteps(t.stageIndex, (o.mon && o.mon.stageLabels) || null)}</span>
+          <span>切片 <b>${t.clips}</b> 片 · 选中 ${t.selected}</span>
+          <span>开始 ${esc(obsStamp(t.createdAt))}（${obsAgo(t.startedAgoSec ?? null)}）</span>
+          <span class="mono-sm" style="color:var(--text-3)">${esc(short)}</span>
+        </div>
+      </div>`;
+    })
     .join('');
 
   const health = (obs.asrHealth || [])
@@ -281,7 +314,7 @@ function renderObserve(box) {
 
     <div class="card">
       <div class="card-head"><b>④ 最近几场</b></div>
-      ${tlRows ? `<table class="tbl obs-tbl"><thead><tr><th>场次</th><th>状态</th><th>切片</th><th>开始</th></tr></thead><tbody>${tlRows}</tbody></table>` : '<div class="empty">台账为空</div>'}
+      ${tlRows ? `<div class="obs-runs">${tlRows}</div>` : '<div class="empty">台账为空</div>'}
     </div>
 
     <div class="card">

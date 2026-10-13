@@ -3165,10 +3165,21 @@ export class UiServer {
       .listTasks({ limit: 5 })
       .map((x) => {
         const clips = orch.ledger.getClips(x.id);
-        /* ⚠️ 必须给**完整 ISO**：一开始在这里 slice(5,16) 截成 "10-13T14:56"，
-           客户端 new Date() 解析不了 ⇒ 又退回显示 UTC（截图当场看到 10-13T14:56）。
-           时区转换统一交给客户端做。 */
-        return { id: x.id, status: x.status, clips: clips.length, selected: clips.filter((c) => c.selected).length, createdAt: x.createdAt ?? '' };
+        /* 为什么用现成的 statusText()：它给出的中文本来就比枚举好读得多
+           （"已录制 · 待处理" / "转写中 3/10" / "切片中 2/6" / "已切片 · 待发布"…），
+           而且把进度也算进去了 —— 界面只要照着显示，别再自己拼一套。
+           ⚠️ createdAt 必须给**完整 ISO**：曾经在这里 slice(5,16) 截成 "10-13T14:56"，
+           客户端 new Date() 解析不了 ⇒ 退回显示 UTC（截图当场看到）。时区转换交给客户端。 */
+        return {
+          id: x.id,
+          title: String(x.title ?? ''),
+          status: x.status,
+          statusText: this.statusText(x),
+          stageIndex: this.stageIndex(x),
+          clips: clips.length,
+          selected: clips.filter((c) => c.selected).length,
+          createdAt: x.createdAt ?? '',
+        };
       });
 
     /* 队列明细：biliLive-tools 的字段名是 taskId / progress / output / startTime(ms) / duration(ms) ——
