@@ -5,7 +5,9 @@ import { launchBrowser, ok, report } from './ui-shared.ts';
 const PORT = 9382;
 /* ⚠️ 不要在脚本里硬编码真实房间号（脱敏钩子会拦，而且换个直播间就失效）。
    改为先问一次接口，拿到"此刻真实存在的房间号清单"，断言"取到的值在清单里"。 */
-const realRooms: string[] = await (await fetch('http://127.0.0.1:3000/api/llc-rooms')).json().then((j: { rooms?: Array<{ roomId?: string }> }) => (j.rooms ?? []).map((x) => String(x.roomId ?? '')).filter(Boolean));
+const realRooms: string[] = await (await fetch('http://127.0.0.1:3000/api/llc-rooms'))
+  .json()
+  .then((raw: unknown) => ((raw as { rooms?: Array<{ roomId?: string }> }).rooms ?? []).map((x) => String(x.roomId ?? '')).filter(Boolean));
 const { cdp, close } = await launchBrowser({ port: PORT, headed: false, windowSize: '1500,1400' });
 try {
   await cdp.send('Page.navigate', { url: 'http://127.0.0.1:3000' });
