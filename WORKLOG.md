@@ -30,4 +30,4 @@
 
 - [x] 2026-10-12T16:09:33Z | session:9aa24b6c-aef | 自动投稿语义澄清：勾选看门槛、投稿看数量上限 src/analyze.ts src/daemon.ts src/config.ts test/auto-publish-split.ts test/clip-boundary.ts | 文件：
 
-- [ ] 2026-10-13T11:29:40Z | session:9aa24b6c-aef | 本地 ASR 精度接线（llm_dtype）+ 修两个真 bug（代理项致整次失败、参数传错位置被静默忽略） src/asr.ts src/config.ts tools/local-asr/transcribe-funasr.py tools/local-asr/ab-llm-dtype.mjs test/local-funasr-provider.ts | 文件：
+- [x] 2026-10-13T11:29:40Z | session:9aa24b6c-aef | 本地 ASR 精度接线（llm_dtype）+ 修两个真 bug（代理项致整次失败、参数传错位置被静默忽略） src/asr.ts src/config.ts tools/local-asr/transcribe-funasr.py tools/local-asr/ab-llm-dtype.mjs test/local-funasr-provider.ts | 文件：
