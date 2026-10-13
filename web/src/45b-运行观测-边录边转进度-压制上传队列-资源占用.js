@@ -123,6 +123,24 @@ function obsFile(name, keep) {
   return s.slice(0, n - ext.length - 1) + '…' + ext;
 }
 
+/** 状态/类型 → 中文。映射表由服务端下发（见 server.ts 的 STATUS_LABELS），这里只做兜底。 */
+function obsLabel(map, raw) {
+  const key = String(raw ?? '');
+  return (map && map[key]) || key || '—';
+}
+function obsStatusText(raw) {
+  return obsLabel((state.obs && state.obs.data && state.obs.data.mon && state.obs.data.mon.statusLabels) || null, raw);
+}
+function obsClipStatusText(raw) {
+  return obsLabel((state.obs && state.obs.data && state.obs.data.mon && state.obs.data.mon.clipStatusLabels) || null, raw);
+}
+function obsTypeText(raw) {
+  return obsLabel((state.obs && state.obs.data && state.obs.data.mon && state.obs.data.mon.llcTypeLabels) || null, raw);
+}
+function obsQueueStatusText(raw) {
+  return obsLabel((state.obs && state.obs.data && state.obs.data.mon && state.obs.data.mon.llcStatusLabels) || null, raw);
+}
+
 function obsNoteKind(msg) {
   if (/让路/.test(msg)) return { cls: 'b-wait', label: '让路' };
   if (/已转 \d+\/\d+/.test(msg)) return { cls: 'b-done', label: '已转' };
@@ -155,8 +173,9 @@ function renderObserve(box) {
     .map((q) => {
       const pct = q.progress === null || q.progress === undefined ? null : q.progress;
       return `<tr>
-        <td><span class="badge">${esc(q.type)}</span></td>
+        <td><span class="badge" title="${esc(q.type)}">${esc(obsTypeText(q.type))}</span></td>
         <td class="obs-strong">${esc(obsFile(q.name || q.taskId, 40))}</td>
+        <td><span class="badge ${q.status === 'running' ? 'b-run' : ''}" title="${esc(q.status)}">${esc(obsQueueStatusText(q.status))}</span></td>
         <td>${obsBar(pct)} <span class="mono-sm">${pct === null ? '—' : pct + '%'}</span></td>
         <td class="mono-sm">${obsDur(q.elapsedSec)}</td>
         <td class="mono-sm">${q.etaSec === null || q.etaSec === undefined ? '—' : obsDur(q.etaSec)}</td>
@@ -200,7 +219,7 @@ function renderObserve(box) {
     .map(
       (t) => `<tr>
         <td class="mono-sm" title="${esc(t.id)}">${esc(String(t.id).replace(/^auto-/, ''))}</td>
-        <td><span class="badge ${/PUBLISHED/.test(t.status) ? 'b-done' : /FAIL|ERROR/.test(t.status) ? 'b-fail' : 'b-run'}">${esc(t.status)}</span></td>
+        <td><span class="badge ${/PUBLISHED/.test(t.status) ? 'b-done' : /FAIL|ERROR/.test(t.status) ? 'b-fail' : 'b-run'}" title="${esc(t.status)}">${esc(obsStatusText(t.status))}</span></td>
         <td>${t.clips} 片 · 选中 ${t.selected}</td>
         <td class="mono-sm">${esc(obsStamp(t.createdAt))}</td>
       </tr>`,
@@ -254,7 +273,7 @@ function renderObserve(box) {
       <div class="card-head"><b>③ 压制 / 上传队列</b><span class="badge ${queue.length ? 'b-run' : ''}">${queue.length} 个进行中</span></div>
       ${
         qRows
-          ? `<table class="tbl obs-tbl"><thead><tr><th>类型</th><th>任务</th><th>进度</th><th>已跑</th><th>预计还需</th><th>产物</th></tr></thead><tbody>${qRows}</tbody></table>`
+          ? `<table class="tbl obs-tbl"><thead><tr><th>类型</th><th>任务</th><th>状态</th><th>进度</th><th>已跑</th><th>预计还需</th><th>产物</th></tr></thead><tbody>${qRows}</tbody></table>`
           : '<div class="empty">队列空闲</div>'
       }
       <div class="hintline">完整版（弹幕版 + 纯享版）由 biliLive-tools 压制与上传；它投出去之后，等完整版的切片才会被追加成分P。</div>

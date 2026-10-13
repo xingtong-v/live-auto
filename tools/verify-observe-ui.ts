@@ -83,6 +83,13 @@ try {
   const afterSwitch = await cdp.evalJs<string>(`String((document.querySelector('#otherPage') || {}).textContent || '').slice(0, 120)`);
   ok('切到实时监控页后内容确实换了（没有两页叠在一起）', !/边录边转（预转写）/.test(afterSwitch), afterSwitch.slice(0, 80));
 
+  /* ★ 状态必须显示中文（用户反馈"英文有时候看不明白"）。
+     判据：可见文本里不出现裸露的英文枚举值（PUBLISHED/CLIPPING/…），中文映射由服务端下发。 */
+  const enums = ['PUBLISHED', 'CLIPPING', 'ANALYZED', 'TRANSCRIBING', 'RECORDED', 'SUBMITTED', 'CANDIDATE', 'FAILED'];
+  const leaked = enums.filter((e) => new RegExp('>' + e + '<|\\b' + e + '\\b').test(page.text) && !page.text.includes('title="' + e + '"'));
+  ok('★ 状态显示为中文（没有裸露的英文枚举值）', leaked.length === 0, leaked.join(', ') || '—');
+  ok('页面里能看到中文状态词（已发布/切片中/待确认 之类）', /已发布|切片中|待确认|已录完|转写中/.test(page.text), page.text.slice(0, 160));
+
   ok('全程无未捕获异常', cdp.errors.length === 0, cdp.errors[0]?.slice(0, 160));
 } finally {
   await close();

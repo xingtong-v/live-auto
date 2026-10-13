@@ -55,6 +55,62 @@ import { log as globalLog } from './logger.ts';
 const STAGE_ORDER: Stage[] = ['IDLE', 'RECORDED', 'TRANSCRIBED', 'ANALYZED', 'CLIPPED', 'PUBLISHED'];
 const STAGE_LABELS = ['录制', '转写', '分析', '切片', '发布'];
 
+/**
+ * 状态中文映射（2026-10-13 加，用户反馈"状态英文有时候看不明白"）。
+ *
+ * 取值与文案**照抄 src/types.ts 的联合类型与注释** —— 那里本来就是中文写的，
+ * 界面上却一直显示英文枚举值，属于"信息在代码里、没送到用户眼前"。
+ * 界面显示中文、鼠标悬停显示英文原文（便于和日志对照）。
+ */
+const STATUS_LABELS: Record<string, string> = {
+  PENDING: '待处理',
+  RECORDED: '已录完',
+  TRANSCRIBING: '转写中',
+  TRANSCRIBED: '转写完成',
+  ANALYZING: '分析中',
+  ANALYZED: '待确认',
+  CLIPPING: '切片中',
+  CLIPPED: '切片完成',
+  PUBLISHING: '投稿中',
+  PUBLISHED: '已发布',
+  FAILED: '失败',
+  ARCHIVED: '已归档',
+  CANCELED: '已取消',
+};
+
+/** 单条切片的状态（ClipStatus） */
+const CLIP_STATUS_LABELS: Record<string, string> = {
+  CANDIDATE: '候选',
+  PENDING_UPLOAD: '待切片',
+  CUTTING: '切片中',
+  CUT: '已切片',
+  SUBMITTING: '提交中',
+  SUBMITTED: '已提交待确认',
+  PUBLISHED: '已发布',
+  FAILED: '失败',
+  SKIPPED: '已跳过',
+};
+
+/** biliLive-tools 队列的任务类型与状态 */
+const LLC_TYPE_LABELS: Record<string, string> = {
+  ffmpeg: '压制/转码',
+  bili: 'B站投稿处理',
+  biliUpload: '上传到 B站',
+  danmu: '弹幕转换',
+  videoCut: '视频切片',
+  merge: '合并',
+  download: '下载',
+};
+const LLC_STATUS_LABELS: Record<string, string> = {
+  running: '进行中',
+  pending: '排队中',
+  waiting: '等待中',
+  paused: '已暂停',
+  completed: '已完成',
+  failed: '失败',
+  killed: '已终止',
+};
+
 /** 允许的 Host（防 DNS rebinding）；只接受回环地址 */
 const ALLOWED_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
 
@@ -3450,6 +3506,10 @@ export class UiServer {
       },
       errors,
       stageLabels: STAGE_LABELS,
+      statusLabels: STATUS_LABELS,
+      clipStatusLabels: CLIP_STATUS_LABELS,
+      llcTypeLabels: LLC_TYPE_LABELS,
+      llcStatusLabels: LLC_STATUS_LABELS,
     };
     this.monitorCache = { at: Date.now(), data };
     return data;
