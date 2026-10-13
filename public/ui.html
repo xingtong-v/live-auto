@@ -5074,15 +5074,12 @@ function ensureObserveStyle() {
 .obs-note:first-of-type { border-top: none; }
 .obs-sub { margin: 12px 0 4px; font-weight: 600; color: var(--text-3, #666); font-size: 13px; }
 .obs-runs { display: flex; flex-direction: column; }
-.obs-run { padding: 10px 2px; border-top: 1px dashed var(--border, #eee); }
+.obs-run { padding: 11px 2px; border-top: 1px solid var(--border, #eee); }
 .obs-run:first-child { border-top: none; }
-.obs-run-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.obs-run-meta { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 5px; font-size: 13px; color: var(--text-3, #666); }
-.obs-steps { display: inline-flex; align-items: center; gap: 4px; }
-.obs-step { padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border, #e5e7eb); font-size: 12px; color: var(--text-3, #999); }
-.obs-step.done { border-color: #10b981; color: #047857; }
-.obs-step.on { border-color: #3b82f6; background: #3b82f6; color: #fff; font-weight: 600; }
-.obs-step-arrow { color: var(--border, #ddd); font-size: 11px; }
+.obs-run-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.obs-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.obs-run-sub { margin-top: 3px; font-size: 12px; color: var(--text-3, #888); }
+.obs-run-top .badge { flex: none; }
 `;
   document.head.appendChild(el);
 }
@@ -5184,16 +5181,9 @@ function obsQueueStatusText(raw) {
   return obsLabel((state.obs && state.obs.data && state.obs.data.mon && state.obs.data.mon.llcStatusLabels) || null, raw);
 }
 
-/** 阶段链：录制 → 转写 → 分析 → 切片 → 发布（当前步骤高亮，已过为实心） */
-function obsSteps(idx, labels) {
-  const steps = labels && labels.length ? labels : ['录制', '转写', '分析', '切片', '发布'];
-  return steps
-    .map((s, i) => {
-      const cls = idx === i ? 'on' : idx > i ? 'done' : 'off';
-      return `<span class="obs-step ${cls}">${esc(s)}</span>`;
-    })
-    .join('<span class="obs-step-arrow">→</span>');
-}
+/* 说明：这里曾经有个 obsSteps() 画"五个阶段胶囊"。用户反馈"难看而且难懂"后删掉 ——
+   阶段信息用状态文案表达（"转写中 3/10" / "已发布"）比五个胶囊更省地方也更好懂。
+   组件删了，但把理由留在这里，免得以后又有人加回来。 */
 
 function obsNoteKind(msg) {
   if (/让路/.test(msg)) return { cls: 'b-wait', label: '让路' };
@@ -5272,22 +5262,25 @@ function renderObserve(box) {
   /* ④ 每场两行：第一行"标题 + 中文状态"，第二行"阶段链 + 切片数 + 开始时间 + 短 id"。
      为什么不用表格：窄窗口下后面的列会被切掉（用户截图里只剩"场次"一列），
      而"哪里在跑、跑到哪一步"恰恰是后面那几列的信息。 */
+  /* ④ 每场两行：**标题 + 状态**（第一行）/ **时间·切片·id**（第二行小字）。
+     ⚠️ 第一版这里堆了五个阶段胶囊（录制→转写→分析→切片→发布），用户反馈"难看而且难懂" ——
+     已完成的场次五个全亮、等于没说，而且三行并排的信息挤成一条。
+     阶段信息其实**状态文案里本来就有**（"转写中 3/10" / "切片中 2/6" / "已发布"），
+     所以直接把胶囊去掉，只留状态。相对时间也改成客户端自己算（原来读服务端没下发的
+     startedAgoSec ⇒ 界面上显示"（—）"）。 */
   const tlRows = tl
     .map((t) => {
       const title = t.title && t.title.length > 1 ? t.title : String(t.id).replace(/^auto-/, '');
-      const short = String(t.id).replace(/^auto-\d{8}/, '');
+      const short = String(t.id).replace(/^auto-\d{8}-?/, '');
       const chip = /PUBLISHED/.test(t.status) ? 'b-done' : /FAIL|ERROR/.test(t.status) ? 'b-fail' : 'b-run';
+      const startedSec = t.createdAt ? Math.max(0, Math.round((Date.now() - new Date(t.createdAt).getTime()) / 1000)) : null;
+      const bits = [esc(obsStamp(t.createdAt)), obsAgo(startedSec), `切片 ${t.clips} 片（选中 ${t.selected}）`, short];
       return `<div class="obs-run">
         <div class="obs-run-top">
-          <span class="obs-strong" title="${esc(t.id)}">${esc(obsFile(title, 46))}</span>
+          <span class="obs-title" title="${esc(t.id)}">${esc(title)}</span>
           <span class="badge ${chip}" title="${esc(t.status)}">${esc(t.statusText || obsStatusText(t.status))}</span>
         </div>
-        <div class="obs-run-meta">
-          <span class="obs-steps">${obsSteps(t.stageIndex, (o.mon && o.mon.stageLabels) || null)}</span>
-          <span>切片 <b>${t.clips}</b> 片 · 选中 ${t.selected}</span>
-          <span>开始 ${esc(obsStamp(t.createdAt))}（${obsAgo(t.startedAgoSec ?? null)}）</span>
-          <span class="mono-sm" style="color:var(--text-3)">${esc(short)}</span>
-        </div>
+        <div class="obs-run-sub">${bits.filter(Boolean).join(' · ')}</div>
       </div>`;
     })
     .join('');

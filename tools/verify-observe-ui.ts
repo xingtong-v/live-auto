@@ -101,9 +101,13 @@ try {
     const withSteps = list.filter((r) => r.querySelectorAll('.obs-step').length >= 4).length;
     return { top: list.length, withSteps, sample: list[0] ? String(list[0].textContent).slice(0, 160) : '' };
   })()`);
-  ok('★ ④ 用两行式列表渲染（不是只有 id 的表格）', runs.top >= 1, JSON.stringify(runs));
-  ok('★ 每场都带阶段链（录制→转写→分析→切片→发布）', runs.withSteps === runs.top && runs.top > 0, JSON.stringify(runs));
+  ok('★ ④ 每场两行（标题 + 中文状态 / 时间·切片·短 id），不是只有 id 的表格', runs.top >= 1, JSON.stringify(runs));
   ok('★ 场次显示的是标题/人话，不是一串 id', /[\u4e00-\u9fa5]/.test(runs.sample), runs.sample);
+  /* ★ 回归保护：第一版这里堆了五个阶段胶囊，用户说"难看而且难懂"。
+     现在阶段信息由状态文案承担（"转写中 3/10"），页面上不该再出现胶囊堆叠。 */
+  const pills = await cdp.evalJs<number>(`document.querySelectorAll('.obs-step').length`);
+  ok('★ 没有重新长出"五个阶段胶囊"那种噪声（阶段信息靠状态文案表达）', pills === 0, '胶囊数 ' + pills);
+  ok('★ 时间列不再出现空的"（—）"', !/\(—\)/.test(String(runs.sample)), runs.sample.slice(0, 120));
 
   ok('全程无未捕获异常', cdp.errors.length === 0, cdp.errors[0]?.slice(0, 160));
 } finally {
