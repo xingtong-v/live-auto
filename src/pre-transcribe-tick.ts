@@ -87,6 +87,14 @@ export async function runPreTranscribeTick(deps: PreTranscribeTickDeps): Promise
     return summary;
   }
 
+  /* ★ 2026-10-13 加：**每轮都必须留下痕迹**。
+     起因是一次真机验证卡住：录制期间日志里完全没有预转写的输出，事后无法判断
+     "是它没在跑、还是跑了但没候选、还是候选都不满足条件" —— 因为原来只有"做了事"才 push note。
+     加这一条之后，每 2 分钟至少有一行"本轮无事：…"，验证时一眼能看出判定路径。 */
+  if (candidates.length === 0) {
+    summary.notes.push('本轮无事：没有候选场次（当前没有正在录制的场次）');
+  }
+
   const closedBefore = deps.closedBeforeMs ? deps.closedBeforeMs() : Date.now() - 120_000;
 
   for (const c of candidates) {
@@ -120,6 +128,14 @@ export async function runPreTranscribeTick(deps: PreTranscribeTickDeps): Promise
             (skipped ? `（${skipped} 段仍在写）` : '') +
             (r.readyToMerge ? ' —— 已可合并' : '') +
             (r.state.mode === 'fallback' ? ` —— 已回退整段路径：${r.state.fallbackReason ?? ''}` : ''),
+        );
+      } else {
+        /* 有候选、但这一轮没有新段可做（段都还没闭合 / 已全部转完）—— 同样要留痕 */
+        const skipped = r.attempts.filter((a) => !a.ok && /仍在写入/.test(a.reason)).length;
+        summary.notes.push(
+          `${c.title ?? c.videoPath}：本轮无新段可转（已完成 ${r.progress.done}/${r.progress.total}` +
+            (skipped ? `，${skipped} 段仍在写` : '') +
+            `）${r.state.mode === 'fallback' ? ` —— 已回退整段路径：${r.state.fallbackReason ?? ''}` : ''}`,
         );
       }
     } catch (e) {

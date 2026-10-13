@@ -380,6 +380,51 @@ section('4g. 已闭合的分段不被「正在录」的分段拖住（回归：�
   fs.rmSync(root2, { recursive: true, force: true });
 }
 
+/* ============ 4h. 压制产物不算「正在写入的录制分段」（回归：面板多出一行） ============ */
+section('4h. 压制产物不算「正在录制」（回归：用户报"应该有两场在录、只显示一场"）');
+{
+  /* 实测（2026-10-13 22:0x）：用户在监控面板看到
+       `…【2D】用一加16打暗区突围！-弹幕版.mp4（1134 MB）` 被列在「正在录制」里 ——
+     那是 biliLive-tools **正在烧的压制产物**（切片助手在别处是明确跳过它的）。
+     同时它把真正在录的那一场挤得不显眼（两场在录，只有一场看起来在录）。 */
+  const cfg = loadConfig().config;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'live-auto-product-fresh-'));
+  const closed = path.join(root, '2026-10-13 19-52-02-563 某场.ts');
+  const product = path.join(root, '2026-10-13 19-52-02-563 某场-弹幕版.mp4');
+  fs.writeFileSync(closed, 'x');
+  fs.writeFileSync(product, 'x');
+  const old = new Date(Date.now() - 3600_000);
+  fs.utimesSync(closed, old, old); // 已闭合；产物保持"现在"（正在被烧）
+
+  const res = await listRecordingsDetailed(
+    { ...cfg, import: { ...cfg.import, scanDirs: [root], minSizeMB: 0, maxDepth: 2 } },
+    { includeFallbackDirs: false, limit: 50, probe: false },
+  );
+  const c = res.candidates[0]!;
+  eq('只有这一场', res.candidates.length, 1);
+  eq('★ 压制产物不进 pendingFiles（否则面板把它当"正在录制"）', c.pendingFiles, undefined);
+  eq('★ 也不该报 pendingParts（本场没有原始分段在写）', c.pendingParts, undefined);
+
+  /* 反向保护：**原始**分段在写时必须照旧报出来（不能因为这次过滤把真在录的也滤掉） */
+  const root2 = fs.mkdtempSync(path.join(os.tmpdir(), 'live-auto-product-fresh2-'));
+  const closed2 = path.join(root2, '2026-10-13 19-52-02-563 某场.ts');
+  const writing2 = path.join(root2, '2026-10-13 19-52-02-563 某场-PART002.ts');
+  const product2 = path.join(root2, '2026-10-13 19-52-02-563 某场-弹幕版.mp4');
+  for (const p of [closed2, writing2, product2]) fs.writeFileSync(p, 'x');
+  fs.utimesSync(closed2, old, old);
+  const res2 = await listRecordingsDetailed(
+    { ...cfg, import: { ...cfg.import, scanDirs: [root2], minSizeMB: 0, maxDepth: 2 } },
+    { includeFallbackDirs: false, limit: 50, probe: false },
+  );
+  const c2 = res2.candidates[0]!;
+  eq('★ 真在写的原始分段仍然报出来', c2.pendingParts, 1);
+  eq('pendingFiles 里只有那一段原始录制', c2.pendingFiles?.length, 1);
+  ok('pendingFiles 里是 PART002 而不是产物', /PART002\.ts$/.test(c2.pendingFiles?.[0]?.fileName ?? ''), String(c2.pendingFiles?.[0]?.fileName));
+
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(root2, { recursive: true, force: true });
+}
+
 /* ================= 4e. 多分段必须真的被合并（回归：匹配器漏了分隔符） ================= */
 section('4e. 多分段合并（回归：分段匹配器永远匹配不上 → N 段被当成 N 场）');
 {

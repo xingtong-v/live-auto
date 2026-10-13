@@ -33,3 +33,5 @@
 - [x] 2026-10-13T11:29:40Z | session:9aa24b6c-aef | 本地 ASR 精度接线（llm_dtype）+ 修两个真 bug（代理项致整次失败、参数传错位置被静默忽略） src/asr.ts src/config.ts tools/local-asr/transcribe-funasr.py tools/local-asr/ab-llm-dtype.mjs test/local-funasr-provider.ts | 文件：
 
 - [x] 2026-10-13T11:54:38Z | session:9aa24b6c-aef | bf16 开关上线（配置已打开）+ 设置面板一键切换 + 覆盖率断言 web/src/42-设置弹窗.js test/config-coverage.ts tools/verify-bf16-switch.ts tools/ui-shared.ts | 文件：
+
+- [ ] 2026-10-13T14:53:32Z | session:9aa24b6c-aef | 边录边转首次真机验证失败 + 补观测（每轮留痕、守护进程限频） src/pre-transcribe-tick.ts src/daemon.ts test/pre-transcribe-tick.ts | 文件：

@@ -139,11 +139,17 @@ const html = fs.readFileSync(htmlPath, 'utf8');
      （用户截图 + 原话「这里的显示的太多了 而且是导入过的 优化他」）。
      规则：需要留意的才直接列表，已导入过的**默认收起**，重跑办法整块只写一次。 */
   ok('已导入过的那类被单独分出来', /const isImportedSkip = \(o\) =>/.test(html));
+  /* 压制产物（`-弹幕版` / `-纯享版`）同样单独分出来（2026-10-13 用户截图：
+     9 行"压制产物…完整版由 biliLive-tools 投"把「其它」占满，真正在录的那一行被淹没）。 */
+  ok('★ 压制产物被单独分出来，且不参与「其它」计数', /const isProductSkip = \(o\) =>/.test(html) && /!isImportedSkip\(o\) && !isProductSkip\(o\)/.test(html));
+  ok('★ 压制产物那组默认收起（display:none，点开才看）', /data-g="health-products"[\s\S]{0,320}id="healthProducts" style="display:none"/.test(html));
+  ok('★ 压制产物那组也绑了点击（不是画个摆设）', /\$\('\[data-g="health-products"\]'\)/.test(html));
+  ok('压制产物组说明"不归切片助手处理、不需要操作"', /不归切片助手处理/.test(html));
   ok('★ 「已导入过」那组默认收起（display:none，点开才看）', /data-g="health-imported"[\s\S]{0,220}id="healthImported" style="display:none"/.test(html));
   ok('可折叠表头带数量（点开前就知道有多少个）', /data-g="health-imported" data-n="\$\{imported\.length\}"/.test(html));
   ok('★ 点了能展开（有绑定，不是画了个摆设）', /\$\('\[data-g="health-imported"\]'\)/.test(html));
   ok('展开/收起会换箭头与 title（否则用户不知道还能收回去）', /impHead\.classList\.toggle\('open'/.test(html) && /impHead\.title = `\$\{open \? '展开' : '收起'\}/.test(html));
-  ok('★ 表头先给分类计数（共 N 个 · 导入成功 · 已导入过 · 其它）', /共 \$\{outs\.length\} 个 · 导入成功 \$\{okCount\} · 已导入过 \$\{imported\.length\} · 其它 \$\{otherCount\}/.test(html));
+  ok('★ 表头先给分类计数（共 N 个 · 导入成功 · 已导入过 · 压制产物 · 其它）', /共 \$\{outs\.length\} 个 · 导入成功 \$\{okCount\} · 已导入过 \$\{imported\.length\}[\s\S]{0,80}· 其它 \$\{otherCount\}/.test(html));
   ok('没有需要处理的结论时给一句话，而不是一张空表', /这一轮没有需要你处理的结论/.test(html));
   ok('直接列表的那部分有上限（12 行）+ 超出提示', /healthTable\(noteworthy, 12\)/.test(html) && /还有 \$\{list\.length - cap\} 个未显示/.test(html));
   ok('★ 逐行结论里不再重复"怎么重跑"的长句（35 行 = 35 遍重复）', !html.includes('如确实要重跑'));

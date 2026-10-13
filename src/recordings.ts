@@ -1119,7 +1119,14 @@ export async function listRecordingsDetailed(cfg: AppConfig, opts: ListRecording
      * 整组都还在写时才保持原来的"仍在录制"判定。 */
     const isFresh = (f: { mtimeMs: number }): boolean => f.mtimeMs > 0 && now - f.mtimeMs < recWindowMs;
     const settled = g.files.filter((f) => !isFresh(f));
-    const freshFiles = g.files.filter(isFresh);
+    /* ★ 压制产物（`-弹幕版` / `-纯享版` / `-danmaku`）**不算"还在写入的录制分段"**。
+       2026-10-13 用户实测：面板「正在录制」里多出一行
+       `…【2D】用一加16打暗区突围！-弹幕版.mp4（1134 MB，正在写入）` —— 那是 biliLive-tools
+       正在烧的产物，切片助手在别处是**明确要跳过**它的（见 watch-import 的 ⑥.5）。
+       列进"正在录制"会让人以为我们要去处理它，也会让"到底有几场在录"变得不可数。
+       规则与 PRODUCT_SUFFIX 同一套（含防覆盖 UUID 与分段后缀叠加的形态）。 */
+    const isProductFile = (name: string): boolean => new RegExp(PRODUCT_SUFFIX, 'i').test(name);
+    const freshFiles = g.files.filter((f) => isFresh(f) && !isProductFile(f.fileName));
     const usableFiles = settled.length > 0 ? settled : g.files;
     const possiblyRecording = settled.length === 0;
 

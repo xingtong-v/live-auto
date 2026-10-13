@@ -437,6 +437,28 @@ function performDelete(entry: PendingDeleteEntry, opts: { trashRoot: string; log
 }
 
 /**
+ * 把删除失败翻译成"人话"（2026-10-13 用户实测）：
+ * 面板上出现过一句刺眼的
+ *   `移入回收站失败（该路径未删除）：… —— EPERM, Permission denied: \\?\C:\…`
+ * 用户以为权限配置坏了。真实原因只有一类：**文件正被别的程序占着** ——
+ * 那一刻 biliLive-tools 的压制/上传（或杀毒扫描）正在读这个 1.2 GB 的源录播，
+ * Windows 上 rename 与"复制再删"都会被拒；等它读完就好了（实测过 20 分钟后手动重试即成功）。
+ *
+ * ⚠️ 错误文本里中文路径显示成 `ÐÇÍ«_Official` 这种乱码**不是我们的 bug**：
+ *    那是 libuv 在 Windows 上报 copyfile 错误时用本地代码页（GBK）打印宽字符路径的结果，
+ *    只影响显示，实际操作的路径是对的。别去"修"路径编码 —— 会白改一圈。
+ */
+export function explainDeleteFailure(message: string): string {
+  const busy = /EPERM|EBUSY|EACCES|Permission denied|operation not permitted/i.test(message);
+  if (!busy) return message;
+  return (
+    '文件正被其它程序占用（多半是 biliLive-tools 的压制/上传，或杀毒/播放器正在读它）—— ' +
+    '这不是权限配置问题：它已在清单里保留，等对方读完会自动重试成功' +
+    `（原始错误：${message.slice(0, 160)}）`
+  );
+}
+
+/**
  * 执行到点的删除。由 daemon 定时调用。
  *
  * 永远不会因为单个文件删不掉而中断（权限占用、文件被播放器打开都可能失败）——
@@ -472,7 +494,7 @@ export function runDueDeletions(
       log.info(`已按期删除：${entry.path}（${entry.kind}，${entry.reason}）`, { data: { id: entry.id, taskId: entry.taskId, by: entry.deletedBy } });
     } catch (e) {
       failed++;
-      entry.error = (e as Error).message;
+      entry.error = explainDeleteFailure((e as Error).message);
       log.warn(`删除失败（保留在清单里，下轮重试）：${entry.path} —— ${entry.error}`, { data: { id: entry.id } });
     }
   }
@@ -618,7 +640,9 @@ export function deletePendingNow(
         { data: { id: entry.id, taskId: entry.taskId, bytes: outcome.bytes } },
       );
     } catch (e) {
-      entry.error = (e as Error).message;
+      /* 手动点「立即删除」失败时也要说人话（用户 2026-10-13 截图里就是这一条）：
+         多半只是"文件正被压制/上传/杀毒占着"，等一会儿再点就好 —— 见 explainDeleteFailure。 */
+      entry.error = explainDeleteFailure((e as Error).message);
       out.failed.push({ id: entry.id, path: entry.path, error: entry.error });
       log.warn(`手动删除失败（条目保留在清单里）：${entry.path} —— ${entry.error}`, { data: { id: entry.id } });
     }

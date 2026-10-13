@@ -22,6 +22,7 @@ import {
   cancelPendingDelete,
   closeMissingPending,
   deletePendingNow,
+  explainDeleteFailure,
   listPendingDelete,
   runDueDeletions,
   sameVolume,
@@ -605,6 +606,19 @@ function main(): void {
     const view = listPendingDelete({ statePath: state, now: t0 + 60_000 });
     eq('★ 条目仍在清单里（用户还能自己判断、手工点「标记为已删除」）', view.pending.length, 1);
     ok(view.pending[0]!.existsNow === false, '界面据 existsNow 显示「文件已不在」', String(view.pending[0]!.existsNow));
+  }
+
+  /* ===== 14. 删除失败要说人话（2026-10-13 用户截图：EPERM 被当成"权限坏了"） ===== */
+  section('14. 文件被占用导致的失败 → 翻译成"稍后自动重试"，不吓人');
+  {
+    const busy = explainDeleteFailure(
+      'EPERM, Permission denied: \\\\?\\C:\\Users\\x\\Bilibili\\ÐÇÍ«_Official\\2026-10-13 20-51-03-546 ¡¾2D¡¿.ts',
+    );
+    ok(/正被其它程序占用/.test(busy), '★ 说清真实原因（有程序在读它），而不是"权限被拒"', busy.slice(0, 80));
+    ok(/自动重试/.test(busy), '★ 明确它会自动重试（用户不必手改权限）', busy.slice(0, 120));
+    ok(/不是权限配置问题/.test(busy), '明确否掉"权限配置坏了"这一误解');
+    ok(/原始错误/.test(busy), '保留原始错误供排查（不吞掉细节）');
+    eq('非占用类错误原样透传（不硬套"被占用"）', explainDeleteFailure('磁盘空间不足'), '磁盘空间不足');
   }
 
   console.log('\n' + '─'.repeat(74));

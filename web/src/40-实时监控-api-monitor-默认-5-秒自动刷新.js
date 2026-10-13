@@ -222,9 +222,16 @@ function renderMonitor(box) {
          · 「已导入过」：**默认收起**（历史，无需处理），点开才看；
        重跑办法只写一次（原来每一行都重复一遍，35 行就是 35 遍）。 */
     const isImportedSkip = (o) => !o.taskId && /^已导入过/.test(String(o.skipped || ''));
+    /* 压制产物（`-弹幕版` / `-纯享版`）也**默认收起**（2026-10-13 用户截图）：
+       那 9 行"压制产物…完整版由 biliLive-tools 投"把「其它」整块占满，
+       而真正要看的那一行（正在录制的那场）反而被淹没。
+       它们不是"待处理的结论"，而是**别人的产物**：留一条折叠组随时可查，
+       但不参与「其它」计数、不占直接列表的位置。 */
+    const isProductSkip = (o) => !o.taskId && /^压制产物/.test(String(o.skipped || ''));
     const imported = outs.filter(isImportedSkip);
+    const products = outs.filter(isProductSkip);
     const okCount = outs.filter((o) => o.taskId).length;
-    const noteworthy = outs.filter((o) => !isImportedSkip(o));
+    const noteworthy = outs.filter((o) => !isImportedSkip(o) && !isProductSkip(o));
     const otherCount = noteworthy.length - okCount;
     const verdictOf = (o) => {
       const stillWriting = /仍在写入|可能仍在录制/.test(String(o.skipped || ''));
@@ -236,7 +243,7 @@ function renderMonitor(box) {
       ${list.slice(0, cap).map((o) => `<tr><td class="mono-sm" title="${esc(o.videoPath || '')}">${esc(o.fileName)}</td><td class="num">${o.sizeMB} MB</td><td>${verdictOf(o)}</td></tr>`).join('')}
       </tbody></table>${list.length > cap ? `<div class="empty">还有 ${list.length - cap} 个未显示（清单太长时这里只列前 ${cap} 个）。</div>` : ''}`;
     html += `<h3 style="font-size:13px;margin:14px 0 8px">上一轮对每个文件的结论
-      <span class="ai-tag">共 ${outs.length} 个 · 导入成功 ${okCount} · 已导入过 ${imported.length} · 其它 ${otherCount}</span></h3>`;
+      <span class="ai-tag">共 ${outs.length} 个 · 导入成功 ${okCount} · 已导入过 ${imported.length}${products.length ? ` · 压制产物 ${products.length}` : ''} · 其它 ${otherCount}</span></h3>`;
     if (noteworthy.length) {
       html += healthTable(noteworthy, 12);
     } else {
@@ -248,6 +255,13 @@ function renderMonitor(box) {
         <div id="healthImported" style="display:none">${healthTable(imported, 60)}</div>
         <p class="hintline">已导入过的文件不会被自动重导（同一个文件重复跑一遍是白花的 ASR + LLM 钱）。确实要重跑：
           用「导入录播」手动挑那一场（那条路不受此限制），或在「设置 → 导入」里关掉目录轮询。</p>`;
+    }
+    if (products.length) {
+      html += `<div class="impgroup" data-g="health-products" data-n="${products.length}" title="展开这 ${products.length} 个压制产物">
+          <span class="caret">▸</span><span>压制产物（-弹幕版/-纯享版，完整版由 biliLive-tools 投）</span><span class="cnt">${products.length} 个</span></div>
+        <div id="healthProducts" style="display:none">${healthTable(products, 60)}</div>
+        <p class="hintline">这些是 biliLive-tools 压出来的完整版（画面已烧弹幕），**不归切片助手处理** ——
+          列出来只是让你能核对"哪一场的完整版已经出来了"，不需要任何操作。</p>`;
     }
   } else {
     html += `<div class="empty">上一轮没扫到任何录播。若目录里确实有文件，点上面的「立即刷新」看结论，或去「导入录播」检查扫描目录。</div>`;
@@ -351,6 +365,19 @@ function renderMonitor(box) {
       impHead.classList.toggle('open', !open);
       impHead.querySelector('.caret').textContent = open ? '▸' : '▾';
       impHead.title = `${open ? '展开' : '收起'}这 ${impHead.dataset.n || ''} 个已导入过的文件`;
+    };
+  }
+  /* 压制产物那一组同样要能点开（2026-10-13 加）：折叠组只画不绑 = 摆设 */
+  const prodHead = $('[data-g="health-products"]');
+  if (prodHead) {
+    prodHead.onclick = () => {
+      const panel = $('#healthProducts');
+      if (!panel) return;
+      const open = panel.style.display !== 'none';
+      panel.style.display = open ? 'none' : '';
+      prodHead.classList.toggle('open', !open);
+      prodHead.querySelector('.caret').textContent = open ? '▸' : '▾';
+      prodHead.title = `${open ? '展开' : '收起'}这 ${prodHead.dataset.n || ''} 个压制产物`;
     };
   }
   const sel = $('#monAuto');

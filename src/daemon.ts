@@ -222,6 +222,12 @@ export class Orchestrator {
   private perfTimer?: NodeJS.Timeout;
   /** 预转写循环的定时器（P1-6，2026-10-14）：只有 asr.incrementalEnabled=true 时才会被创建 */
   private preTranscribeTimer?: NodeJS.Timeout;
+  /**
+   * 上一次打印"本轮无事 / 本轮无新段可转"这类**说明性**日志的时间戳（2026-10-13 加）。
+   * 为什么需要：不打印的话，真机验证时事后完全看不出预转写到底跑没跑（那次日志一片空白）；
+   * 每次都打印又会每 2 分钟刷一行、24/7 下太吵 ⇒ 折中为**每 10 分钟最多一行**。
+   */
+  private lastPreTranscribeIdleLogAt = 0;
   /** 配置文件变更监听定时器 */
   private cfgTimer?: NodeJS.Timeout;
   /** 「用完即删」的执行循环（每 10 分钟检查待删清单） */
@@ -807,7 +813,18 @@ export class Orchestrator {
           },
           log: (m) => this.logger.info(m, { mod: 'asr' }),
         });
-        for (const n of sum.notes) this.logger.info(`预转写：${n}`, { mod: 'asr' });
+        /* ★ 2026-10-13：notes 的打印**分两类**。
+           · 干了活的、出错的一律照打（排障主线，不能省）；
+           · "本轮无事 / 本轮无新段可转"这类**说明性**的，每 10 分钟最多打一行 —— 既保留了
+             "别每 2 分钟刷屏"的老语义，又不至于像这次真机验证那样事后一片空白
+             （分不清是没在跑、没候选、还是候选都不满足条件）。 */
+        const idle = sum.notes.filter((n) => /本轮无事|本轮无新段可转/.test(n));
+        const busy = sum.notes.filter((n) => !/本轮无事|本轮无新段可转/.test(n));
+        for (const n of busy) this.logger.info(`预转写：${n}`, { mod: 'asr' });
+        if (idle.length > 0 && Date.now() - this.lastPreTranscribeIdleLogAt > 10 * 60 * 1000) {
+          this.lastPreTranscribeIdleLogAt = Date.now();
+          for (const n of idle) this.logger.info(`预转写：${n}`, { mod: 'asr' });
+        }
       } catch (e) {
         /* 预转写是"锦上添花"：失败绝不影响录制、导入与既有流程 */
         this.logger.warn('预转写一轮异常（不影响录制/导入）', { data: { error: (e as Error).message } });
