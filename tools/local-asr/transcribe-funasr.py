@@ -72,6 +72,47 @@ def _scrub_surrogates(value, counter: list) -> object:
     return value
 
 
+PROGRESS_PREFIX = "##ASR-PROGRESS##"
+
+# 子批的默认大小（音频秒）。300 秒的由来：批要够大才不重复前向开销，又要够小才让界面
+# 每 30–60 秒看到一次**真实**推进（本机 RTF ≈0.11 ⇒ 300 秒音频约 33 秒墙上时间）。
+# TS 侧可用 `asr.localFunasr.progressBatchSec` 覆盖；传 0 表示关掉分批。
+PROGRESS_BATCH_SEC = 300
+
+
+
+def emit_progress(phase: str, done_sec: float, total_sec: float,
+                  seg_done: int = None, seg_total: int = None,
+                  speed: float = None, elapsed_ms: int = None) -> None:
+    """把一行进度写到 **stderr**（带哨兵前缀），父进程边跑边解析。
+
+    为什么走 stderr 而不是 stdout：stdout 是**结果通道**（`emit()` 的 JSON，
+    父进程按"最后一个合法 JSON 行"解析）。往里塞进度行就等于污染结果契约 ——
+    而 stderr 本来就是库的杂音通道，加一行带前缀的 JSON 不影响任何人。
+
+    为什么需要它（2026-10-15 用户需求「精确进度」）：模型一次 `generate()` 就是一个黑盒，
+    30 分钟一块的音频要跑好几分钟、期间**零输出** ⇒ 界面只能靠猜（实测显示 1%，
+    而实际已经跑了 16 分钟）。把批次切开、每批报一次"已推进到本块第几秒" +
+    实测速度，界面上的百分比与剩余时间就都是**量出来的**。
+
+    任何异常都吞掉：进度是**观测**，绝不能因为它把转写弄失败。
+    """
+    payload: dict = {"phase": phase, "done_sec": round(float(done_sec), 3), "total_sec": round(float(total_sec), 3)}
+    if seg_done is not None:
+        payload["seg_done"] = int(seg_done)
+    if seg_total is not None:
+        payload["seg_total"] = int(seg_total)
+    if speed is not None and speed > 0:
+        payload["speed"] = round(float(speed), 4)
+    if elapsed_ms is not None:
+        payload["elapsed_ms"] = int(elapsed_ms)
+    try:
+        sys.stderr.write(PROGRESS_PREFIX + " " + json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def emit(obj: dict, code: int = 0) -> None:
     """
     只往**真正的 stdout** 写 JSON。
@@ -323,8 +364,12 @@ def main() -> None:
     wav = os.path.join(tmpdir, "audio16k.wav")
 
     try:
+        # 进度：抽取音频（ffmpeg 转 16k 单声道）。这一段没有细粒度百分比（单次 ffmpeg 调用），
+        # 报出来是为了让界面能说清"现在卡在哪一步"，而不是一片空白。
+        emit_progress("extract", 0, max(0.0, end - start), elapsed_ms=0)
         extract_audio(file, start, end, wav)
         duration = probe_duration(wav) or (end - start)
+        emit_progress("extract", 0, duration, elapsed_ms=int((time.time() - t0) * 1000))
 
         import torch  # noqa: F401  仅用于确认可用性
 
@@ -357,7 +402,13 @@ def main() -> None:
                 step = (e - s) / n
                 fine.extend((s + i * step, s + (i + 1) * step) for i in range(n))
 
+        # 进度：VAD 切句完成（它跑在整块音频上，也是"固定成本"的一部分）
+        emit_progress("vad", 0, duration, seg_total=len(fine), elapsed_ms=int((time.time() - t0) * 1000))
+
         # ---- ASR 引擎：优先 vLLM（官方 bench RTFx 340 vs PyTorch 21），失败退 PyTorch ----
+        # 进度：从 VAD 之后到模型可用，是这一块里**最贵的一次性等待**（实测 ≈90–100 秒）。
+        # 界面据此显示"加载模型"而不是一个假百分比。
+        emit_progress("load", 0, duration, elapsed_ms=int((time.time() - t0) * 1000))
         engine = "pytorch"
         asr = None
         if engine_pref in ("auto", "vllm"):
@@ -390,15 +441,21 @@ def main() -> None:
 
         另外**尽量批量**：逐段调用会把同一套前端/编码器开销重复 N 次，
         实测 60 秒音频分成 7 段逐段跑，推理时间比批量高一个量级。
+        （2026-10-15 更严谨的说法：实测那 10 倍差是"每段一次 generate"的**调用开销**，
+          不是模型本身慢 —— 所以下面按"若干段一批"切分，批次数量控制在个位数。）
         """
-        seg_paths: list[str] = []
+        # (句子区间, wav 路径) **成对**保存。
+        # 原来只留路径列表 `seg_paths`，而结果回填用的是区间列表 `fine` 去 zip ——
+        # 一旦有区间因为太短被跳过（下面那个 continue），两者就错位了：
+        # 文本会被贴到**别的**时间点上（字幕整体串位）。成对保存 + 按对推进，从根上消掉它。
+        pairs: list[tuple[tuple[float, float], str]] = []
         for i, (s, e) in enumerate(fine):
             chunk = audio[int(s * sr): int(e * sr)]
             if chunk.size < int(0.05 * sr):
                 continue
             p = os.path.join(tmpdir, f"seg-{i:04d}.wav")
             sf.write(p, chunk, sr)
-            seg_paths.append(p)
+            pairs.append(((s, e), p))
 
         asr_t0 = time.time()
         kwargs: dict = {"language": language}
@@ -421,39 +478,105 @@ def main() -> None:
         if spec.get("max_length"):
             kwargs["max_length"] = int(spec["max_length"])
 
+        # ---- 子批：把"一次喂完"切成若干批，**只为让进度可见**（2026-10-15）----
+        # 批大小按**音频秒数**控制（`progress_batch_sec`，默认 300 秒）：
+        #   · 太小（逐段）→ 重复前向开销，实测慢一个量级；
+        #   · 太大（一次喂完）→ 界面在整个块（几分钟到十几分钟）里没有任何真实进度。
+        # 批与批之间**顺序拼接**结果 ⇒ 与"一次喂完"语义等价；批内仍是原来那个批量调用。
+        try:
+            batch_sec = float(spec.get("progress_batch_sec") or PROGRESS_BATCH_SEC)
+        except Exception:
+            batch_sec = float(PROGRESS_BATCH_SEC)
+        batches: list[list[int]] = []
+        if not pairs:
+            batches = []
+        elif batch_sec <= 0:
+            # 0/负数 = 关掉分批（行为与历史逐字一致，也给"怀疑分批拖慢了"时留一个开关）
+            batches = [list(range(len(pairs)))]
+        else:
+            cur: list[int] = []
+            cur_audio = 0.0
+            for idx, ((s, e), _p) in enumerate(pairs):
+                cur.append(idx)
+                cur_audio += max(0.0, e - s)
+                if cur_audio >= batch_sec:
+                    batches.append(cur)
+                    cur = []
+                    cur_audio = 0.0
+            if cur:
+                batches.append(cur)
+
         texts: list[str] = []
         results_items: list = []
         engine_note = ""
         raw_debug: object = None
-        try:
-            # 批量：一次把全部片段喂进去（模型内部按 batch 处理）
-            res = asr.generate(input=seg_paths, **kwargs)
-            results_items = list(res or [])
-            texts = [str(item.get("text", "")).strip() if isinstance(item, dict) else str(item) for item in results_items]
-            engine_note = f"批量 {len(seg_paths)} 段一次调用"
-            if spec.get("debug_raw"):
-                # 把第一条结果的键与时间戳结构原样带出来，便于确认字级时间戳怎么取
-                raw_debug = _describe_result(res)
-        except Exception as e:
-            # 退路：逐段调用（慢，但至少能出结果）
-            engine_note = f"批量失败（{type(e).__name__}），退化为逐段调用"
-            texts = []
-            results_items = []
-            for p in seg_paths:
-                try:
-                    r = asr.generate(input=p, **kwargs)
-                except TypeError:
-                    r = asr.generate(input=p)
-                items = list(r or [])
-                results_items.append(items[0] if items else {})
-            texts = [str(it.get("text", "")).strip() if isinstance(it, dict) else str(it) for it in results_items]
+        degraded = 0
+        seg_done = 0
+        speech_done = 0.0
+        speed = 0.0
+        for b_i, batch in enumerate(batches):
+            paths = [pairs[i][1] for i in batch]
+            try:
+                # 批量：这一批一次喂进去（模型内部按 batch 处理）
+                res = asr.generate(input=paths, **kwargs)
+                items = list(res or [])
+                if spec.get("debug_raw") and raw_debug is None:
+                    # 把第一条结果的键与时间戳结构原样带出来，便于确认字级时间戳怎么取
+                    raw_debug = _describe_result(res)
+            except Exception as e:
+                # 退路：**本批**逐段调用（慢，但至少能出结果）
+                degraded += 1
+                items = []
+                for p in paths:
+                    try:
+                        r = asr.generate(input=p, **kwargs)
+                    except TypeError:
+                        r = asr.generate(input=p)
+                    row = list(r or [])
+                    items.append(row[0] if row else {})
+            results_items.extend(items)
+            seg_done += len(batch)
+            speech_done += sum(max(0.0, e - s) for (s, e), _p in (pairs[i] for i in batch))
+            speed = speech_done / max(1e-6, time.time() - asr_t0)
+            # 进度：已推进到本块音频的第几秒（= 这一批最后一句的结束位置）。
+            # 静音段也算"推进"——否则 30 分钟里 20% 是静音时，进度永远差一截。
+            emit_progress(
+                "asr",
+                pairs[batch[-1]][0][1],
+                duration,
+                seg_done=seg_done,
+                seg_total=len(pairs),
+                speed=speed,
+                elapsed_ms=int((time.time() - t0) * 1000),
+            )
+        if len(batches) > 1:
+            engine_note = (
+                f"分 {len(batches)} 批调用（每批约 {int(batch_sec)} 秒音频，共 {len(pairs)} 段）"
+                + (f"；其中 {degraded} 批退化为逐段调用" if degraded else "")
+            )
+        elif batches:
+            engine_note = f"批量 {len(pairs)} 段一次调用"
+        else:
+            engine_note = "没有可识别的句子（VAD 没切出语音）"
+        texts = [str(it.get("text", "")).strip() if isinstance(it, dict) else str(it) for it in results_items]
         asr_ms = int((time.time() - asr_t0) * 1000)
+        # 整块跑完：末尾的静音不会被 VAD 覆盖，显式报"到末尾"，
+        # 否则进度会停在 99%（实测：最后 8 秒静音就够卡住它）。
+        emit_progress(
+            "asr",
+            duration,
+            duration,
+            seg_done=len(pairs),
+            seg_total=len(pairs),
+            speed=speed,
+            elapsed_ms=int((time.time() - t0) * 1000),
+        )
 
         max_chars = int(spec.get("max_chars_per_cue") or 18)
         min_dur = float(spec.get("min_cue_dur") or 0.6)
         by_stamp = {"字级": 0, "VAD 段": 0}
         segments: list[dict] = []
-        for (s, e), res_item in zip(fine, results_items, strict=False):
+        for (s, e), res_item in zip([sp for sp, _p in pairs], results_items, strict=False):
             text = ""
             stamps: list = []
             if isinstance(res_item, dict):
@@ -493,8 +616,18 @@ def main() -> None:
             # 耗时拆分：模型加载是一次性成本，跟"每段音频要多久"必须分开看，
             # 否则拿冷启动的数字去比 RTF，会得出"本地慢几十倍"的错误结论
             "asr_ms": asr_ms,
-            "segments_input": len(seg_paths),
+            "segments_input": len(pairs),
             "batch_note": engine_note,
+            # 进度观测的汇总（2026-10-15）：父进程据此把"这一块的固定成本"与实测速度
+            # 写进日志/台账 —— 界面上"还需约 N 分钟"的准确性全靠这两个数。
+            "progress": {
+                "batches": len(batches),
+                "batch_sec": int(batch_sec) if batch_sec > 0 else 0,
+                "seg_total": len(pairs),
+                "speech_sec": round(speech_done, 1),
+                "asr_speed": round(speed, 4),
+                "degraded_batches": degraded,
+            },
             "timestamp_source": by_stamp,
             "raw_debug": raw_debug,
             "notes": dll_notes,

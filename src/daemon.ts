@@ -72,6 +72,7 @@ import {
 import { decideShutdown, executeCancelShutdown, executeShutdown, inShutdownWindow, type ShutdownConditions } from './auto-shutdown.ts';
 import { planSegmentCalls } from './media-plan.ts';
 import { transcribeInWorker } from './asr-worker-client.ts';
+import type { ProgressPayload } from './asr-progress.ts';
 import { Cleaner, checkAfterUploadDelete, judgeDeletability, rotateLogs } from './cleanup.ts';
 import { writeErrorReport, setErrorReportDir, setErrorsPath, classifyError, type ErrorReportInput } from './errors.ts';
 import { LlmClient } from './llm.ts';
@@ -220,8 +221,14 @@ export class Orchestrator {
   private bootedAt = nowIso();
   /** 运行期目录覆盖（端到端测试用，避免污染真实 data/） */
   private dataDir: string;
-  /** 各任务的进度（供 UI 读取细粒度进度，如「转写中 12/24」） */
-  readonly progress = new Map<string, { label: string; current: number; total: number }>();
+  /**
+   * 各任务的进度（供 UI 读取细粒度进度，如「转写中 12/24」）。
+   *
+   * 2026-10-15：值类型换成 {@link ProgressPayload} —— 转写会往里塞**实测**的
+   * `pct` / `audioDoneSec` / `etaSec` / `speed`，界面因此能显示"已转写 44 分 / 还剩 15 分"，
+   * 而不是拿标称速度猜出来的数字（猜错会让人做出错误决定：去睡觉，或者手动杀掉正在跑的活）。
+   */
+  readonly progress = new Map<string, ProgressPayload>();
   /** biliLive-tools 当前「字幕识别」模型的缓存（见 `bililiveAsrModel()`） */
   private asrModelCache?: { at: number; value: { modelId?: string; modelName?: string } };
   /** 正在处理的任务（场次级串行） */
@@ -1509,9 +1516,13 @@ export class Orchestrator {
    * 流水线
    * ---------------------------------------------------------------------- */
 
-  private setProgress(taskId: string, label: string, current: number, total: number): void {
-    this.progress.set(taskId, { label, current, total });
-    this.ledger.updateTask(taskId, { progress: { label, current, total } });
+  /**
+   * 记一次阶段进度。内存里那份map 是界面读的**权威**副本；台账那份只是持久化留痕
+   * （`ledger.updateTask` 只打脏标记、300ms 合并写，所以高频上报不会造成写盘风暴）。
+   */
+  private setProgress(taskId: string, p: ProgressPayload): void {
+    this.progress.set(taskId, p);
+    this.ledger.updateTask(taskId, { progress: p });
   }
 
   private clearProgress(taskId: string): void {
@@ -1830,7 +1841,7 @@ export class Orchestrator {
           streamer: guess,
           ...(this.opts.dryRun !== undefined ? { dryRun: this.opts.dryRun } : {}),
           ...(this.opts.allowPaid !== undefined ? { allowPaid: this.opts.allowPaid } : {}),
-          onProgress: (p) => this.setProgress(taskId, p.label, p.current, p.total),
+          onProgress: (p) => this.setProgress(taskId, p),
           ...(task.overrides?.maxClips !== undefined ? { maxClipsOverride: task.overrides.maxClips } : {}),
           ...(task.overrides?.extraTags ? { extraTags: task.overrides.extraTags } : {}),
         });
@@ -2098,7 +2109,7 @@ export class Orchestrator {
           task: this.ledger.getTask(taskId)!,
           uid,
           submitTimeMs: Date.now(),
-          onProgress: (p) => this.setProgress(taskId, p.label, p.current, p.total),
+          onProgress: (p) => this.setProgress(taskId, p),
         });
     this.clearProgress(taskId);
 
@@ -2522,7 +2533,7 @@ export class Orchestrator {
       uid,
       skipUpload: true,
       signal: undefined,
-      onProgress: (p) => this.setProgress(taskId, p.label, p.current, p.total),
+      onProgress: (p) => this.setProgress(taskId, p),
     });
 
     const cutOk = cutRes.results.filter((r) => r.ok && r.output);
@@ -2687,7 +2698,7 @@ export class Orchestrator {
     }
 
     /* ---- 第三步：一次投出所有分P ---- */
-    this.setProgress(taskId, `投稿中（多分P）`, 0, 1);
+    this.setProgress(taskId, { label: '投稿中（多分P）', current: 0, total: 1 });
     const r = await this.publisher.publishAsMultiPart({
       task,
       uid,
@@ -2858,7 +2869,7 @@ export class Orchestrator {
             {
               ...(workerCfg.maxOldSpaceMb ? { maxOldSpaceMb: workerCfg.maxOldSpaceMb } : {}),
               ...(this.cfg.asr.localFunasr?.timeoutSec ? { timeoutSec: this.cfg.asr.localFunasr.timeoutSec } : {}),
-              onProgress: (p) => this.setProgress(task.id, p.label, p.current, p.total),
+              onProgress: (p) => this.setProgress(task.id, p),
               /* 把 worker 的 pid 写进日志：它要是吃满内存/卡死，用户能照着这个 pid 找到并结束它，
                  不必"把整个服务重启一遍"（那正是拆独立进程要避免的事） */
               onSpawn: (child) => log.info(`转写 worker 已启动（pid ${String(child.pid)}）—— 它崩了不影响本进程`, { mod: 'asr' }),
@@ -2877,7 +2888,7 @@ export class Orchestrator {
         totalDuration: task.source.totalDuration,
         ...(this.opts.dryRun !== undefined ? { dryRun: this.opts.dryRun } : {}),
         ...(this.opts.allowPaid !== undefined ? { allowPaid: this.opts.allowPaid } : {}),
-        onProgress: (p) => this.setProgress(task.id, p.label, p.current, p.total),
+        onProgress: (p) => this.setProgress(task.id, p),
       });
     }
     for (const w of res.warnings) log.warn(w);

@@ -6,6 +6,7 @@
  *    enum 等会产出运行时代码的语法在 noEmit + erasableSyntaxOnly 下被禁止）。
  *  - 常量一律用 `as const` 对象 + 字面量联合类型表达。
  */
+import type { ProgressPayload } from './asr-progress.ts';
 
 /* ============================================================================
  * 场级 / 切片级状态机（任务书 §8 WP6 步骤 1、WP5 步骤 5）
@@ -581,8 +582,14 @@ export interface TaskRecord {
   seasonId?: number;
   sectionId?: number;
   cost: TaskCost;
-  /** 当前阶段的细粒度进度，如「转写中 12/24」 */
-  progress?: { label: string; current: number; total: number };
+  /**
+   * 当前阶段的细粒度进度，如「转写中 12/24」。
+   *
+   * 2026-10-15 起是 {@link ProgressPayload}：转写会额外带上**实测**字段
+   * （`pct` / `audioDoneSec` / `audioTotalSec` / `etaSec` / `speed` / `phase`），
+   * 界面据此显示"已转写多少、还剩多少时间"，而不是靠标称速度猜。
+   */
+  progress?: ProgressPayload;
   /** 失败信息（同时写入 error-report） */
   error?: TaskErrorBrief;
   /** 本场覆盖设置（UI 的「本场设置」） */
@@ -812,7 +819,7 @@ export interface ApiTaskSummary {
   status: TaskStatus;
   statusText: string;
   stageIndex: number;
-  progress?: { label: string; current: number; total: number };
+  progress?: ProgressPayload;
   clipCount: number;
   publishedCount: number;
   selectedCount: number;

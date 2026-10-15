@@ -25,6 +25,7 @@ import { URL } from 'node:url';
 import type { Orchestrator } from './daemon.ts';
 import { APP_VERSION, retentionNote, summarizeTask } from './daemon.ts';
 import { LOCAL_ASR_STALL_MS } from './asr.ts';
+import { fmtSecShort, type ProgressPayload } from './asr-progress.ts';
 
 /**
  * 独立的「跑完自动关机」页面（内联 HTML，无外部依赖）。
@@ -279,7 +280,8 @@ interface TaskSummaryLite {
   stageIndex?: number;
   stages?: string[];
   publishWaiting?: boolean;
-  progress?: { label: string; current: number; total: number };
+  /** 转写进度：2026-10-15 起带实测字段（pct / audioDoneSec / etaSec / speed / phase） */
+  progress?: ProgressPayload;
 }
 
 export interface UiServerOptions {
@@ -3254,6 +3256,11 @@ export class UiServer {
       case 'RECORDED':
         return '已录制 · 待处理';
       case 'TRANSCRIBING':
+        /* 2026-10-15：有**实测**百分比就写百分比（`转写中 43%`）—— 原来的 `1/4`
+           是"块数"，用户看到的还是"不知道跑了多少"；没实测数据时退回块数（如实）。 */
+        if (p && p.pct !== undefined && p.audioTotalSec) {
+          return `转写中 ${p.pct}%（${fmtSecShort(p.audioDoneSec ?? 0)}/${fmtSecShort(p.audioTotalSec)}）`;
+        }
         return p ? `转写中 ${p.current}/${p.total}` : '转写中';
       case 'TRANSCRIBED':
         return '转写完成';

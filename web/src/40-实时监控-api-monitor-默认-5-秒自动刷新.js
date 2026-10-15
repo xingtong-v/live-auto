@@ -148,17 +148,45 @@ function renderMonitor(box) {
   const stageStrip = (p) => (h.stageLabels || []).map((label, i) => {
     const st = (p.stages && p.stages[i]) || 'todo';
     const mark = st === 'done' ? '✓' : st === 'fail' ? '!' : st === 'active' ? '•' : '';
-    const prog = st === 'active' && p.progress && p.progress.total ? `<span class="prog">${p.progress.current}/${p.progress.total}</span>` : '';
+    /* 阶段条上的小数字：有**实测**百分比就用它（转写），否则用块数（分析/切片那两条链） */
+    const g = p.progress;
+    const prog = st !== 'active' || !g
+      ? ''
+      : typeof g.pct === 'number'
+        ? `<span class="prog">${g.pct}%</span>`
+        : g.total
+          ? `<span class="prog">${g.current}/${g.total}</span>`
+          : '';
     return `<span class="stage ${st}"><span class="dot">${mark}</span>${esc(label)}${prog}</span>`;
   }).join('<span class="arrow">›</span>');
 
   /* P1-7 正文级定位说明：这一页是"直播进行中盯一眼"用的，和"跑完复盘"要分清。 */
   html += `<p class="hintline">这一页回答：<b>现在在干什么、在等什么、为什么没动</b>（默认 5 秒自动刷新，适合直播进行中盯一眼）。跑完一场的产出请到「任务」里看复盘报告。</p>`;
-  /* ★ 2026-10-15 热补丁（用户："能热补丁加一个转写进度吗，已经转写多少、剩余多少时间"）：
-     接口里**没有**"本次转写开始于何时"（tasks 的 when 是任务创建时间），所以由本页记录
-     "它第一次以 TRANSCRIBING 出现在这一页"的时刻，存 localStorage（刷新页面不丢）。
-     速度按本机实测：空载 ≈0.11 × 音频时长，被抢 GPU 时 ≈0.3，取 0.25 作规划值。
-     ⚠️ 因此它是**估算**：若页面刚打开、而转写已经跑了一会儿，显示的比例会偏低 —— 界面上标了"（估算）"。 */
+  /* ★ 2026-10-15 第二版（用户："精确进度"）：服务端现在给**实测**字段 ——
+     `p.progress` 里带 pct / audioDoneSec / audioTotalSec / etaSec / speed / phase。
+     来源：本地 ASR 执行器把一块音频切成若干子批推理，每批上报"已经推进到本块音频的第几秒"
+     + 实测速度 ⇒ 百分比是**量出来的**，剩余时间 = 剩余音频 ÷ 实测速度 + 还没开始的块 × 单块固定成本。
+     ⚠️ 有实测数据时**只显示实测**，不再叠加下面那套估算（两套数字同时出现会互相打架）。 */
+  const txMeasuredOf = (p) => {
+    const g = p && p.progress;
+    if (!g || typeof g.pct !== 'number' || !(Number(g.audioTotalSec) > 0)) return null;
+    return g;
+  };
+  const txMeasuredLine = (g) => {
+    const eta = g.etaSec === null || g.etaSec === undefined ? null : Math.max(0, Number(g.etaSec));
+    const left = eta === null ? '<b>计算中</b>（还没测到速度）' : `还需约 <b>${secText(eta)}</b>`;
+    const speed = typeof g.speed === 'number' && g.speed > 0 ? `实测 ${(1 / g.speed).toFixed(2)}× 音频时长` : '速度测量中';
+    const title =
+      `实测：已识别 ${secText(g.audioDoneSec)} / ${secText(g.audioTotalSec)} 音频` +
+      `（第 ${g.chunksDone || 0}/${g.chunksTotal || 0} 块，${g.phase || '—'}）；${speed}；` +
+      `剩余 = 剩余音频 ÷ 实测速度 + 未开始的块 × 单块固定成本（抽音频+切句+加载模型 ≈90–100 秒）。` +
+      `计时自 ${g.startedAt ? new Date(g.startedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '—'}。`;
+    return `<div class="mono-sm" style="color:var(--text-3)" title="${esc(title)}">转写进度 <b>${g.pct}%</b> · ${secText(g.audioDoneSec)} / ${secText(g.audioTotalSec)} 音频 · ${left}<span style="color:var(--text-3)">（${esc(g.phase || '')}）</span></div>`;
+  };
+  /* 兜底（**估算**）：服务端没有实测数据时（旧服务 / 云端 · whisper 路径）才用。
+     接口里没有"本次转写开始于何时"，所以由本页记录"它第一次以 TRANSCRIBING 出现的时刻"，
+     存 localStorage（刷新不丢）。速度按本机实测标称值 0.25×音频时长 —— 它是**猜**的，
+     页面上必须写清"（估算）"，不许冒充精确值。 */
   const TX_RTF = 0.25;
   const txAnchors = (() => {
     try {
@@ -264,9 +292,11 @@ function renderMonitor(box) {
         <td>${statusBadge(p.status)}${p.publishWaiting ? badge('等完整稿件', 'b-wait') : ''}${p.hasError ? badge('有错误', 'b-fail') : ''}
           <div class="mono-sm" style="color:var(--text-3)">${esc(p.statusText || '')}</div>
           ${(() => {
+            const g = txMeasuredOf(p);
+            if (g) return txMeasuredLine(g);
             const e = txProgressOf(p, txDurCache.map[p.id], Date.now());
             if (!e) return '';
-            return `<div class="mono-sm" style="color:var(--text-3)" title="按本机实测速度（约 ${TX_RTF}×音频时长）与“本页第一次看到它开始转写”的时刻估算；刚打开页面时数值会偏低">转写进度 <b>${e.pct}%</b> · 还需约 ${secText(e.leftSec)}<span style="color:var(--text-3)">（估算）</span></div>`;
+            return `<div class="mono-sm" style="color:var(--text-3)" title="服务端没给实测进度，这里是**估算**：按本机标称速度（约 ${TX_RTF}×音频时长）与本页第一次看到它开始转写的时刻推算；刚打开页面时数值会偏低">转写进度 <b>${e.pct}%</b> · 还需约 ${secText(e.leftSec)}<span style="color:var(--text-3)">（估算）</span></div>`;
           })()}</td>
         <td><div class="stages" style="margin:0">${stageStrip(p)}</div></td>
         <td class="mono-sm">${secText(p.elapsedSec)}</td>

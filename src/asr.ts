@@ -39,6 +39,12 @@ import {
   writeJsonAtomic,
 } from './util.ts';
 import { log as globalLog, type Logger } from './logger.ts';
+import {
+  AsrProgressTracker,
+  parseAsrProgressLine,
+  type AsrTick,
+  type ProgressPayload,
+} from './asr-progress.ts';
 
 /* ============================================================================
  * 本地 ASR 执行器（provider = 'whisper-cpp'）
@@ -76,6 +82,18 @@ export interface LocalAsrResult {
   gpu_reserved_mb?: number;
   /** 执行器擦除的非法代理字符数（>0 说明模型吐了坏字节，曾被它整次跑挂） */
   text_scrubbed?: number;
+  /**
+   * 进度观测的汇总（2026-10-15，Fun-ASR 执行器才给）。
+   * `asr_speed` 是**实测**速度（语音秒 / 墙上秒），界面上的"还需约 N 分钟"全靠它。
+   */
+  progress?: {
+    batches?: number;
+    batch_sec?: number;
+    seg_total?: number;
+    speech_sec?: number;
+    asr_speed?: number;
+    degraded_batches?: number;
+  };
 }
 
 /** 本地 ASR 的执行参数（由配置组装） */
@@ -106,6 +124,11 @@ interface LocalAsrOptions {
   hotwords?: string[];
   /** 解码器精度（留空 = fp32 = 历史行为）；见 config.ts 的 asr.localFunasr.llmDtype */
   llmDtype?: string;
+  /**
+   * 子批大小（音频秒）：执行器按它把一次转写切成若干批，**每批报一次真实进度**。
+   * 0 = 关掉分批（与历史行为逐字一致，也给"怀疑分批变慢"时留一个对照）。
+   */
+  progressBatchSec?: number;
 }
 
 /* ============================================================================
@@ -288,6 +311,12 @@ function runLocalAsr(args: {
   offset: number;
   /** 任务号（用于登记表/收尸）；缺省时用窗口信息合成一个 */
   taskId?: string;
+  /**
+   * 执行器上报的一行**真实**进度（2026-10-15）。
+   * 只在识别阶段才有（抽音频/切句/加载模型都只是一次库调用，没有细粒度进度）——
+   * 但它让界面上的百分比与剩余时间从"猜"变成"量"。
+   */
+  onTick?: (tick: AsrTick) => void;
 }): Promise<LocalAsrResult> {
   const { opts } = args;
   const spec = buildLocalAsrSpec(opts, args);
@@ -342,7 +371,26 @@ function runLocalAsr(args: {
       entry.lastOutputAt = Date.now();
     };
     child.stdout?.on('data', markOutput);
-    child.stderr?.on('data', markOutput);
+    /* ★ 进度行解析（2026-10-15）：执行器把 `##ASR-PROGRESS## {json}` 打在 **stderr** 上
+       （stdout 是结果通道，不能污染）。这里按**行**切 —— 管道会把多行粘在一个 chunk 里，
+       也会把一行切成两个 chunk，所以必须留残行缓冲，不能逐 chunk 直接 parse。 */
+    let pending = '';
+    child.stderr?.on('data', (buf: Buffer | string) => {
+      markOutput();
+      if (!args.onTick) return;
+      pending += String(buf);
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? '';
+      for (const line of lines) {
+        const tick = parseAsrProgressLine(line);
+        if (!tick) continue;
+        try {
+          args.onTick(tick);
+        } catch {
+          /* 进度回调是观测链路：它抛异常绝不能把转写带崩 */
+        }
+      }
+    });
     const stallTimer = setInterval(() => {
       if (!shouldKillStalled(entry.lastOutputAt, entry.startedAt, Date.now(), LOCAL_ASR_STALL_MS)) return;
       /* 先杀进程树（venv 的 python 会再拉起真解释器），再让回调里的 err 分支走"被终止" */
@@ -388,6 +436,10 @@ export function buildLocalAsrSpec(
       ...(opts.hotwords && opts.hotwords.length > 0 ? { hotwords: opts.hotwords } : {}),
       /* 精度同样"只在设了才写"：不写时 spec 与历史逐字节相同（执行器那边本来就是容错的） */
       ...(opts.llmDtype ? { llm_dtype: opts.llmDtype } : {}),
+      /* 子批大小：只在**显式配了**才写（不写时用执行器的内置默认 300 秒）。
+         为什么允许写 0：0 = 关掉分批，行为与历史逐字一致 —— 怀疑"分批把转写拖慢了"时
+         能一键回到老路径做对照，而不是靠改代码。 */
+      ...(opts.progressBatchSec !== undefined ? { progress_batch_sec: opts.progressBatchSec } : {}),
     };
   }
   return {
@@ -476,8 +528,15 @@ export interface TranscribeOptions {
   /** 显式允许产生费用（dry-run 下必须显式开启才允许付费调用） */
   allowPaid?: boolean;
   signal?: AbortSignal;
-  /** 进度回调：用于 UI 的「转写中 12/24」 */
-  onProgress?: (p: { current: number; total: number; label: string }) => void;
+  /**
+   * 进度回调：用于 UI 的「转写中 12/24」。
+   *
+   * 2026-10-15 起载荷里多了**实测**字段（`pct` / `audioDoneSec` / `etaSec` / `speed` /
+   * `phase`）—— 见 `src/asr-progress.ts` 的说明：以前界面只能拿"标称速度 × 已过时间"猜，
+   * 页面上显示的百分比和真实进度可以差一个数量级。旧的 `label`/`current`/`total` 三个字段
+   * 保持原样（`statusText()` 与界面早就在读）。
+   */
+  onProgress?: (p: ProgressPayload) => void;
 }
 
 export interface TranscribeResult {
@@ -1147,6 +1206,9 @@ export class Transcriber {
       maxCharsPerCue: f.maxCharsPerCue ?? 18,
       minCueDur: f.minCueDur ?? 0.6,
       timestamps: f.timestamps !== false,
+      /* 子批大小（音频秒）：配了就写进 spec，没配就让执行器用它自己的默认值（300 秒）。
+         写 0 是**有意义的**：关掉分批 = 回到"一次喂完"的老行为（对照用）。 */
+      ...(f.progressBatchSec !== undefined ? { progressBatchSec: Math.max(0, Math.round(f.progressBatchSec)) } : {}),
       ...(hotwords.length > 0 ? { hotwords } : {}),
       timeoutMs: Math.max(600, f.timeoutSec ?? 4 * 3600) * 1000,
     };
@@ -1249,6 +1311,24 @@ export class Transcriber {
       data: { segmentMinutes: this.cfg.asr.segmentMinutes, overlapSeconds: this.cfg.asr.overlapSeconds, dryRun, allowPaid },
     });
 
+    /* ---- 精确进度（2026-10-15）--------------------------------------------
+     * 一个聚合器对应**这一次转写**。它把"每个调用单元推进到音频第几秒"累加起来，
+     * 得到真实的百分比与剩余时间 —— 而不是拿"标称速度 × 已过时间"猜。
+     *
+     * 只有本地 Fun-ASR 会喂它细粒度进度（执行器的子批上报）；云端/whisper 路径
+     * 仍然只在单元结束时调用 markDone ⇒ 界面上退回"块级"进度（如实，不假精确）。 */
+    const tracker = new AsrProgressTracker(
+      effectiveWindows.map((w) => ({ audioSec: Math.max(0, w.inFileEnd - w.inFileStart) })),
+    );
+    const pushProgress = (): void => {
+      try {
+        opts.onProgress?.(tracker.snapshot());
+      } catch (e) {
+        /* 进度是观测链路：它出问题绝不能把转写带崩（跟热词/体检行同一个原则） */
+        log.warn(`进度回调抛错（已忽略，不影响转写）：${(e as Error).message}`);
+      }
+    };
+
     interface UnitResult {
       window: WindowCall;
       fromCache: boolean;
@@ -1276,7 +1356,9 @@ export class Transcriber {
           // ---- 命中缓存：直接跳过，绝不重复付费（陷阱 #3）----
           if (cached) {
             done++;
-            opts.onProgress?.({ current: done, total: effectiveWindows.length, label: `转写中 ${done}/${effectiveWindows.length}（缓存）` });
+            /* 命中缓存也是"这一块不用跑了" ⇒ 直接算完成，进度立刻前进一格 */
+            tracker.markDone(w.windowIndex);
+            pushProgress();
             log.debug(`段 ${w.windowIndex + 1} 命中缓存，跳过付费调用`, { data: { file: path.basename(w.file), inFileStart: w.inFileStart } });
             return { window: w, fromCache: true, segments: cached.segments, audioSeconds, paid: false };
           }
@@ -1290,7 +1372,8 @@ export class Transcriber {
            *   （耗时 1ms、失败 1 段，报错还指着付费）。 */
           if (dryRun && !allowPaid && !useLocalAsr) {
             done++;
-            opts.onProgress?.({ current: done, total: effectiveWindows.length, label: `转写中 ${done}/${effectiveWindows.length}（dry-run 跳过）` });
+            tracker.markDone(w.windowIndex);
+            pushProgress();
             return {
               window: w,
               fromCache: false,
@@ -1330,6 +1413,8 @@ export class Transcriber {
                    各起一次 —— 两个进程各加载一份模型、抢同一份 ModelScope 缓存，实测会双双卡死。
                    同一个 key 只留一个进程，第二个调用复用它的结果。 */
                 const flightKey = [localOpts!.engine, localOpts!.model, w.file, w.inFileStart, w.inFileEnd, w.globalStart].join('|');
+                tracker.markStarted(w.windowIndex);
+                pushProgress();
                 const flight = singleFlightLocal(flightKey, () =>
                   runLocalAsr({
                     opts: localOpts!,
@@ -1338,6 +1423,11 @@ export class Transcriber {
                     endTime: w.inFileEnd,
                     offset: w.globalStart,
                     taskId: `${taskId}#${w.windowIndex}`,
+                    /* 执行器每跑完一个子批就报一次 ⇒ 百分比与剩余时间是**量出来的** */
+                    onTick: (tick) => {
+                      tracker.onTick(w.windowIndex, tick);
+                      pushProgress();
+                    },
                   }),
                 );
                 if (flight.reused) {
@@ -1433,7 +1523,8 @@ export class Transcriber {
                 audioSeconds,
               });
               done++;
-              opts.onProgress?.({ current: done, total: effectiveWindows.length, label: `转写中 ${done}/${effectiveWindows.length}` });
+              tracker.markDone(w.windowIndex);
+              pushProgress();
               log.info(`${purpose} 完成：${segments.length} 条字幕`, { data: { attempt, paid: !useLocalAsr } });
               /* ⚠️ `paid` 决定"实际计费音频"的累计口径（→ 台账 ASR 费用、界面"预计花费"）。
                  本地 provider（whisper / local-funasr）是**零成本**的，写成 true 会让
@@ -1455,7 +1546,8 @@ export class Transcriber {
                 continue;
               }
               done++;
-              opts.onProgress?.({ current: done, total: effectiveWindows.length, label: `转写中 ${done}/${effectiveWindows.length}（跳过）` });
+              tracker.markDone(w.windowIndex);
+              pushProgress();
               log.error(`${purpose} 重试 ${maxRetries} 次后跳过`, e, { data: { type } });
               return {
                 window: w,

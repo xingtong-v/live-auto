@@ -203,6 +203,45 @@ section('2. 协议：任务原样抵达、进度原样回传、结果原样返�
     (progRes?.transcript as { segments?: unknown[] })?.segments,
     [{ start: 1, end: 2, text: '空耳' }],
   );
+
+  /* ★ 2026-10-15：精确进度的**新字段**必须也能穿过 IPC。
+     这里钉的是一个真会发生的退化：客户端原来手抄 label/current/total 三个字段
+     （`{ label: msg.label, current: msg.current, total: msg.total }`），
+     后来给 ProgressPayload 加了 pct / audioDoneSec / etaSec / speed / phase ——
+     手抄写法会让新字段在这条路径上**静默消失**：界面表现只是"独立进程模式下精确进度不生效"，
+     不报错、不失败，只能靠人肉对比两条路径才发现。 */
+  const richWorker = fakeWorker(
+    'progress-rich',
+    `send({ type: 'ready' });
+     process.on('message', (m) => {
+       if (m?.type === 'ping') return send({ type: 'pong' });
+       if (m?.type !== 'job') return;
+       send({ type: 'progress', label: '转写中 43%', current: 1, total: 4,
+              pct: 43, phase: '识别中', audioDoneSec: 4432, audioTotalSec: 10305,
+              elapsedSec: 900, etaSec: 1320, speed: 9.2, chunksDone: 1, chunksTotal: 4,
+              startedAt: '2026-10-15T14:00:00.000Z', updatedAt: '2026-10-15T14:15:00.000Z' });
+       send({ type: 'done', result: { transcript: { segments: [] }, paidCalls: 0, cacheHits: 0, failedWindows: 0, warnings: [], durationMs: 1 } });
+     });`,
+  );
+  const rich: Array<Record<string, unknown>> = [];
+  try {
+    await transcribeInWorker(job({ taskId: 'progress-rich-task' }), {
+      forkPath: richWorker.script,
+      handshakeMs: 5000,
+      timeoutMs: 10_000,
+      onProgress: (p) => rich.push(p as unknown as Record<string, unknown>),
+    });
+  } catch (e) {
+    ok('rich progress worker 应当成功返回', false, String(e));
+  }
+  const r0 = rich[0] ?? {};
+  eq('★ 实测百分比穿过 IPC 不丢', r0['pct'], 43);
+  eq('★ 已转写音频秒穿过 IPC 不丢', r0['audioDoneSec'], 4432);
+  eq('★ 总音频秒穿过 IPC 不丢', r0['audioTotalSec'], 10305);
+  eq('★ 剩余时间穿过 IPC 不丢', r0['etaSec'], 1320);
+  eq('★ 实测速度穿过 IPC 不丢', r0['speed'], 9.2);
+  eq('★ 阶段文案穿过 IPC 不丢', r0['phase'], '识别中');
+  ok('★ 消息里的 `type` 不会被当成进度字段带出去（前端拿到的对象里没有 type）', !('type' in r0), JSON.stringify(r0));
 }
 
 section('3. 五种失败：都必须被归类，且都必须收尸');

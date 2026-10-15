@@ -9,7 +9,9 @@
  * 协议（只走 JSON，父进程用 `child_process.fork` 起它）：
  *   父 → 子  { type:'job', job:{ taskId, totalDuration, allowPaid, segments, cacheDir } }
  *   子 → 父  { type:'ready' }                                 启动握手
- *            { type:'progress', label, current, total }        进度（转发给界面）
+ *            { type:'progress', label, current, total, … }     进度（转发给界面）
+ *              ⚠️ 2026-10-15 起还带 pct / audioDoneSec / audioTotalSec / etaSec / speed / phase
+ *                 —— **整个对象原样转发**，少传一个字段界面上的"精确进度"就静默失效。
  *            { type:'done', transcript, stats }                成功
  *            { type:'error', message }                         失败（随后进程退出）
  *   父 → 子  { type:'ping' }  ⇒  { type:'pong' }               心跳
@@ -93,7 +95,10 @@ process.on('message', (raw) => {
         /* ⚠️ dryRun 必须一起带过来：不传的话，"dry-run 被拦下"这条会退化成另一种失败，
            守护进程就分不清"设计内拦截"与"真跑挂了"（见 WorkerJob 的注释）。 */
         ...(job.dryRun ? { dryRun: true } : {}),
-        onProgress: (p) => send({ type: 'progress', label: p.label, current: p.current, total: p.total }),
+        /* 进度原样转发（含 2026-10-15 加的**实测**字段：pct / audioDoneSec / etaSec / speed / phase）。
+           ⚠️ 这里必须整个对象转，不能只挑 label/current/total —— 少一个字段，
+           独立进程路径下的「精确进度」就会静默退化回"块级进度"（界面看着像没生效）。 */
+        onProgress: (p) => send({ ...p, type: 'progress' }),
       });
       /* 回传**整个结果对象**：形状与进程内路径一致，调用方不必区分两条路（少一处漂移点） */
       send({ type: 'done', result: res as unknown as Record<string, unknown> });

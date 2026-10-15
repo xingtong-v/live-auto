@@ -14,6 +14,7 @@ import { fork, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import { ROOT_DIR } from './util.ts';
 import type { MediaSegment } from './media-plan.ts';
+import type { ProgressPayload } from './asr-progress.ts';
 
 export interface WorkerJob {
   taskId: string;
@@ -46,7 +47,8 @@ export class AsrWorkerError extends Error {
 }
 
 export interface TranscribeInWorkerOptions {
-  onProgress?: (p: { label: string; current: number; total: number }) => void;
+  /** 进度回调（含 2026-10-15 加的**实测**字段，见 src/asr-progress.ts 的 ProgressPayload） */
+  onProgress?: (p: ProgressPayload) => void;
   /** 整体超时（秒）；默认 4 小时，与 asr.localFunasr.timeoutSec 默认一致 */
   timeoutSec?: number;
   /**
@@ -138,7 +140,26 @@ export async function transcribeInWorker(job: WorkerJob, opts: TranscribeInWorke
     );
 
     child.on('message', (raw) => {
-      const msg = raw as { type?: string; label?: string; current?: number; total?: number; result?: unknown; message?: string };
+      const msg = raw as {
+        type?: string;
+        label?: string;
+        current?: number;
+        total?: number;
+        result?: unknown;
+        message?: string;
+        /** 2026-10-15 加的实测进度字段（原样透传，见 asr-progress.ts） */
+        pct?: number;
+        phase?: string;
+        audioDoneSec?: number;
+        audioTotalSec?: number;
+        elapsedSec?: number;
+        etaSec?: number | null;
+        speed?: number | null;
+        chunksDone?: number;
+        chunksTotal?: number;
+        startedAt?: string;
+        updatedAt?: string;
+      };
       if (msg?.type === 'ready') {
         gotReady = true;
         try {
@@ -166,7 +187,16 @@ export async function transcribeInWorker(job: WorkerJob, opts: TranscribeInWorke
         return;
       }
       if (msg?.type === 'progress') {
-        opts.onProgress?.({ label: String(msg.label ?? ''), current: Number(msg.current ?? 0), total: Number(msg.total ?? 0) });
+        /* ⚠️ **整个消息**当成进度对象往下传（只去掉 type）——2026-10-15 之前这里是手抄三个字段，
+           后来给 ProgressPayload 加了 pct/etaSec/speed/phase，手抄写法会让新字段在这条路径上静默消失
+           （界面表现就是"独立进程模式下精确进度不生效"，且完全不报错）。 */
+        const { type: _type, ...progress } = msg;
+        opts.onProgress?.({
+          label: String(progress.label ?? ''),
+          current: Number(progress.current ?? 0),
+          total: Number(progress.total ?? 0),
+          ...progress,
+        });
         return;
       }
       if (msg?.type === 'done') {

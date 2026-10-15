@@ -11,6 +11,16 @@
       "cmd": "npm run asr-guard-test"
     },
     {
+      "name": "asr-progress-test",
+      "fast": true,
+      "cmd": "npm run asr-progress-test"
+    },
+    {
+      "name": "local-funasr-executor-test",
+      "fast": true,
+      "cmd": "npm run local-funasr-executor-test"
+    },
+    {
       "name": "typecheck",
       "cmd": "npm run typecheck",
       "fast": true

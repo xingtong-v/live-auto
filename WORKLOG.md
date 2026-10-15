@@ -37,3 +37,5 @@
 - [x] 2026-10-13T14:53:32Z | session:9aa24b6c-aef | 边录边转首次真机验证失败 + 补观测（每轮留痕、守护进程限频） src/pre-transcribe-tick.ts src/daemon.ts test/pre-transcribe-tick.ts | 文件：
 
 - [x] 2026-10-13T14:57:43Z | session:9aa24b6c-aef | 收窄预转写让路门控：只有真正在转写时才让路 src/daemon.ts | 文件：
+
+- [x] 2026-10-15T15:01:36Z | session:9aa24b6c-aef | 精确转写进度：执行器子批上报 + 服务端实测聚合（pct/ETA）+ 界面显示 | 文件：src/asr-progress.ts, src/asr.ts, src/daemon.ts, src/server.ts, src/config.ts, src/types.ts, src/asr-worker.ts, src/asr-worker-client.ts, tools/local-asr/transcribe-funasr.py, test/asr-progress.ts, test/local-funasr-executor.ts, test/asr-worker.ts, web/src/40-实时监控-api-monitor-默认-5-秒自动刷新.js

@@ -89,6 +89,8 @@
     "media-plan-test": "node test/media-plan.ts",
     "asr-worker-test": "node test/asr-worker.ts",
     "asr-guard-test": "node test/asr-process-guard.ts",
+    "asr-progress-test": "node test/asr-progress.ts",
+    "local-funasr-executor-test": "node test/local-funasr-executor.ts",
     "worker-fault-live": "node --experimental-strip-types tools/local-asr/worker-fault-live.ts",
     "footprint": "node --experimental-strip-types tools/local-asr/footprint.ts",
     "build:ui": "node tools/ui-modules.ts --build",
