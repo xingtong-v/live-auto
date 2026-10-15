@@ -90,6 +90,11 @@ async function loadMonitor(silent) {
   }
 }
 
+/* ★ 2026-10-15：任务时长表（id → durationSec）**必须在模块级** ——
+   我第一次写在了渲染函数里，函数每 5 秒跑一次 ⇒ 缓存每次被重置 ⇒ 进度永远算不出来（实测页面空白无进度）。
+   60 秒拉一次 /api/tasks 就够，别每 5 秒拉。 */
+let txDurCache = { at: 0, map: {} };
+
 function renderMonitor(box) {
   const m = state.mon;
   const d = m.data;
@@ -149,6 +154,107 @@ function renderMonitor(box) {
 
   /* P1-7 正文级定位说明：这一页是"直播进行中盯一眼"用的，和"跑完复盘"要分清。 */
   html += `<p class="hintline">这一页回答：<b>现在在干什么、在等什么、为什么没动</b>（默认 5 秒自动刷新，适合直播进行中盯一眼）。跑完一场的产出请到「任务」里看复盘报告。</p>`;
+  /* ★ 2026-10-15 热补丁（用户："能热补丁加一个转写进度吗，已经转写多少、剩余多少时间"）：
+     接口里**没有**"本次转写开始于何时"（tasks 的 when 是任务创建时间），所以由本页记录
+     "它第一次以 TRANSCRIBING 出现在这一页"的时刻，存 localStorage（刷新页面不丢）。
+     速度按本机实测：空载 ≈0.11 × 音频时长，被抢 GPU 时 ≈0.3，取 0.25 作规划值。
+     ⚠️ 因此它是**估算**：若页面刚打开、而转写已经跑了一会儿，显示的比例会偏低 —— 界面上标了"（估算）"。 */
+  const TX_RTF = 0.25;
+  const txAnchors = (() => {
+    try {
+      return JSON.parse(localStorage.getItem('liveauto.tx.anchor') || '{}');
+    } catch {
+      return {};
+    }
+  })();
+  const txSaveAnchors = () => {
+    try {
+      localStorage.setItem('liveauto.tx.anchor', JSON.stringify(txAnchors));
+    } catch {
+      /* 隐私模式/禁用存储：退化为"本次页面会话内有效" */
+    }
+  };
+  const txAnchorOf = (p, nowMs) => {
+    if (p.status === 'TRANSCRIBING') {
+      if (!txAnchors[p.id]) {
+        txAnchors[p.id] = nowMs;
+        txSaveAnchors();
+      }
+      return txAnchors[p.id];
+    }
+    /* 已经不是转写了：留 6 小时便于回看，再久就清掉，别让 localStorage 无限长 */
+    if (txAnchors[p.id] && nowMs - txAnchors[p.id] > 6 * 3600_000) {
+      delete txAnchors[p.id];
+      txSaveAnchors();
+    }
+    return undefined;
+  };
+  /** 只有"正在转写"才有进度；音频时长取 /api/tasks 的 durationSec */
+  const txProgressOf = (p, durationSec, nowMs) => {
+    const anchor = txAnchorOf(p, nowMs);
+    /* 调试出口：界面上一旦不显示，能立刻看出是"状态不对/没锚点/没时长"哪一类（2026-10-15 排查用） */
+    const dbg = (why) => {
+      try {
+        window.__txDebug = window.__txDebug || {};
+        window.__txDebug[p.id] = {
+          status: p.status,
+          hasAnchor: Boolean(anchor),
+          durationSec: durationSec ?? null,
+          cacheKeys: Object.keys(txDurCache.map || {}).length,
+          cacheAt: txDurCache.at ? new Date(txDurCache.at).toISOString() : null,
+          why,
+        };
+      } catch {
+        /* 忽略 */
+      }
+      return null;
+    };
+    if (p.status !== 'TRANSCRIBING') return dbg('状态不是 TRANSCRIBING');
+    if (!anchor) return dbg('没有锚点');
+    const audioSec = Number(durationSec || 0);
+    if (!(audioSec > 0)) return dbg('没有音频时长（/api/tasks 还没回来？）');
+    const totalMs = audioSec * 1000 * TX_RTF;
+    const pct = Math.max(1, Math.min(99, Math.round(((nowMs - anchor) / totalMs) * 100)));
+    return { pct, leftSec: Math.max(0, Math.round((totalMs - (nowMs - anchor)) / 1000)), audioSec };
+  };
+  /* 任务时长表：60 秒缓存（缓存在**模块级**，见 txDurCache） */
+  const txEnsureDurations = () => {
+    if (Date.now() - txDurCache.at < 60_000) return;
+    txDurCache.at = Date.now();
+    fetch('/api/tasks?limit=50')
+      .then((r) => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then((j) => {
+        const map = {};
+        for (const x of j.tasks || []) map[x.id] = x.durationSec;
+        txDurCache.map = map;
+        try {
+          window.__txFetch = { ok: true, keys: Object.keys(map).length };
+        } catch {
+          /* 忽略 */
+        }
+        /* ★ 必须自己重画一次：loadMonitor(true) 有"签名相同就不重画"的快路径（见本文件 L540 的注释），
+           监控数据没变时根本不会走 renderMonitor ⇒ 进度行永远出不来。
+           实测就是卡在这一步：时长拿到了（keys: 6），页面上却一直没有那行。 */
+        try {
+          if (state.view === 'monitor') renderMonitor($('#otherPage'));
+        } catch {
+          /* 重画失败不影响其它 */
+        }
+      })
+      .catch((e) => {
+        /* ⚠️ 原来这里吞掉了错误 ⇒ 界面只是"不显示进度"，查不出为什么（实测就卡在这一步） */
+        try {
+          window.__txFetch = { ok: false, error: String((e && e.message) || e) };
+        } catch {
+          /* 忽略 */
+        }
+      });
+  };
+  txEnsureDurations();
+
   html += `<div class="card"><h2>流水线（现在在干什么）${d.pipeline.length ? badge(`${d.pipeline.length} 个活跃任务`, 'b-run') : badge('空闲', 'b-idle')}</h2>`;
   if (d.pipeline.length) {
     html += `<table class="tbl"><thead><tr><th>任务</th><th>状态</th><th style="width:46%">阶段</th><th>已用</th><th class="num">花费</th></tr></thead><tbody>
@@ -156,7 +262,12 @@ function renderMonitor(box) {
         <td><a href="#" data-act="mon-open" data-id="${esc(p.id)}" style="color:inherit;text-decoration:none;border-bottom:1px dotted #c9ced4">${esc(p.title)}</a>
           <div class="mono-sm" style="color:var(--text-3)">${esc(p.streamer || '')} · ${esc(p.id)} · ${esc(p.importSource === 'auto' ? '自动导入' : p.importSource === 'manual' ? '手动导入' : '录制触发')}</div></td>
         <td>${statusBadge(p.status)}${p.publishWaiting ? badge('等完整稿件', 'b-wait') : ''}${p.hasError ? badge('有错误', 'b-fail') : ''}
-          <div class="mono-sm" style="color:var(--text-3)">${esc(p.statusText || '')}</div></td>
+          <div class="mono-sm" style="color:var(--text-3)">${esc(p.statusText || '')}</div>
+          ${(() => {
+            const e = txProgressOf(p, txDurCache.map[p.id], Date.now());
+            if (!e) return '';
+            return `<div class="mono-sm" style="color:var(--text-3)" title="按本机实测速度（约 ${TX_RTF}×音频时长）与“本页第一次看到它开始转写”的时刻估算；刚打开页面时数值会偏低">转写进度 <b>${e.pct}%</b> · 还需约 ${secText(e.leftSec)}<span style="color:var(--text-3)">（估算）</span></div>`;
+          })()}</td>
         <td><div class="stages" style="margin:0">${stageStrip(p)}</div></td>
         <td class="mono-sm">${secText(p.elapsedSec)}</td>
         <td class="num">¥${Number(p.costYuan || 0).toFixed(2)}</td></tr>`).join('')}
