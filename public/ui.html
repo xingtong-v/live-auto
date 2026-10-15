@@ -476,7 +476,7 @@
 const BOOT = window.__BOOT__ || { csrf: '', version: '?', roomId: '', platform: '' };
 
 /** UI 构建标记：在浏览器控制台里能看到，用来确认页面是不是最新的（避免缓存导致以为功能没做） */
-const UI_BUILD = 'ui-2026-10-13-llmdtype-switch';
+const UI_BUILD = 'ui-2026-10-15-pretranscribe-truth';
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -2702,12 +2702,18 @@ function renderMonitor(box) {
     const eta = g.etaSec === null || g.etaSec === undefined ? null : Math.max(0, Number(g.etaSec));
     const left = eta === null ? '<b>计算中</b>（还没测到速度）' : `还需约 <b>${secText(eta)}</b>`;
     const speed = typeof g.speed === 'number' && g.speed > 0 ? `实测 ${(1 / g.speed).toFixed(2)}× 音频时长` : '速度测量中';
+    /* 分块信息：多块时百分比会"跳"（一块跑完就前进一大格），标出"第几块"才不会被误读成卡顿。
+       ⚠️ chunksDone 已经等于 chunksTotal 时要夹住，否则会出现"第 3/2 块"这种读不通的文案。 */
+    const chunkInfo =
+      Number(g.chunksTotal) > 1
+        ? ` · 第 ${Math.min(Number(g.chunksDone || 0) + 1, Number(g.chunksTotal))}/${g.chunksTotal} 块`
+        : '';
     const title =
       `实测：已识别 ${secText(g.audioDoneSec)} / ${secText(g.audioTotalSec)} 音频` +
       `（第 ${g.chunksDone || 0}/${g.chunksTotal || 0} 块，${g.phase || '—'}）；${speed}；` +
       `剩余 = 剩余音频 ÷ 实测速度 + 未开始的块 × 单块固定成本（抽音频+切句+加载模型 ≈90–100 秒）。` +
       `计时自 ${g.startedAt ? new Date(g.startedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '—'}。`;
-    return `<div class="mono-sm" style="color:var(--text-3)" title="${esc(title)}">转写进度 <b>${g.pct}%</b> · ${secText(g.audioDoneSec)} / ${secText(g.audioTotalSec)} 音频 · ${left}<span style="color:var(--text-3)">（${esc(g.phase || '')}）</span></div>`;
+    return `<div class="mono-sm" style="color:var(--text-3)" title="${esc(title)}">转写进度 <b>${g.pct}%</b> · ${secText(g.audioDoneSec)} / ${secText(g.audioTotalSec)} 音频 · ${left}<span style="color:var(--text-3)">（${esc(g.phase || '')}${chunkInfo}）</span></div>`;
   };
   /* 兜底（**估算**）：服务端没有实测数据时（旧服务 / 云端 · whisper 路径）才用。
      接口里没有"本次转写开始于何时"，所以由本页记录"它第一次以 TRANSCRIBING 出现的时刻"，
@@ -5486,17 +5492,28 @@ function renderObserve(box) {
          这一栏读的是录像目录里的**进度文件**，不是"当前录制状态"，所以必须说清它属于哪种：
            · 仍在写 → 这一场正在录；
            · 已导入 → 那场已经进过流水线（记录留着只为命中缓存），不会再变；
-           · 历史   → 超过 1 小时没更新且没查到对应任务（多半是旧场次留下的）。 */
-      const state = p.stillWriting
-        ? '<span class="badge b-run">仍在写</span>'
-        : p.imported
-          ? '<span class="badge b-done">已导入</span>'
-          : p.ageSec > 3600
-            ? '<span class="badge">历史</span>'
-            : '<span class="badge b-done">最近</span>';
+           · 历史   → 超过 1 小时没更新且没查到对应任务（多半是旧场次留下的）。
+      ★ 2026-10-15 用户报「文件对不上」：进度记录按"分段清单指纹"存，是**历史快照** ——
+        同一场分段变多之后旧指纹还在，且记录的段数停在当时那一刻。所以这里：
+        ① 被更新的指纹（superseded）单独标出来，不冒充当前进度；
+        ② 记录的段数与**磁盘现有段数**不一致时，把磁盘数字也写出来（"记录 1/1 · 磁盘 4 段"），
+           免得拿旧数字假装是现在。 */
+      const state = p.superseded
+        ? '<span class="badge">旧指纹</span>'
+        : p.stillWriting
+          ? '<span class="badge b-run">仍在写</span>'
+          : p.imported
+            ? '<span class="badge b-done">已导入</span>'
+            : p.ageSec > 3600
+              ? '<span class="badge">历史</span>'
+              : '<span class="badge b-done">最近</span>';
+      const segNote =
+        Number(p.diskSegs) > Number(p.total)
+          ? ` <span class="obs-dim" title="进度记录是历史快照，磁盘上这一场已经有更多分段">· 磁盘现有 ${p.diskSegs} 段</span>`
+          : '';
       return `<tr>
         <td><span class="obs-strong">${esc(p.name)}</span><span class="obs-dim">${p.dir ? ' · ' + esc(p.dir) : ''}</span></td>
-        <td>${obsBar(pct, 'ok')} <span class="mono-sm">${p.done}/${p.total} 段</span></td>
+        <td>${obsBar(pct, 'ok')} <span class="mono-sm">${p.done}/${p.total} 段</span>${segNote}</td>
         <td>
           ${p.mode === 'fallback' ? '<span class="badge b-fail">已回退整段</span>' : '<span class="badge b-done">分段增量</span>'}
           ${state}

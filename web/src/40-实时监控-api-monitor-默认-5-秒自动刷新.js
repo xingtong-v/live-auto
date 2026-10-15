@@ -176,12 +176,18 @@ function renderMonitor(box) {
     const eta = g.etaSec === null || g.etaSec === undefined ? null : Math.max(0, Number(g.etaSec));
     const left = eta === null ? '<b>计算中</b>（还没测到速度）' : `还需约 <b>${secText(eta)}</b>`;
     const speed = typeof g.speed === 'number' && g.speed > 0 ? `实测 ${(1 / g.speed).toFixed(2)}× 音频时长` : '速度测量中';
+    /* 分块信息：多块时百分比会"跳"（一块跑完就前进一大格），标出"第几块"才不会被误读成卡顿。
+       ⚠️ chunksDone 已经等于 chunksTotal 时要夹住，否则会出现"第 3/2 块"这种读不通的文案。 */
+    const chunkInfo =
+      Number(g.chunksTotal) > 1
+        ? ` · 第 ${Math.min(Number(g.chunksDone || 0) + 1, Number(g.chunksTotal))}/${g.chunksTotal} 块`
+        : '';
     const title =
       `实测：已识别 ${secText(g.audioDoneSec)} / ${secText(g.audioTotalSec)} 音频` +
       `（第 ${g.chunksDone || 0}/${g.chunksTotal || 0} 块，${g.phase || '—'}）；${speed}；` +
       `剩余 = 剩余音频 ÷ 实测速度 + 未开始的块 × 单块固定成本（抽音频+切句+加载模型 ≈90–100 秒）。` +
       `计时自 ${g.startedAt ? new Date(g.startedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '—'}。`;
-    return `<div class="mono-sm" style="color:var(--text-3)" title="${esc(title)}">转写进度 <b>${g.pct}%</b> · ${secText(g.audioDoneSec)} / ${secText(g.audioTotalSec)} 音频 · ${left}<span style="color:var(--text-3)">（${esc(g.phase || '')}）</span></div>`;
+    return `<div class="mono-sm" style="color:var(--text-3)" title="${esc(title)}">转写进度 <b>${g.pct}%</b> · ${secText(g.audioDoneSec)} / ${secText(g.audioTotalSec)} 音频 · ${left}<span style="color:var(--text-3)">（${esc(g.phase || '')}${chunkInfo}）</span></div>`;
   };
   /* 兜底（**估算**）：服务端没有实测数据时（旧服务 / 云端 · whisper 路径）才用。
      接口里没有"本次转写开始于何时"，所以由本页记录"它第一次以 TRANSCRIBING 出现的时刻"，
