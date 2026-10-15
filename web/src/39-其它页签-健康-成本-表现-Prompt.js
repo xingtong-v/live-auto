@@ -38,6 +38,18 @@ async function renderOther(v) {
     }
     if (v === 'observe') return renderObserve(box);
     if (v === 'health') return renderHealth(box);
+    /* 「跑完自动关机」= **独立页面**（iframe，2026-10-14 用户：「独立页面放在健康界面后面」）：
+       它有自己的文档与定时器，其它页（尤其运行观测）每 5 秒整块重渲染**碰不到它** ——
+       用户报的"界面一直抖"就是这么根治的。结构只建一次：切走再切回来才重建。 */
+    if (v === 'autoshutdown') {
+      if (!box.querySelector('#sdFrame')) {
+        box.innerHTML =
+          '<div class="hintline" style="margin:0 0 10px">下面是独立页面（自己的刷新节奏，不受本页影响）。' +
+          '也可以直接在浏览器里打开：<a href="/api/shutdown/page" target="_blank" class="mono-sm">/api/shutdown/page</a></div>' +
+          '<iframe id="sdFrame" src="/api/shutdown/page" style="width:100%;height:620px;border:0;background:#f6f7f9;border-radius:8px"></iframe>';
+      }
+      return;
+    }
     /* 2026-10-11：待删清单与回收站合并成一页（用户：「待删清单和回收站放一起」） */
     if (v === 'trash') return renderDeletePage(box);
     if (v === 'clips') return renderClipLibrary(box);

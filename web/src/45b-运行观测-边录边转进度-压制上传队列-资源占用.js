@@ -356,6 +356,12 @@ function renderObserve(box) {
       ${noteRows ? `<div class="obs-sub">最近判定（已滤掉"循环已启动"这类噪声）</div>${noteRows}` : ''}
     </div>
 
+    <!-- ★ 2026-10-14：原来这里的「④ 跑完自动关机」卡片**已迁出**为独立页签
+         （顶栏「自动关机」，见 20-shell-body.html 的 data-view="autoshutdown" + 39-其它页签 的 iframe）。
+         原因：这一页每 5 秒整块重渲染，卡片再怎么只改文本也会被带着抖 —— 用户连报两次"界面一直抖"，
+         最终方案是让它有自己的文档（/api/shutdown/page）。此处不再保留重复入口。 -->
+    </div>
+
     <div class="card">
       <div class="card-head"><b>③ 压制 / 上传队列</b><span class="badge ${queue.length ? 'b-run' : ''}">${queue.length} 个进行中</span></div>
       ${
@@ -396,4 +402,8 @@ function renderObserve(box) {
       renderObserve(box);
     };
   }
+
+  /* ④ 跑完自动关机：状态 + 三个按钮（2026-10-14）。
+     状态走专用接口 `/api/shutdown`，**不塞进 monitor 载荷** —— 免得为了一个开关动两处接口。
+     渲染后异步取一次；按钮每次渲染都重新绑定（onclick 赋值是幂等的）。 */
 }

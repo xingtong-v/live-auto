@@ -239,6 +239,34 @@ const html = fs.readFileSync(htmlPath, 'utf8');
   ok('★ 任务被删也不丢：回流把 pubdate 写进 performance.jsonl', /\.\.\.\(pubdate !== undefined \? \{ pubdate \} : \{\}\)/.test(daemonSrc));
   const ledgerSrc = fs.readFileSync(path.join(ROOT_DIR, 'src', 'ledger.ts'), 'utf8');
   ok('台账把 pubdate 存进表现历史', /'pubdate',/.test(ledgerSrc));
+
+  /* ---- 自动关机：独立页签 + 独立页面（2026-10-14） ----
+     这一组锁的是"入口只有一个、页面不会被反复重建"：
+       · 页签在「健康面板」**后面**，且内容是 iframe（自己的文档 → 不受其它页 5 秒整块重渲染影响）；
+       · 运行观测页里**不许**再有第二份卡片（不然又是重复入口 + 抖动）；
+       · 独立页面里六条条件可视化、每秒跳动、结构只建一次。
+     真浏览器行为由 tools/verify-shutdown-tab.ts 覆盖（6 项），这里补静态的"防回归"钉子。 */
+  const tabViews = [...html.matchAll(/data-view="([a-z]+)"/g)].map((m) => m[1]!);
+  const iHealth = tabViews.indexOf('health');
+  const iAuto = tabViews.indexOf('autoshutdown');
+  ok('★ 有「自动关机」页签', iAuto >= 0, tabViews.join(','));
+  ok('★ 页签位置紧跟「健康面板」之后', iAuto === iHealth + 1, `health=${iHealth} autoshutdown=${iAuto}`);
+  ok('★ 页签内容是 iframe（独立文档 → 不会被别的页刷新带着抖）', /id="sdFrame" src="\/api\/shutdown\/page"/.test(html));
+  ok('★ iframe 结构只建一次（切走切回不堆叠）', /if \(!box\.querySelector\('#sdFrame'\)\)/.test(html));
+  ok('★ 运行观测页里不再有第二份自动关机卡片（防重复入口回归）', !/id="sdBadge"/.test(html) && !/id="sdLine1"/.test(html));
+  ok('★ 驱动旧卡片的死代码不再出现（sdSet/sdPaint/sdLive 全清）', !/const sdSet =/.test(html) && !/function sdPaint/.test(html));
+  /* 取样窗口要**足够长**：2026-10-14 给页面加了可编辑的时段/冷静期/倒计时后，
+     页面超过 9000 字符，窗口末尾的 setInterval(live,1000) 就落到了窗口外 → 断言假红。
+     这里直接取"const SHUTDOWN_PAGE 到下一个顶层 const"之间的全部内容，不再靠魔法数字。 */
+  const pageStart = serverSrc.indexOf('const SHUTDOWN_PAGE');
+  const pageEnd = serverSrc.indexOf("\nconst ", pageStart + 10);
+  const pageHtml = serverSrc.slice(pageStart, pageEnd > 0 ? pageEnd : pageStart + 30000);
+  ok('断言取样窗口覆盖整个页面常量（不是魔法长度）', pageHtml.length > 9000, String(pageHtml.length));
+  ok('★ 独立页面有六条条件的可视化容器与渲染函数', /id="gates"/.test(pageHtml) && /function paintGates\(s\)/.test(pageHtml));
+  ok('★ 条件行按 key 建一次、之后只改文本（不重建 DOM）', /if\(box\.childElementCount!==gs\.length\)/.test(pageHtml));
+  ok('★ 页面每 5 秒当场判定（?live=1）、倒计时每秒跳动', /\/api\/shutdown\?live=1/.test(pageHtml) && /setInterval\(live,1000\)/.test(pageHtml));
+  ok('★ 进度条带百分比刻度（看得见走了多少）', /id="pctL"/.test(pageHtml) && /id="pctR"/.test(pageHtml));
+  ok('参数只在底部说明出现一次（防重复信息回归）', !/set\("#l2","上次判定：.*冷静期/.test(pageHtml));
   ok('★ 缺 pubdate 的当日记录允许再拉一次（新增字段的一次性补齐）', /const lacksPubdate =/.test(ledgerSrc));
 
   /* 重投「已提交待确认」的出口（2026-10-10：提交了但 B站 稿件里始终没出现的切片必须能重投，

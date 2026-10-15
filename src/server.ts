@@ -25,6 +25,148 @@ import { URL } from 'node:url';
 import type { Orchestrator } from './daemon.ts';
 import { APP_VERSION, retentionNote, summarizeTask } from './daemon.ts';
 import { LOCAL_ASR_STALL_MS } from './asr.ts';
+
+/**
+ * 独立的「跑完自动关机」页面（内联 HTML，无外部依赖）。
+ *
+ * 设计约束（就是为了不抖）：
+ *   · 结构**只建一次**；之后每秒只改 `#cd`/`#bar` 的文本与宽度（textContent / style.width）；
+ *   · 客户端 JS **不用模板字符串**（避免与外层 TS 模板字面量打架），只用字符串拼接；
+ *   · CSRF 从 `/api/bootstrap` 现拿（与主界面同一套校验，不额外开口子）。
+ */
+const SHUTDOWN_PAGE = [
+  '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
+  '<title>跑完自动关机 · 直播切片助手</title>',
+  '<style>',
+  'body{font:14px/1.7 system-ui,"Microsoft YaHei",sans-serif;background:#f6f7f9;color:#222;margin:0;padding:28px}',
+  '.card{max-width:720px;margin:0 auto;background:#fff;border:1px solid #e6e8eb;border-radius:10px;padding:20px 22px}',
+  'h1{font-size:17px;margin:0 0 14px}',
+  '.row{margin:10px 0}',
+  '.badge{display:inline-block;padding:2px 10px;border-radius:10px;font-size:12px;background:#eee;color:#666}',
+  '.badge.on{background:#e6f2fd;color:#1a86c7}',
+  '.badge.fired{background:#fdecea;color:#c0392b}',
+  '#cd{font-variant-numeric:tabular-nums;font-size:22px;font-weight:600;min-height:1.4em;margin:2px 0 2px}',
+  '.bar{height:10px;background:#eef1f4;border-radius:5px;overflow:hidden;margin:12px 0 4px}',
+  '#bar{height:100%;width:0;background:#1a86c7;transition:width .3s}',
+  '.pctrow{display:flex;justify-content:space-between;color:#888;font-size:12.5px;font-variant-numeric:tabular-nums;margin-bottom:10px}',
+  'button{font:14px system-ui;padding:7px 14px;margin-right:8px;border:1px solid #d5d9de;background:#fff;border-radius:8px;cursor:pointer}',
+  'button:hover{background:#f2f6fb}',
+  '#hint{color:#888;font-size:12.5px;margin-top:12px}',
+  '.gate{display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:13px}',
+  '.gate .gi{width:18px;flex:0 0 18px}',
+  '.gate .gl{flex:0 0 auto}',
+  '.gate.ok .gl{color:#2f7d32}',
+  '.gate.no .gl{color:#b3261e}',
+  '.gate .gd{color:#888;font-size:12.5px}',
+  '#msg{min-height:1.6em;color:#c0392b;font-size:13px}',
+  '</style></head><body><div class="card">',
+  '<h1>跑完自动关机 <span class="badge" id="badge">读取中…</span></h1>',
+  '<div class="row" id="l1">正在读取状态…</div>',
+  '<div class="bar"><div id="bar"></div></div>',
+  '<div class="pctrow"><span id="pctL">冷静期进度</span><span id="pctR">—</span></div>',
+  '<div id="cd">—</div>',
+  '<div class="row" id="l2" style="color:#888;font-size:12.5px"></div>',
+  '<div class="row" style="margin-top:10px"><b style="font-size:13px">六条条件（逐条实时状态）</b></div>',
+  '<div id="gates"></div>',
+  '<div class="row"><button id="on">打开（本次运行）</button><button id="off">关闭</button><button id="cancel">取消关机</button></div>',
+  '<div class="row" id="persist" style="font-size:13px"></div>',
+  '<div class="row" style="margin-top:10px;padding-top:10px;border-top:1px solid #eef1f4">',
+  '  允许关机时段 <input id="wf" size="5" placeholder="22:00"> – <input id="wt" size="5" placeholder="08:00">',
+  '  &nbsp;冷静期 <input id="mi" size="3" type="number" min="0" max="720"> 分',
+  '  &nbsp;倒计时 <input id="gs" size="4" type="number" min="0" max="3600"> 秒',
+  '  &nbsp;<button id="save">保存</button> <span id="saver" style="font-size:12.5px"></span>',
+  '</div>',
+  '<div id="msg"></div>',
+  '<div id="hint">开关打开且<b>六条条件全部满足</b>（没有在录的场次、流水线空闲、没有转写在跑、biliLive-tools 队列为空、在允许时段内、空闲满冷静期）才会关机；倒计时期间点「取消关机」可撤销。时段/冷静期/倒计时/长期开关见 config.json → runtime.shutdownWhenIdle（改完热加载）。</div>',
+  '</div><script>',
+  'var BOOT={csrf:""};',
+  'function $(s){return document.querySelector(s)}',
+  'function set(id,v){var e=$(id);if(e&&e.textContent!==v)e.textContent=v}',
+  'async function api(path,opts){opts=opts||{};var r=await fetch(path,{method:opts.method||"GET",headers:{"Content-Type":"application/json","X-CSRF-Token":BOOT.csrf},body:opts.body?JSON.stringify(opts.body):undefined});var t=await r.text();var d={};try{d=t?JSON.parse(t):{}}catch(e){d={error:t}}if(!r.ok)throw new Error(d.error||("HTTP "+r.status));return d}',
+  'var last=null,at=0;',
+  'function fmt(s){s=Math.max(0,Math.floor(s));var m=Math.floor(s/60),x=s%60;return (m<10?"0":"")+m+":"+(x<10?"0":"")+x}',
+  'function live(){',
+  '  if(!last)return;',
+  '  var p=last.policy||{};var need=Math.max(1,Number(p.minIdleMinutes)||0)*60;',
+  '  var idle=(Number(last.idleForSec)||0)+(Date.now()-at)/1000;',
+  '  var pct=Math.max(0,Math.min(100,Math.round(idle/need*100)));',
+  '  var bar=$("#bar");bar.style.width=(last.enabled?pct:0)+"%";',
+  '  bar.style.background=last.firedAt?"#c0392b":(pct>=100?"#2fa84f":"#1a86c7");',
+  '  var pl=$("#pctL"),pr=$("#pctR");',
+  '  if(pl)pl.textContent=last.enabled?"冷静期进度":"开关已关闭";',
+  '  if(pr)pr.textContent=last.enabled?(pct+"% · "+fmt(idle)+" / "+fmt(need)):"—";',
+  '  var b=$("#badge");',
+  '  if(!last.enabled){b.className="badge";set("#badge","已关闭");set("#cd","开关已关闭 —— 不会自动关机");return}',
+  '  if(last.firedAt){b.className="badge fired";set("#badge","已下发关机");set("#cd","已下发关机命令（"+new Date(last.firedAt).toLocaleTimeString("zh-CN",{hour12:false})+"）—— 点「取消关机」可撤销");return}',
+  '  b.className="badge on";set("#badge","已打开");',
+  '  if(idle>=need)set("#cd","冷静期已满（"+fmt(idle)+" / "+fmt(need)+"）—— 正在检查其余条件…");',
+  '  else set("#cd","等待条件满足："+fmt(idle)+" / "+fmt(need)+"（还差 "+fmt(need-idle)+" 关机）");',
+  '}',
+  'function paint(s){last=s;at=Date.now();',
+  '  var p=s.policy||{};',
+  '  set("#l1",(s.enabled?"✅ 已打开 —— 条件满足就会关机":"⏸ 已关闭 —— 不会自动关机")+(s.dryRun?"（dry-run：只记日志不真关）":""));',
+  /* 参数只在底部提示里出现一次（原来"上次判定"那行又重复了一遍时段/冷静期/倒计时 —— 信息重复反而看不清） */
+  '  set("#l2","上次判定："+(s.lastReason||"—"));',
+  '  paintGates(s);',
+  '  paintPersist(s);',
+  '  fillPolicy(s);',
+  '  live();',
+  '}',
+  /* 常驻说明（2026-10-14 用户：「我希望打开时绿字可以一直显示」）：
+     由**状态**生成、不由动作回执生成 —— 所以它永远不会过期，轮询也清不掉它。
+     开关开着就是绿的"讲清会发生什么"，关着就是灰的"不会自动关机"。 */
+  'function paintPersist(s){',
+  '  var el=$("#persist");if(!el)return;',
+  '  var p=s.policy||{};var win=(p.windowFrom||p.windowTo)?((p.windowFrom||"不限")+"–"+(p.windowTo||"不限")):"不限时段";',
+  '  if(s.firedAt){el.style.color="#c0392b";set("#persist","已下发关机命令（"+new Date(s.firedAt).toLocaleTimeString("zh-CN",{hour12:false})+"）—— 点「取消关机」可撤销");return}',
+  '  if(s.enabled){el.style.color="#2f7d32";set("#persist","已打开（仅本次运行生效）：六条条件都满足且空闲满 "+(p.minIdleMinutes==null?"—":p.minIdleMinutes)+" 分钟后关机（时段 "+win+"）"+(s.dryRun?"；当前 dry-run，只会写日志不会真关":""));return}',
+  '  el.style.color="#888";set("#persist","已关闭：不会自动关机。点「打开」（仅本次运行）或改 config.json 的 runtime.shutdownWhenIdle.enabled（重启后仍生效）");',
+  '}',
+  /* 六条条件的可视化：✅/⛔ + 当前值。行结构按 key 建一次，之后只改文本与类名（不重建 DOM → 不抖）。 */
+  'function paintGates(s){',
+  '  var box=$("#gates");if(!box)return;var gs=s.gates||[];',
+  '  if(box.childElementCount!==gs.length){',
+  '    box.innerHTML=gs.map(function(g){return \'<div class="gate" data-k="\'+g.key+\'"><span class="gi"></span><span class="gl"></span><span class="gd"></span></div>\'}).join("");',
+  '  }',
+  '  gs.forEach(function(g,i){',
+  '    var row=box.children[i];if(!row)return;',
+  '    var i2=row.querySelector(".gi"),l=row.querySelector(".gl"),d=row.querySelector(".gd");',
+  '    var icon=g.ok?"✅":"⛔";if(i2.textContent!==icon)i2.textContent=icon;',
+  '    if(l.textContent!==g.label)l.textContent=g.label;',
+  '    var det=g.ok?"（已满足）"+(g.detail?" · "+g.detail:""):(g.detail?"（"+g.detail+"）":"");',
+  '    if(d.textContent!==det)d.textContent=det;',
+  '    var cls="gate"+(g.ok?" ok":" no");if(row.className!==cls)row.className=cls;',
+  '  });',
+  '}',
+  /* 轮询**不清空** #msg：那是动作回执（点了什么、结果如何），清掉会让人以为没生效；
+     常驻状态另有 #persist（见 paintPersist）。 */
+  'function poll(){api("/api/shutdown?live=1").then(function(d){paint(d)}).catch(function(e){var m=$("#msg");if(m)m.style.color="#c0392b";set("#msg","读取失败："+(e&&e.message?e.message:String(e))+"（每 5 秒自动重试）")})}',
+  'function act(a){api("/api/shutdown",{method:"POST",body:{action:a}}).then(function(d){var m=$("#msg");if(d&&d.ok!==false){set("#msg","");}else{if(m)m.style.color="#c0392b";set("#msg",(d&&d.note)||"操作失败")}paint(d)}).catch(function(e){var m=$("#msg");if(m)m.style.color="#c0392b";set("#msg","操作失败："+(e&&e.message?e.message:String(e)))})}',
+  /* 时段/冷静期/倒计时：**用户自己改**（2026-10-14 用户：「时段我希望我可以自己设置」）。
+     走既有的 POST /api/config（带 patch，force 覆盖乐观锁）→ 写进 config.json 并热加载，
+     与在设置面板里改是同一件事；保存后立刻重新判定一次，页面上马上能看到新时段生效。 */
+  'function savePolicy(){',
+  '  var wf=$("#wf").value.trim(),wt=$("#wt").value.trim();',
+  '  var mi=Number($("#mi").value),gs=Number($("#gs").value);',
+  '  var sr=$("#saver");if(sr){sr.style.color="#888";sr.textContent="保存中…"}',
+  '  api("/api/config",{method:"POST",body:{patch:{runtime:{shutdownWhenIdle:{windowFrom:wf,windowTo:wt,minIdleMinutes:mi,graceSeconds:gs}}},force:true}})',
+  '   .then(function(){if(sr){sr.style.color="#2f7d32";sr.textContent="已保存（热加载生效）"}setTimeout(poll,300)})',
+  '   .catch(function(e){if(sr){sr.style.color="#c0392b";sr.textContent="保存失败："+(e&&e.message?e.message:String(e))}})',
+  '}',
+  'function fillPolicy(s){',
+  '  var p=s.policy||{};var f=document.activeElement;',
+  '  var setv=function(id,v){var el=$(id);if(el&&el!==f)el.value=(v==null?"":String(v))};',
+  '  setv("#wf",p.windowFrom);setv("#wt",p.windowTo);setv("#mi",p.minIdleMinutes);setv("#gs",p.graceSeconds);',
+  '}',
+  'fetch("/api/bootstrap").then(function(r){return r.json()}).then(function(j){BOOT.csrf=j.csrf||"";poll()}).catch(function(e){set("#msg","拿不到 CSRF："+(e&&e.message?e.message:String(e)))})',
+  'document.getElementById("on").onclick=function(){act("arm")};',
+  'document.getElementById("off").onclick=function(){act("disarm")};',
+  'document.getElementById("cancel").onclick=function(){act("cancel")};',
+  'document.getElementById("save").onclick=savePolicy;',
+  'setInterval(poll,5000);',
+  'setInterval(live,1000);',
+  '</script></body></html>',
+].join('\n');
 import { isFixtureTask, splitFixtures } from './fixtures.ts';
 import { findDuplicateTitles, readBatches, readRecentDuplicateParts } from './publish-batches.ts';
 import type { ClipRecord, Stage, TaskRecord } from './types.ts';
@@ -1845,6 +1987,82 @@ export class UiServer {
       this.sendJson(res, r.ok ? 200 : 404, r);
       return;
     }
+    /* ---------------- 跑完自动关机（2026-10-14） ----------------
+     * GET  /api/shutdown        → 状态（开关/策略/已空闲多久/上次判定的那句话）
+     * POST /api/shutdown        → { action: 'arm' | 'disarm' | 'cancel' | 'dry-run' }
+     * 判定逻辑不在这里：`src/auto-shutdown.ts`（纯函数）+ daemon 的每分钟评估。
+     * 这里只是"看"与"拨开关"，**不重复实现任何判据**（避免两处口径打架）。 */
+    /* ---------------- GET /shutdown：**独立**的「跑完自动关机」小页面 ----------------
+     * 为什么单独做一个页面（2026-10-14 用户原话：「还是抖，能不能单独做一个界面，让抖动不影响当前界面」）：
+     * 运行观测那一页每 5 秒整块重渲染（既有设计，其它卡片都依赖它），卡片再怎么只改文本也会被带着抖。
+     * 这个页面**只有这一件事**：结构建一次，之后只改文本节点 —— 天然不会抖。
+     * 它是纯静态内联页（不参与 UI 构建、不引模块），接口仍走 /api/shutdown。 */
+    if ((p === '/api/shutdown/page' || p === '/shutdown-page') && method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(SHUTDOWN_PAGE);
+      return;
+    }
+
+    if (p === '/api/shutdown' && (method === 'GET' || method === 'POST')) {
+      if (method === 'GET') {
+        /* `?live=1` = 先**当场判定一次**再返回（界面每 5 秒轮询用）。
+           没有它的话，卡片上那句"还差 X 分钟"最多会滞后一分钟（判定定时器是每分钟一次），
+           用户点完开关会觉得"没反应"（2026-10-14 原话：「点击我没直观感受，他有没有运行」）。
+           判定本身很轻（一次本地 HTTP + 几个内存字段），且它是幂等的 —— 只是提前算一遍。 */
+        if (url.searchParams.get('live') === '1') {
+          try {
+            await orch.evaluateAutoShutdown();
+          } catch {
+            /* 判定失败不影响返回当前状态 */
+          }
+        }
+        this.sendJson(res, 200, { ok: true, ...orch.autoShutdownStatus() });
+        return;
+      }
+      const body = (await this.readBody(req)) as { action?: string };
+      const action = String(body.action ?? '');
+      if (action === 'cancel') {
+        const r = orch.cancelAutoShutdown();
+        /* ⚠️ 「本来就没有待执行的关机」**不是失败**（2026-10-14 用户截图：点了取消，页面上冒出红字
+           "取消失败"，看着像出事）。用户要的终态是"没有关机在等着"——本来就没有，那就是已满足。
+           真正的失败（例如 shutdown /a 被系统拒绝）才回 ok:false。 */
+        this.sendJson(res, 200, {
+          ok: true,
+          ...(r.ok ? {} : { noop: true }),
+          error: r.ok ? undefined : r.error,
+          note: r.ok ? '已取消关机倒计时（shutdown /a）' : '当前没有待执行的关机 —— 无需取消',
+          ...orch.autoShutdownStatus(),
+        });
+        return;
+      }
+      if (action === 'arm' || action === 'disarm') {
+        orch.setAutoShutdownEnabled(action === 'arm');
+        const st = orch.autoShutdownStatus();
+        this.sendJson(res, 200, {
+          ok: true,
+          ...st,
+          note:
+            action === 'arm'
+              ? `已打开（仅本次运行生效）：六条条件都满足且空闲满 ${st.policy.minIdleMinutes} 分钟后关机` +
+                (st.dryRun ? '；当前 dryRun=true，只会写日志不会真关' : '') +
+                `（时段 ${st.policy.windowFrom || '不限'}–${st.policy.windowTo || '不限'}）`
+              : '已关闭：不会自动关机',
+        });
+        return;
+      }
+      if (action === 'dry-run') {
+        /* 不改配置，只提示：dryRun 是 config.json 的字段（避免程序回写配置与热加载打架） */
+        this.sendJson(res, 200, {
+          ok: true,
+          ...orch.autoShutdownStatus(),
+          note: 'dryRun 只能在 config.json 的 runtime.shutdownWhenIdle.dryRun 里改（改完热加载生效）',
+        });
+        return;
+      }
+      this.sendJson(res, 400, { ok: false, error: `action 必须是 arm / disarm / cancel / dry-run，收到 "${action}"` });
+      return;
+    }
+
     if (p === '/api/pending-delete/run' && method === 'POST') {
       // 手动执行到点的删除（正常情况下由 daemon 每 10 分钟自动执行）
       const r = runDueDeletions({ logger: orch.logger });

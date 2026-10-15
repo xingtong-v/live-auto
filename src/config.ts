@@ -675,6 +675,24 @@ export interface RuntimeConfig {
   allowPaid: boolean;
   maxParallelTasks: number;
   stageTimeoutSec: number;
+  /**
+   * 「跑完自动关机」（2026-10-14 用户需求）：**开关打开**且六条条件全部满足时关机。
+   * 判定逻辑在 `src/auto-shutdown.ts`（纯函数，逐条单测钉死），这里只是参数。
+   * 默认**关**；参数都可自定义（用户原话：「时间我可以自定义」）。
+   */
+  shutdownWhenIdle: {
+    /** 开关（界面上那个「跑完自动关机」）。默认 false */
+    enabled: boolean;
+    /** 条件要**连续**满足多久才关（分钟）—— 防"直播刚断线重连"的假空闲 */
+    minIdleMinutes: number;
+    /** 允许关机的时段（本地时间 HH:MM）；`windowFrom` > `windowTo` 视为跨午夜；两个都留空 = 不限时段 */
+    windowFrom: string;
+    windowTo: string;
+    /** 关机倒计时秒数（期间可取消：`shutdown /a`） */
+    graceSeconds: number;
+    /** 只写日志不真关机（想先看它会不会误判时打开） */
+    dryRun: boolean;
+  };
 }
 
 export interface AppConfig {
@@ -975,6 +993,16 @@ function builtinDefaults(): AppConfig {
       allowPaid: false,
       maxParallelTasks: 1,
       stageTimeoutSec: 7200,
+      /* 跑完自动关机：默认**关**（新功能，先让用户自己打开）。
+         默认时段 22:00–08:00、冷静期 15 分钟、倒计时 300 秒 —— 都可在 config.json 里改。 */
+      shutdownWhenIdle: {
+        enabled: false,
+        minIdleMinutes: 15,
+        windowFrom: '22:00',
+        windowTo: '08:00',
+        graceSeconds: 300,
+        dryRun: false,
+      },
     },
   };
 }

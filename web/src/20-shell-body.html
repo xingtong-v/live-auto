@@ -34,6 +34,10 @@
   <button class="tab" data-view="observe" title="边录边转的进度、压制/上传队列与 ETA、我们进程的显存与内存（默认 5 秒自动刷新）">运行观测</button>
   <span class="tabsep" style="width:1px;height:16px;background:var(--border);margin:0 8px;display:inline-block;vertical-align:middle"></span>
   <button class="tab" data-view="health" title="现在有没有需要你处理的事（待办）/ 错误 / 磁盘 / 自检">健康面板</button>
+  <!-- 「跑完自动关机」独立页签（2026-10-14 用户：「独立页面放在健康界面后面」）：
+       里面是 iframe 加载 /api/shutdown/page —— 它有自己的文档与刷新节奏，
+       运行观测那页每 5 秒整块重渲染**影响不到它**（这就是不抖的原因）。 -->
+  <button class="tab" data-view="autoshutdown" title="跑完自动关机：开关、允许时段、冷静期倒计时与取消（独立页面，不受其它页刷新影响）">自动关机</button>
   <!-- ★ 2026-10-11 用户要求：「将这两个（查看回收站 / 查看待删清单）放到成本的位置，然后将成本放到稿件表现里」；
        随后又要求「待删清单和回收站放一起」—— 两者本来就是同一条生命周期上的两段（待删 → 已删可恢复），
        合并成一页两段，顺带去掉重复了两遍的"最近已删除"列表。 -->
