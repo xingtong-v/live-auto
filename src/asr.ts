@@ -1679,7 +1679,15 @@ export function mergeWindowsPerFile(windows: WindowCall[], maxChunkSec = Number.
         };
       } else {
         out.push(cur);
-        cur = { ...w, inFileStart: 0 };
+        /* ★★ 2026-10-15 修（真机实测：块数 >1 时白跑一倍的活）：
+         * 这里原来是 `cur = { ...w, inFileStart: 0 }` —— 把新块的**段内起点也归零**。
+         * 对"每个文件只出一块"的老场景看不出问题，但现在 `chunkMinutes=30`（用户 2026-10-15 调小）
+         * 让一个 31 分钟的录制文件切成 2 块 ⇒ 第 2 块本该读文件的 1800–1887.5 秒，
+         * 却因为归零变成 **0–1887.5 秒**：整个文件又转一遍（多花约一倍 GPU），
+         * 而它的 globalStart 仍是 1800 ⇒ 界面上的进度分母也跟着翻倍
+         * （实测现场：31 分钟的场次显示「1 小时 1 分 音频」，正是 1800 + 1887.5）。
+         * 同一文件的后半块必须**接着往下读**，所以新块照抄 `w.inFileStart`。 */
+        cur = { ...w };
       }
     }
     if (cur) out.push(cur);

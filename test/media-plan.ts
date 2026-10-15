@@ -115,6 +115,26 @@ section('4b. ★ 兜底单元必须保留区间在全局时间轴上的位置（
   );
 }
 
+section('4c. ★ 同一文件的后半块要接着往下读（否则整个文件重转一遍）');
+{
+  /* 现场（2026-10-15，`auto-20261015141657-r1v4`）：一个 31 分钟的单文件录制，chunkMinutes=30
+     ⇒ 切 2 块。第 2 块本该只读文件的 1800–1887.5 秒，却因为 mergeWindowsPerFile 把新块的
+     `inFileStart` 归零而变成读 0–1887.5 秒：**整个文件又转一遍**（实测多花约一倍 GPU），
+     而且界面上的"总音频"变成 1800+1887.5 = 3688 秒（31 分钟的场次显示 1 小时 1 分）。 */
+  const one: MediaSegment[] = [{ path: 'single.ts', globalStart: 0, globalEnd: 1887.5 }];
+  const windows = [
+    { file: 'single.ts', inFileStart: 0, inFileEnd: 1800, globalStart: 0, globalEnd: 1800, offset: 0, windowIndex: 0 },
+    { file: 'single.ts', inFileStart: 1800, inFileEnd: 1887.5, globalStart: 1800, globalEnd: 1887.5, offset: 0, windowIndex: 1 },
+  ];
+  const merged = mergeWindowsPerFile(windows, 1800);
+  eq('切成 2 块（30 分钟上限）', merged.length, 2);
+  eq('第 1 块：段内 0–1800', [merged[0]!.inFileStart, merged[0]!.inFileEnd], [0, 1800]);
+  eq('★ 第 2 块：段内 1800–1887.5（**不是** 0–1887.5）', [merged[1]!.inFileStart, merged[1]!.inFileEnd], [1800, 1887.5]);
+  eq('★ 两块合起来的音频量 = 整场时长（分母不再翻倍）', merged.reduce((a, m) => a + (m.inFileEnd - m.inFileStart), 0), 1887.5);
+  eq('全局区间仍然不重不漏', merged.reduce((a, m) => a + (m.globalEnd - m.globalStart), 0), 1887.5);
+  void one;
+}
+
 section('5. 跨进程可序列化（这是能搬进 worker 的关键）');
 {
   const r = planSegmentCalls(SEGS, { start: 0, end: 3540 });
