@@ -2786,12 +2786,28 @@ export class Orchestrator {
   private async runTranscribe(task: TaskRecord, dir: string): Promise<Transcript> {
     const cfg = this.config;
     const log = this.logger.child({ taskId: task.id, mod: 'asr' });
-    const segments = task.source.segments.length
-      ? task.source.segments
-      : buildSegmentMap(task.source.rawFiles, {
-          ...(findFfprobe() ? { ffprobePath: findFfprobe()! } : {}),
-          fallbackDurationSec: task.source.totalDuration,
-        }).segments;
+    /* ★ 2026-10-15：**存下来的分段时长不可信时要重探测**。
+     *
+     * 事故现场：`auto-20261015135916-6rh9` 的 `source.segments[0]` 是 `globalStart=0, globalEnd=0`
+     * ——任务是在文件**还在写**的时候建的，那一刻 ffprobe 读不出时长。而这里一旦"有分段就用存下来的"，
+     * 那份坏数据会被**永远**沿用：规划窗口时每个窗口与它求交都为空 ⇒ 走 media-plan 的兜底，
+     * 后果是 58:58 的录播只转写出前 30 分钟（详见 media-plan.ts 里那段注释）。
+     * 重探测一次的成本是十几毫秒的 ffprobe，收益是"剩下半小时的字幕不会凭空消失"。 */
+    const storedSegs = task.source.segments;
+    const storedBad = storedSegs.some((s) => !(s.globalEnd > 0));
+    if (storedSegs.length && storedBad) {
+      log.warn(
+        `存下来的分段时长不可用（${storedSegs.length} 个分段里有 ${storedSegs.filter((s) => !(s.globalEnd > 0)).length} 个 globalEnd=0）` +
+          `—— 重新探测一次，避免只转写出前一段（实测踩过：58 分钟的场次只出了 30 分钟字幕）`,
+      );
+    }
+    const segments =
+      storedSegs.length && !storedBad
+        ? storedSegs
+        : buildSegmentMap(task.source.rawFiles, {
+            ...(findFfprobe() ? { ffprobePath: findFfprobe()! } : {}),
+            fallbackDurationSec: task.source.totalDuration,
+          }).segments;
 
     // 输入源选择（§8 WP3 步骤 1）：默认读**录制原始文件**，这样转写才能与压制并行
     let inputSegments = segments;

@@ -60,16 +60,31 @@ export function planSegmentCalls(segments: MediaSegment[], range: { start: numbe
   }
   if (calls.length === 0 && segments.length > 0) {
     const fallback = segments[0]!;
+    /* ★★ 2026-10-15 修（真机数据丢失事故）：兜底单元必须**保留区间在全局时间轴上的位置**。
+     *
+     * 原来写的是 `globalStart: 0, globalEnd: range.end - range.start` —— 拿"区间长度"当全局区间。
+     * 对"从 0 开始的单窗口"恰好等价，**对后面的窗口就是错的**：第 2 个窗口（1800–3537）会自称
+     * "全局 0–1737"，于是两件坏事同时发生：
+     *   ① 它的时间戳与第 1 个窗口重叠（字幕会串到前面去）；
+     *   ② 它在 `mergeWindowsPerFile` 里被**并进第一块**（1737 − 0 ≤ 块长上限 1800）——
+     *      实测现场（`auto-20261015135916-6rh9`，58:58 的录播）：只转写出前 30 分钟，
+     *      后 29 分钟**整段丢失**，而日志只说"把 2 个窗口合并为 1 块"，完全看不出丢了东西。
+     *
+     * 触发条件很具体：该场 `source.segments[0]` 的 `globalEnd = 0`（导入时文件还在写、探测不到时长），
+     * 于是每个窗口都求交为空 ⇒ 走兜底。兜底的前提本来就是"这个文件承载了从 0 开始的整条时间轴"，
+     * 所以段内时间 = 全局时间，直接照抄区间即可。
+     */
+    const gStart = Number(Math.max(0, range.start).toFixed(3));
+    const gEnd = Number(Math.max(range.end, gStart + 1).toFixed(3));
     return {
       calls: [
         {
           file: fallback.path,
-          inFileStart: 0,
-          /* 与原实现逐字一致：按"整段时长"给一个单元（至少 1 秒），而不是 0 —— 
-             0 会让下游认为"这段音频是空的"，从而静默产出空转写（正是要避免的事）。 */
-          inFileEnd: Math.max(range.end - range.start, 1),
-          globalStart: 0,
-          globalEnd: Math.max(range.end - range.start, 1),
+          inFileStart: gStart,
+          /* 至少 1 秒：0 会让下游认为"这段音频是空的"，从而静默产出空转写（正是要避免的事）。 */
+          inFileEnd: gEnd,
+          globalStart: gStart,
+          globalEnd: gEnd,
           offset: 0,
           windowIndex: 0,
         },

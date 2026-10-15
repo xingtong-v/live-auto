@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildMediaAdapter, planSegmentCalls, type MediaSegment } from '../src/media-plan.ts';
+import { mergeWindowsPerFile } from '../src/asr.ts';
 
 let pass = 0;
 let fail = 0;
@@ -86,6 +87,32 @@ section('4. 切不出单元时退化为「整文件一次」并如实回报');
   eq('兜底的 global 也从 0 起算（与原实现一致）', [zero.calls[0]!.globalStart, zero.calls[0]!.globalEnd], [0, 100]);
   const empty = planSegmentCalls([], { start: 0, end: 100 });
   eq('没有分段 ⇒ 没有调用单元，也不谎报 fallback', [empty.calls.length, empty.fallback], [0, false]);
+}
+
+section('4b. ★ 兜底单元必须保留区间在全局时间轴上的位置（2026-10-15 真机数据丢失事故）');
+{
+  /* 现场（任务 auto-20261015135916-6rh9，58:58 的录播）：`source.segments[0]` 是
+     `globalStart=0, globalEnd=0` —— 任务是文件**还在写**的时候建的，那一刻探测不到时长。
+     于是每个窗口与该分段求交都为空 ⇒ 走兜底。原实现把"区间长度"当全局区间：
+     第 2 个窗口（1800–3537）会自称"全局 0–1737" ⇒ ① 时间戳与第 1 个窗口重叠、
+     ② 被 mergeWindowsPerFile 并进第一块（1737 − 0 ≤ 块长上限 1800）
+     ⇒ **后 29 分钟整段没转**，而日志只说"把 2 个窗口合并为 1 块"。 */
+  const badSeg: MediaSegment[] = [{ path: 'growing.ts', globalStart: 0, globalEnd: 0 }];
+  const w1 = planSegmentCalls(badSeg, { start: 0, end: 1800 });
+  const w2 = planSegmentCalls(badSeg, { start: 1800, end: 3537 });
+  eq('窗口 1 的兜底单元：全局 0–1800', [w1.calls[0]!.globalStart, w1.calls[0]!.globalEnd], [0, 1800]);
+  eq('★ 窗口 2 的兜底单元：全局 1800–3537（**不是** 0–1737）', [w2.calls[0]!.globalStart, w2.calls[0]!.globalEnd], [1800, 3537]);
+  eq('★ 段内区间跟着全局走（兜底的前提：该文件承载从 0 起的整条时间轴）', [w2.calls[0]!.inFileStart, w2.calls[0]!.inFileEnd], [1800, 3537]);
+  const merged = mergeWindowsPerFile([...w1.calls, ...w2.calls].map((c, i) => ({ ...c, windowIndex: i })), 1800);
+  eq('★ 合并后仍是 2 块（原实现会并成 1 块 ⇒ 后半场丢失）', merged.length, 2);
+  eq('两块合起来覆盖整场（不重不漏）', merged.reduce((a, m) => a + (m.globalEnd - m.globalStart), 0), 3537);
+  /* 从 0 开始的单窗口必须与历史行为**逐字一致** —— 那是绝大多数场次走的路 */
+  const one = planSegmentCalls(badSeg, { start: 0, end: 3537 });
+  eq(
+    '从 0 开始的单窗口：与历史行为逐字一致',
+    [one.calls[0]!.inFileStart, one.calls[0]!.inFileEnd, one.calls[0]!.globalStart, one.calls[0]!.globalEnd],
+    [0, 3537, 0, 3537],
+  );
 }
 
 section('5. 跨进程可序列化（这是能搬进 worker 的关键）');
