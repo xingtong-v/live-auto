@@ -1,5 +1,7 @@
 # === 凭据与运行期数据：禁止提交 ===
 config.json
+# 改配置前手动留的备份（config.json.bak-xxx 之类）同样含密钥，绝不能被 add -A 顺手带上
+config.json.*
 config.local.json
 data/
 logs/
