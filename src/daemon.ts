@@ -69,6 +69,7 @@ import {
   listActiveLocalAsrRuns,
   type AsrMediaAdapter,
 } from './asr.ts';
+import { decideShutdown, executeCancelShutdown, executeShutdown, inShutdownWindow, type ShutdownConditions } from './auto-shutdown.ts';
 import { planSegmentCalls } from './media-plan.ts';
 import { transcribeInWorker } from './asr-worker-client.ts';
 import { Cleaner, checkAfterUploadDelete, judgeDeletability, rotateLogs } from './cleanup.ts';
@@ -657,6 +658,13 @@ export class Orchestrator {
       }
     }, 5 * 60_000);
     memTimer.unref?.();
+    /* 「跑完自动关机」（2026-10-14 用户需求）：开关打开 + 六条条件全满足 → 倒计时关机。
+       判定在 `src/auto-shutdown.ts`（纯函数，逐条单测钉死），这里只做四件事：
+       收集事实 / 记冷静期起点 / 记日志（含 dry-run）/ 真下发 `shutdown /s /t`。 */
+    const shutdownTimer = setInterval(() => {
+      void this.evaluateAutoShutdown();
+    }, 60_000);
+    shutdownTimer.unref?.();
     // 启动时先记一条（能看到基线）
     try {
       const m0 = process.memoryUsage();
@@ -1272,6 +1280,197 @@ export class Orchestrator {
     return { requeued, skippedMissing, refused, blocked, repaired };
   }
 
+  /* ------------------------------------------------------------------------
+   * 跑完自动关机（2026-10-14）
+   * ---------------------------------------------------------------------- */
+
+  /** 条件连续满足的起点（ISO）；不满足时清空 */
+  private shutdownIdleSince = '';
+  /** 已经下发过关机命令的时刻（同一轮运行内不重复下发） */
+  private shutdownFiredAt = 0;
+  /** 最近一次判定的结论（给人看的那句话，界面/日志共用） */
+  private shutdownLastReason = '尚未评估';
+  /**
+   * 界面开关的**内存覆盖**（undefined = 用 config.json 里的值）。
+   *
+   * 为什么不直接改 config.json：那个文件是用户手改 + 配置热加载盯着的，
+   * 程序回写容易和用户/热加载打架（本项目在别处也吃过这个亏）。
+   * 所以界面上的开关只覆盖本次运行；要长期生效请改 `runtime.shutdownWhenIdle.enabled`。
+   */
+  private shutdownEnabledOverride?: boolean;
+
+  /** 最近一次判定的**逐条**结论（界面用它画"六条条件"的可视化，2026-10-14 用户要求） */
+  private shutdownLastGates: Array<{ key: string; label: string; ok: boolean; detail: string }> = [];
+
+  /** 界面上的「跑完自动关机」开关（只影响本次运行，见 shutdownEnabledOverride 的说明） */
+  setAutoShutdownEnabled(v: boolean): void {
+    this.shutdownEnabledOverride = v;
+    this.shutdownIdleSince = '';
+    this.shutdownLastReason = v ? '已打开（等待条件满足）' : '已关闭';
+    this.logger.info(`自动关机开关：${v ? '打开' : '关闭'}（仅本次运行生效；长期请改 config.json 的 runtime.shutdownWhenIdle.enabled）`, {
+      mod: 'shutdown',
+    });
+  }
+
+  /**
+   * 评估一次「要不要关机」。
+   *
+   * 六条事实全部来自既有接口，**任何一条拿不准都按"别关"处理**：
+   *   · biliLive-tools 队列查不到（超时/它没开）→ 当作"有任务在跑"，绝不当空闲；
+   *   · watcher 说某场"可能还在录"（possiblyRecording / 还有分段在写）→ 绝不当空闲。
+   * 这两条正是踩一次就丢数据的地方（分段写一半、压制白跑）。
+   */
+  async evaluateAutoShutdown(): Promise<{ shutdown: boolean; reason: string }> {
+    const p = this.cfg.runtime.shutdownWhenIdle;
+    const now = new Date();
+
+    /* 它那边的压制/上传队列：查不到就按"忙"算（保守） */
+    let llcQueueLength = 1;
+    try {
+      const r = await this.client.taskList({ pageSize: 30, timeoutMs: 1500 });
+      llcQueueLength = (r.list ?? []).filter((t) => t.status === 'running' || t.status === 'pending' || t.status === 'waiting').length;
+    } catch {
+      llcQueueLength = 1;
+    }
+
+    const conditions: ShutdownConditions = {
+      enabled: this.shutdownEnabledOverride ?? p.enabled,
+      busy: this.busy,
+      queueLength: this.queue.length,
+      activeTranscriptions: listActiveLocalAsrRuns().length,
+      recordingSessions: this.watcher
+        .status()
+        .lastOutcomes.filter((o) => o.possiblyRecording === true || (o.pendingParts ?? 0) > 0).length,
+      llcQueueLength,
+      now,
+    };
+
+    /* 逐条状态（界面画"六条条件"用）：每条都带**当前值**，用户一眼能看出卡在哪一条。
+       顺序与判定里的优先级一致（"还在录"最要命，排最前）。 */
+    const idleSec = this.shutdownIdleSince ? (now.getTime() - Date.parse(this.shutdownIdleSince)) / 1000 : 0;
+    const needSec = Math.max(1, p.minIdleMinutes) * 60;
+    this.shutdownLastGates = [
+      { key: 'enabled', label: '开关已打开', ok: conditions.enabled, detail: conditions.enabled ? '本次运行有效' : '在页面上点「打开」或改 config.json' },
+      {
+        key: 'recording',
+        label: '没有正在录制 / 可能还在录的场次',
+        ok: conditions.recordingSessions === 0,
+        detail: conditions.recordingSessions > 0 ? `${conditions.recordingSessions} 场可能还在录` : '0 场',
+      },
+      {
+        key: 'pipeline',
+        label: '流水线空闲（无在跑任务、队列为空）',
+        ok: !conditions.busy && conditions.queueLength === 0,
+        detail: conditions.busy ? `有任务在跑${conditions.queueLength ? `，队列 ${conditions.queueLength} 个` : ''}` : `队列 ${conditions.queueLength} 个`,
+      },
+      {
+        key: 'asr',
+        label: '没有本地转写在跑',
+        ok: conditions.activeTranscriptions === 0,
+        detail: `${conditions.activeTranscriptions} 个`,
+      },
+      {
+        key: 'llc',
+        label: 'biliLive-tools 队列为空（压制/上传）',
+        ok: conditions.llcQueueLength === 0,
+        detail: conditions.llcQueueLength > 0 ? `${conditions.llcQueueLength} 个（查不到也算忙）` : '0 个',
+      },
+      {
+        key: 'window',
+        label: '在允许关机的时段内',
+        ok: inShutdownWindow(now, p.windowFrom, p.windowTo),
+        detail: p.windowFrom || p.windowTo ? `${p.windowFrom || '不限'}–${p.windowTo || '不限'}` : '不限时段',
+      },
+      {
+        key: 'cooldown',
+        label: `空闲满冷静期 ${p.minIdleMinutes} 分钟`,
+        ok: idleSec >= needSec,
+        detail: `${Math.floor(idleSec / 60)} 分 ${Math.floor(idleSec % 60)} 秒 / ${p.minIdleMinutes} 分`,
+      },
+    ];
+
+    /* 六条门槛（不含冷静期）是否都过了 —— 用来维护"空闲起点" */
+    const gatesOk =
+      conditions.enabled &&
+      conditions.recordingSessions === 0 &&
+      !conditions.busy &&
+      conditions.queueLength === 0 &&
+      conditions.activeTranscriptions === 0 &&
+      conditions.llcQueueLength === 0;
+    if (gatesOk) {
+      if (!this.shutdownIdleSince) this.shutdownIdleSince = now.toISOString();
+    } else {
+      this.shutdownIdleSince = '';
+    }
+
+    const d = decideShutdown(conditions, p, this.shutdownIdleSince || undefined);
+    this.shutdownLastReason = d.reason;
+    if (!d.shutdown) {
+      this.logger.debug(`自动关机：不关 —— ${d.reason}`, { mod: 'shutdown' });
+      return { shutdown: false, reason: d.reason };
+    }
+
+    /* 已下发过就不再重复（同一个运行周期内） */
+    if (this.shutdownFiredAt && Date.now() - this.shutdownFiredAt < 6 * 3600_000) {
+      return { shutdown: false, reason: `本次运行已下发过关机命令（${new Date(this.shutdownFiredAt).toLocaleString()}），不再重复` };
+    }
+
+    if (p.dryRun) {
+      this.logger.warn(`自动关机（dry-run）：本应关机 —— ${d.reason}。把 runtime.shutdownWhenIdle.dryRun 改成 false 才会真关`, { mod: 'shutdown' });
+      return { shutdown: false, reason: `[dry-run] ${d.reason}` };
+    }
+
+    this.shutdownFiredAt = Date.now();
+    const r = executeShutdown(p.graceSeconds);
+    if (r.ok) {
+      this.logger.warn(
+        `自动关机已下发：${d.reason}（${p.graceSeconds} 秒后关机，取消请用界面上的「取消关机」或 shutdown /a）`,
+        { mod: 'shutdown' },
+      );
+    } else {
+      this.logger.error(`自动关机下发失败：${r.error ?? '未知原因'}`, undefined, { mod: 'shutdown' });
+      this.shutdownFiredAt = 0; // 失败就当没发过，下一轮还能再试
+    }
+    return { shutdown: r.ok, reason: r.ok ? d.reason : `下发失败：${r.error ?? ''}` };
+  }
+
+  /** 取消已下发的关机（`shutdown /a`） */
+  cancelAutoShutdown(): { ok: boolean; error?: string } {
+    const r = executeCancelShutdown();
+    if (r.ok) {
+      this.shutdownFiredAt = 0;
+      this.shutdownIdleSince = '';
+      this.shutdownLastReason = '已手动取消关机';
+      this.logger.info('已取消自动关机的倒计时', { mod: 'shutdown' });
+    }
+    return r;
+  }
+
+  /** 自动关机的当前状态（界面用；只读） */
+  autoShutdownStatus(): {
+    enabled: boolean;
+    dryRun: boolean;
+    policy: AppConfig['runtime']['shutdownWhenIdle'];
+    idleForSec: number;
+    firedAt: string;
+    lastReason: string;
+    override?: boolean;
+    /** 逐条条件（界面可视化用）：label 是给人看的，detail 是当前值 */
+    gates: Array<{ key: string; label: string; ok: boolean; detail: string }>;
+  } {
+    const p = this.cfg.runtime.shutdownWhenIdle;
+    return {
+      enabled: this.shutdownEnabledOverride ?? p.enabled,
+      dryRun: p.dryRun,
+      policy: p,
+      idleForSec: this.shutdownIdleSince ? Math.round((Date.now() - Date.parse(this.shutdownIdleSince)) / 1000) : 0,
+      firedAt: this.shutdownFiredAt ? new Date(this.shutdownFiredAt).toISOString() : '',
+      lastReason: this.shutdownLastReason,
+      ...(this.shutdownEnabledOverride !== undefined ? { override: this.shutdownEnabledOverride } : {}),
+      gates: this.shutdownLastGates,
+    };
+  }
+
   private async drainQueue(): Promise<void> {
     if (this.busy) return;
     this.busy = true;
@@ -1486,13 +1685,26 @@ export class Orchestrator {
           throw new StageError(
             'TRANSCRIBED',
             `语音识别没有产出任何字幕${covered > 0 && total > 0 ? `（失败区间覆盖 ${(covered / 60).toFixed(1)}/${(total / 60).toFixed(1)} 分钟）` : ''}：${detail}\n` +
-              `这不是"识别出来是空的"，而是转写请求失败了。常见原因：\n` +
-              `  ① biliLive-tools 里选的语音识别模型不支持"录音文件转写"（例如选成了 Qwen Omni 之类的对话模型）；\n` +
-              `  ② 阿里云 DashScope 的 Key 失效/欠费，或该模型没有开通；\n` +
-              `  ③ 音频本身异常（本次已确认源文件有正常音轨，可排除）。\n` +
-              `处理：去 biliLive-tools 的「设置 → 语音识别」把模型换回可用的录音文件识别模型，` +
-              `然后在本任务上「从某阶段重跑 → TRANSCRIBED」（失败的那次没有计费，重跑不会重复花钱）。` +
-              (asrModel.modelName ? `\n【当前 biliLive-tools 字幕识别模型：${asrModel.modelName}】若这个名字不是录音文件转写模型，这就是根因。` : ''),
+              /* ★ 2026-10-15：这段提示原来一律按"云端 ASR"写（让人去改 biliLive-tools 的模型），
+                 而实测本地 Fun-ASR 失败的主因是**进程被系统杀掉**（物理内存不足）—— 它把排查方向带偏了（我自己就被带偏过一次）。
+                 现在按引擎分支：本地讲内存/被杀，云端才讲模型与 Key。 */
+              (/本地 ASR|funasr|Command failed/i.test(detail)
+                ? `这不是"识别出来是空的"，而是**本地转写进程没跑完**。最常见的原因：\n` +
+                  `  ① 物理内存不足被系统杀掉（整场一块转写时峰值最高；看任务管理器里“可用内存”还剩多少）；\n` +
+                  `  ② 被别的程序抢显存/算力（游戏、剪辑、同时多路压制）；\n` +
+                  `  ③ 进程崩溃（尾部输出见本次错误报告）。\n` +
+                  `处理：关掉吃内存的程序后，在本任务上「从某阶段重跑 → TRANSCRIBED」（本地转写不产生费用）；\n` +
+                  `若反复发生，把设置里的“单块音频时长”（asr.localFunasr.chunkMinutes）调小（例如 30 分钟）——` +
+                  ` 单次内存峰值会显著下降，代价是每多一块多约 96 秒模型加载。`
+                : `这不是"识别出来是空的"，而是转写请求失败了。常见原因：\n` +
+                  `  ① biliLive-tools 里选的语音识别模型不支持"录音文件转写"（例如选成了 Qwen Omni 之类的对话模型）；\n` +
+                  `  ② 阿里云 DashScope 的 Key 失效/欠费，或该模型没有开通；\n` +
+                  `  ③ 音频本身异常（本次已确认源文件有正常音轨，可排除）。\n` +
+                  `处理：去 biliLive-tools 的「设置 → 语音识别」把模型换回可用的录音文件识别模型，` +
+                  `然后在本任务上「从某阶段重跑 → TRANSCRIBED」（失败的那次没有计费，重跑不会重复花钱）。`) +
+              (!/本地 ASR|funasr|Command failed/i.test(detail) && asrModel.modelName
+                ? `\n【当前 biliLive-tools 字幕识别模型：${asrModel.modelName}】若这个名字不是录音文件转写模型，这就是根因。`
+                : ''),
             'asr-failed',
             {
               ...(transcript.lastFailure?.request ? { request: transcript.lastFailure.request } : {}),
