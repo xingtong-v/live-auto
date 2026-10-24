@@ -12,13 +12,13 @@
 $('#btnImport').onclick = () => {
   openInfo('导入录播文件', `
     <div class="barstrip" style="gap:8px">
-      <span style="font-size:12.5px;color:var(--text-3)">可导入的录播</span>
+      <span style="font-size:var(--fs-s);color:var(--text-3)">可导入的录播</span>
       <button class="btn-sm" id="impRefresh">刷新清单</button>
       <span id="impScanInfo" class="hintline" style="margin-left:auto"></span>
     </div>
 
     <details id="impDirsBox" style="margin:8px 0 12px">
-      <summary style="cursor:pointer;font-size:12.5px;color:var(--text-2)">扫描目录（录播没显示出来？在这里加）</summary>
+      <summary style="cursor:pointer;font-size:var(--fs-s);color:var(--text-2)">扫描目录（录播没显示出来？在这里加）</summary>
       <div id="impDirs" style="margin-top:8px"></div>
       <div class="ctl" style="margin-top:8px">
         <input class="inp" id="impDirAdd" placeholder="例如 D:\\录播  或  ~/Videos/bili（支持 ~）">
@@ -56,7 +56,7 @@ $('#btnImport').onclick = () => {
     for (const d of info.detectedDirs || []) {
       rows.push(`<div class="row"><span class="t" style="color:var(--text-3)">自动</span><span class="s">
         <span class="mono-sm" style="word-break:break-all">${esc(d)}</span>
-        <br><span style="color:var(--text-3);font-size:11.5px">来自 biliLive-tools 的保存目录</span></span></div>`);
+        <br><span style="color:var(--text-3);font-size:var(--fs-meta)">来自 biliLive-tools 的保存目录</span></span></div>`);
     }
     for (const d of info.configuredDirs || []) {
       rows.push(`<div class="row"><span class="t" style="color:var(--text-3)">手动</span><span class="s">
@@ -224,7 +224,7 @@ $('#btnImport').onclick = () => {
       ];
       box.innerHTML = `<div class="kv">${rows.map(([k, v]) => `<div class="k">${k}</div><div>${esc(String(v))}</div>`).join('')}</div>` +
         (p.variants.length > 1
-          ? `<div style="margin-top:10px"><div class="k" style="font-size:11.5px;color:var(--text-3);margin-bottom:6px">这一场的其它版本（点一下换用它）</div>
+          ? `<div style="margin-top:10px"><div class="k" style="font-size:var(--fs-meta);color:var(--text-3);margin-bottom:6px">这一场的其它版本（点一下换用它）</div>
              <div class="filelist">${p.variants.map((v, i) => `<button data-variant="${i}" ${v.videoPath === p.videoPath ? 'style="border-color:var(--blue,#00aeec)"' : ''}>${esc(v.fileName)}（${v.sizeMB} MB${v.hasDanmakuInPicture ? ' · 已烧弹幕' : ''}）</button>`).join('')}</div></div>`
           : '') +
         (p.importedBy ? `<div class="barstrip warn">这个文件已属于任务 <span class="mono-sm">${esc(p.importedBy.taskId)}</span>（${esc(p.importedBy.status)}）—— 再次导入会新建一场并重新花 ASR 费用</div>` : '') +
@@ -298,11 +298,18 @@ $('#btnImport').onclick = () => {
 };
 $('#modeSwitch').onclick = async () => {
   const on = !$('#modeSwitch').classList.contains('on');
-  if (on && !confirm('切换到全自动后，分析完成会直接按评分阈值选片、切片并排期发布，全程无人工。确定开启？')) return;
+  /* ★ 2026-10-16（UI 评审 3.1）：这是全站唯一"点一下就会自动对外发文、且不再问你"的开关，
+     所以确认文案把后果说全（会发文 / 不再询问 / 怎么退回），而不是只说"确定开启？"。 */
+  if (on && !confirm(
+    '开启「全自动 · 免确认发布」后：\n\n' +
+    '· 分析完成后直接按评分阈值选片、切片、排期发布\n' +
+    '· 全程不再询问你，稿件会直接投到 B 站\n' +
+    '· 顶栏这个开关会变成琥珀色，用来提醒你它正开着\n\n' +
+    '随时可以点回来切回半自动。确定开启？',
+  )) return;
   try {
     await api('/api/config', { method: 'POST', body: { patch: { publish: { autoPublish: on } } } });
-    $('#modeSwitch').classList.toggle('on', on);
-    $('#modeText').textContent = on ? '全自动 · 免确认发布' : '半自动 · 需确认后发布';
+    renderModeSwitch(on);
     toast(on ? '已切换为全自动：分析完成后直接排期发布' : '已切换为半自动：需你确认后才发布');
     await loadBootstrap();
   } catch (e) { toast('切换失败：' + e.message); }

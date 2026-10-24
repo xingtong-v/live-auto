@@ -79,7 +79,11 @@ function doSplit(): void {
   /* 三段：<style> 之前是外壳；<style>…</style> 是样式；<script>…</script> 是脚本 */
   const styleStart = src.indexOf('<style>');
   const styleEnd = src.indexOf('</style>');
-  const scriptStart = src.indexOf('<script>');
+  /* ⚠️ 主脚本必须从 **</style> 之后**开始找 `<script>`。
+     2026-10-16 起 00-shell-head.html 里多了一段「主题引导」内联脚本
+     （在 head、<style> 之前，用来在首屏渲染前设好 data-theme，避免深色下闪白）。
+     继续用 `indexOf('<script>')` 会切到它，把引导脚本当成主脚本的开头 —— 一拆就坏。 */
+  const scriptStart = src.indexOf('<script>', styleEnd);
   const scriptEnd = src.lastIndexOf('</script>');
   if (styleStart < 0 || styleEnd < 0 || scriptStart < 0 || scriptEnd < 0) throw new Error('ui.html 结构不符合预期（找不到 <style>/<script>）');
 

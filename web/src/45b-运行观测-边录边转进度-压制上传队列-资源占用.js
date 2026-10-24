@@ -225,17 +225,28 @@ function renderObserve(box) {
          这一栏读的是录像目录里的**进度文件**，不是"当前录制状态"，所以必须说清它属于哪种：
            · 仍在写 → 这一场正在录；
            · 已导入 → 那场已经进过流水线（记录留着只为命中缓存），不会再变；
-           · 历史   → 超过 1 小时没更新且没查到对应任务（多半是旧场次留下的）。 */
-      const state = p.stillWriting
-        ? '<span class="badge b-run">仍在写</span>'
-        : p.imported
-          ? '<span class="badge b-done">已导入</span>'
-          : p.ageSec > 3600
-            ? '<span class="badge">历史</span>'
-            : '<span class="badge b-done">最近</span>';
+           · 历史   → 超过 1 小时没更新且没查到对应任务（多半是旧场次留下的）。
+      ★ 2026-10-15 用户报「文件对不上」：进度记录按"分段清单指纹"存，是**历史快照** ——
+        同一场分段变多之后旧指纹还在，且记录的段数停在当时那一刻。所以这里：
+        ① 被更新的指纹（superseded）单独标出来，不冒充当前进度；
+        ② 记录的段数与**磁盘现有段数**不一致时，把磁盘数字也写出来（"记录 1/1 · 磁盘 4 段"），
+           免得拿旧数字假装是现在。 */
+      const state = p.superseded
+        ? '<span class="badge">旧指纹</span>'
+        : p.stillWriting
+          ? '<span class="badge b-run">仍在写</span>'
+          : p.imported
+            ? '<span class="badge b-done">已导入</span>'
+            : p.ageSec > 3600
+              ? '<span class="badge">历史</span>'
+              : '<span class="badge b-done">最近</span>';
+      const segNote =
+        Number(p.diskSegs) > Number(p.total)
+          ? ` <span class="obs-dim" title="进度记录是历史快照，磁盘上这一场已经有更多分段">· 磁盘现有 ${p.diskSegs} 段</span>`
+          : '';
       return `<tr>
         <td><span class="obs-strong">${esc(p.name)}</span><span class="obs-dim">${p.dir ? ' · ' + esc(p.dir) : ''}</span></td>
-        <td>${obsBar(pct, 'ok')} <span class="mono-sm">${p.done}/${p.total} 段</span></td>
+        <td>${obsBar(pct, 'ok')} <span class="mono-sm">${p.done}/${p.total} 段</span>${segNote}</td>
         <td>
           ${p.mode === 'fallback' ? '<span class="badge b-fail">已回退整段</span>' : '<span class="badge b-done">分段增量</span>'}
           ${state}
@@ -334,43 +345,40 @@ function renderObserve(box) {
         : `<div class="hintline">biliLive-tools 录制器状态问不到（${esc(rec.error || '接口异常')}）—— 此时"录制中"退回按文件是否在写判断，不影响边录边转。</div>`}
     </div>
 
-    <div class="card">
-      <div class="card-head"><b>① 正在录制的文件</b><span class="badge ${recording.length ? 'b-run' : ''}">${recording.length} 个</span></div>
-      ${
-        recRows
-          ? `<table class="tbl obs-tbl"><thead><tr><th>文件</th><th>大小</th><th>速率</th><th>最后写入</th><th>状态</th></tr></thead><tbody>${recRows}</tbody></table>`
-          : '<div class="empty">当前没有在写的录制文件（每轮目录轮询的结论见「实时监控」页）</div>'
-      }
-    </div>
+    ${/* ★ 2026-10-16（UI 评审 IA-2）：空态不再占整张卡片。
+          改版前 ①②③ 三张空卡片合计占掉约 350px，把真正有数据的「④ 最近几场」挤出首屏。
+          现在没有内容时收成一行虚线摘要条，有内容才展开成完整卡片（含那条长说明）。 */ ''
+    }${recRows
+      ? `<div class="card">
+      <div class="card-head"><b>① 正在录制的文件</b><span class="badge b-run">${recording.length} 个</span></div>
+      <table class="tbl obs-tbl"><thead><tr><th>文件</th><th>大小</th><th>速率</th><th>最后写入</th><th>状态</th></tr></thead><tbody>${recRows}</tbody></table>
+    </div>`
+      : `<div class="empty-strip"><b>① 正在录制的文件</b><span class="badge b-idle">0 个</span>
+      <span class="tail">当前没有在写的录制文件 · 每轮目录轮询的结论见「实时监控」页</span></div>`}
 
-    <div class="card">
-      <div class="card-head"><b>② 边录边转（预转写）</b><span class="badge ${preActive.length ? 'b-done' : ''}">${preActive.length ? preActive.length + ' 场进行中' : '当前空闲'}${preActive.length && preHistory ? ` · 另有 ${preHistory} 条历史记录` : ''}</span></div>
-      ${
-        preRows
-          ? `<table class="tbl obs-tbl"><thead><tr><th>场次</th><th>已完成</th><th>路径</th><th>更新</th></tr></thead><tbody>${preRows}</tbody></table>`
-          : '<div class="empty">当前没有直播在录，也没有进行中的转写 —— 这里就该是空的。</div>'
-      }`
-      + `
-      <div class="hintline">粒度：biliLive-tools 会把一场直播切成多个分段文件（<span class="mono-sm">.ts</span> / <span class="mono-sm">-PART001.ts</span>…）。<b>正在写的那个分段不会转</b>（末次写入距今不到 2 分钟即视为"仍在写入"），写完之后的下一次检查就会转它 —— 所以一场 4 小时的直播，下播时通常只剩最后一个分段要转。
-      }
+    ${preRows
+      ? `<div class="card">
+      <div class="card-head"><b>② 边录边转（预转写）</b><span class="badge b-done">${preActive.length} 场进行中${preActive.length && preHistory ? ` · 另有 ${preHistory} 条历史记录` : ''}</span></div>
+      <table class="tbl obs-tbl"><thead><tr><th>场次</th><th>已完成</th><th>路径</th><th>更新</th></tr></thead><tbody>${preRows}</tbody></table>
+      <div class="hintline">粒度：biliLive-tools 会把一场直播切成多个分段文件（<span class="mono-sm">.ts</span> / <span class="mono-sm">-PART001.ts</span>…）。<b>正在写的那个分段不会转</b>（末次写入距今不到 2 分钟即视为"仍在写入"），写完之后的下一次检查就会转它 —— 所以一场 4 小时的直播，下播时通常只剩最后一个分段要转。</div>
       ${noteRows ? `<div class="obs-sub">最近判定（已滤掉"循环已启动"这类噪声）</div>${noteRows}` : ''}
-    </div>
+    </div>`
+      : `<div class="empty-strip"><b>② 边录边转（预转写）</b><span class="badge b-idle">当前空闲</span>
+      <span class="tail">当前没有直播在录，也没有进行中的转写</span></div>`}
 
     <!-- ★ 2026-10-14：原来这里的「④ 跑完自动关机」卡片**已迁出**为独立页签
          （顶栏「自动关机」，见 20-shell-body.html 的 data-view="autoshutdown" + 39-其它页签 的 iframe）。
          原因：这一页每 5 秒整块重渲染，卡片再怎么只改文本也会被带着抖 —— 用户连报两次"界面一直抖"，
          最终方案是让它有自己的文档（/api/shutdown/page）。此处不再保留重复入口。 -->
-    </div>
 
-    <div class="card">
-      <div class="card-head"><b>③ 压制 / 上传队列</b><span class="badge ${queue.length ? 'b-run' : ''}">${queue.length} 个进行中</span></div>
-      ${
-        qRows
-          ? `<table class="tbl obs-tbl"><thead><tr><th>类型</th><th>任务</th><th>状态</th><th>进度</th><th>已跑</th><th>预计还需</th><th>产物</th></tr></thead><tbody>${qRows}</tbody></table>`
-          : '<div class="empty">队列空闲</div>'
-      }
+    ${qRows
+      ? `<div class="card">
+      <div class="card-head"><b>③ 压制 / 上传队列</b><span class="badge b-run">${queue.length} 个进行中</span></div>
+      <table class="tbl obs-tbl"><thead><tr><th>类型</th><th>任务</th><th>状态</th><th>进度</th><th>已跑</th><th>预计还需</th><th>产物</th></tr></thead><tbody>${qRows}</tbody></table>
       <div class="hintline">完整版（弹幕版 + 纯享版）由 biliLive-tools 压制与上传；它投出去之后，等完整版的切片才会被追加成分P。</div>
-    </div>
+    </div>`
+      : `<div class="empty-strip"><b>③ 压制 / 上传队列</b><span class="badge b-idle">队列空闲</span>
+      <span class="tail">完整版压制与上传由 biliLive-tools 负责</span></div>`}
 
     <div class="card">
       <div class="card-head"><b>④ 最近几场</b></div>

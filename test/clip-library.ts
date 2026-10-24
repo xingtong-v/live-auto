@@ -95,7 +95,7 @@ try {
   const all = await get('limit=100');
   eq('两个场次的 4 条切片都在一张表里', all.total, 4);
   eq('带上场次信息（能认出它是哪一场）', [...new Set(all.rows.map((r) => r['taskId']))].length, 2);
-  eq('带上状态计数', all.counts, { published: 1, submitted: 1, candidate: 1, failed: 1 });
+  eq('带上状态计数', all.counts, { published: 1, submitted: 1, candidate: 1, failed: 1, gone: 0 });
   const withView = all.rows.find((r) => r['bvid'] === 'BV1LIB000001' && r['title'] === '露露吐槽手办价格');
   eq('★ 播放/点赞来自表现数据（与表现页同源）', [withView?.['view'], withView?.['like']], [1234, 56]);
   ok('带稿件链接（点得出去）', typeof withView?.['url'] === 'string' && String(withView['url']).includes('BV1LIB000001'));
@@ -122,6 +122,78 @@ try {
   eq('★ 但如实报出总数与截断', [limited.total, limited.truncated], [4, true]);
   const notLimited = await get('limit=100');
   eq('没截断时不谎报 truncated', notLimited.truncated, false);
+
+  section('4. 稿件已不存在（2026-10-17 切片库对账刷新）');
+  /* 对账刷新把「B站 上已没有」的稿件写成 gone 记录后，切片库的两条行都要标出来、计数也要算进去 */
+  ledger.recordPerformance({ bvid: 'BV1LIB000001', date: new Date().toLocaleDateString('sv-SE'), gone: true, title: '露露吐槽手办价格' });
+  const goneView = await get('limit=100');
+  eq('★ gone 计数进了 counts', goneView.counts['gone'], 2);
+  ok('★ 行上带 gone 标记（播放/点赞不再装有数据）',
+    goneView.rows.filter((r) => r['bvid'] === 'BV1LIB000001').every((r) => r['gone'] === true),
+    JSON.stringify(goneView.rows.filter((r) => r['bvid'] === 'BV1LIB000001')));
+
+  section('5. 去 B站 对账刷新（POST /api/clips/library/refresh，2026-10-17 用户要求）');
+  /* 三个新场次，覆盖对账的四种结局：
+     BV1LIB000001 稿件还在（列表 state=0 + 详情正常）⇒ 拉统计、撤销 gone；
+     BV1LIBGONE01 强证据「稿件不可见」且不在取全的列表里 ⇒ 判已不存在；
+     BV1LIBWEAK01 弱证据「啥都木有」（可能是审核中/仅自己可见）⇒ 不删标记、算没查清；
+     BV1LIBLOCK01 在列表里但 state=-4 已锁定 ⇒ 统计取不到，单独标注。 */
+  mkTask('auto-20260930090000-gone1', '稿件被删场', '2026-09-30T09:00:00.000Z');
+  ledger.setClips('auto-20260930090000-gone1', [mkClip(0, { title: '被删稿件里的切片', status: 'PUBLISHED', bvid: 'BV1LIBGONE01' })] as never);
+  mkTask('auto-20260930090000-weak1', '证据不足场', '2026-09-30T09:00:00.000Z');
+  ledger.setClips('auto-20260930090000-weak1', [mkClip(0, { title: '查不动的切片', status: 'PUBLISHED', bvid: 'BV1LIBWEAK01' })] as never);
+  mkTask('auto-20260930090000-lock1', '稿件锁定场', '2026-09-30T09:00:00.000Z');
+  ledger.setClips('auto-20260930090000-lock1', [mkClip(0, { title: '锁定稿件里的切片', status: 'PUBLISHED', bvid: 'BV1LIBLOCK01' })] as never);
+  /* publisher 只桩 confirmPublished（第①步：确认待确认切片）—— 真实实现另有专项测试 */
+  (orch as unknown as { publisher: unknown }).publisher = {
+    confirmPublished: async (taskId: string) => ({
+      confirmed: taskId === 'auto-20261010090000-aaaa' ? [{ clipIndex: 1, bvid: 'BV1LIB000001', title: '乙主播讲三国' }] : [],
+      pending: [],
+      stalled: [],
+      batches: [],
+    }),
+  };
+  (orch as unknown as { client: unknown }).client = {
+    /* 列表按 count 元信息一次取全（fetchAllArchivePages 的契约） */
+    biliArchivesPage: async () => ({
+      items: [
+        { bvid: 'BV1LIB000001', title: '露露专场 稿件', ctime: Math.floor(Date.now() / 1000), state: 0 },
+        { bvid: 'BV1LIBLOCK01', title: '锁定稿件', ctime: Math.floor(Date.now() / 1000), state: -4 },
+      ],
+      page: { count: 2, ps: 2, page: 1 },
+    }),
+    biliArchiveDetail: async (bvid: string) => {
+      if (bvid === 'BV1LIBGONE01') throw new Error('biliLive-tools 内部错误（HTTP 500） —— 稿件不可见');
+      /* 「啥都木有」是弱证据：审核中/仅自己可见/接口异常都会出现，不能判已删除 */
+      if (bvid === 'BV1LIBWEAK01' || bvid === 'BV1LIBLOCK01') throw new Error('biliLive-tools 内部错误（HTTP 500） —— 啥都木有');
+      return {
+        View: { bvid, title: '对账中的稿件', videos: 2, pubdate: 1750000000, stat: { view: 999, like: 42, coin: 1, favorite: 2, danmaku: 3, reply: 1, share: 0 } },
+      };
+    },
+  };
+  const boot = (await (await fetch(`${ui.url}/api/bootstrap`)).json()) as { csrf?: string };
+  const post = async (p: string): Promise<Record<string, unknown>> => {
+    const r = await fetch(`${ui.url}${p}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-CSRF-Token': String(boot.csrf ?? '') },
+      body: '{}',
+    });
+    return (await r.json()) as Record<string, unknown>;
+  };
+  const rec = await post('/api/clips/library/refresh');
+  eq('★ 核对切片库全部 4 个去重稿件', rec['checked'], 4);
+  eq('★ 第①步：待确认切片由 publisher 确认（桩报 1 个）', rec['confirmed'], 1);
+  eq('★ 第③步：还在的稿件拉到最新统计', rec['statsUpdated'], 1);
+  eq('★ 第②步：强证据 + 列表取全后没有 ⇒ 判「已不存在」', rec['gone'], ['BV1LIBGONE01']);
+  eq('★ 第②步：列表里在但 state=-4 锁定 ⇒ 统计取不到（不当已删除）', rec['unavailable'], ['BV1LIBLOCK01']);
+  eq('★ 弱证据「啥都木有」不删标记，进「没查清」', (rec['failed'] as Array<{ bvid: string }>).map((f) => f.bvid), ['BV1LIBWEAK01']);
+  const after = await get('limit=100');
+  const aliveRow = after.rows.find((r) => r['bvid'] === 'BV1LIB000001' && r['title'] === '露露吐槽手办价格')!;
+  eq('★ 对账拉到新统计：播放/点赞更新', [aliveRow['view'], aliveRow['like']], [999, 42]);
+  ok('★ 稿件又查到了 ⇒ 撤销 gone 标记（后来的一次成功回流赢）', aliveRow['gone'] === undefined, JSON.stringify(aliveRow['gone']));
+  const goneRow = after.rows.find((r) => r['bvid'] === 'BV1LIBGONE01')!;
+  ok('★ 已不在 B站 的稿件在切片库里标出', goneRow['gone'] === true, JSON.stringify(goneRow));
+  eq('gone 计数跟着更新（只剩真没了的那个）', after.counts['gone'], 1);
 } finally {
   ui.stop();
   orch.stop();

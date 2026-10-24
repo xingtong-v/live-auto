@@ -218,18 +218,23 @@ export class Trigger {
   /**
    * 要轮询的房间号列表。
    *
-   * ⚠️ 为什么不能只轮询 `cfg.room.roomId`：本项目配置里只有**一个** `room.roomId`，
-   *   而 biliLive-tools 可以同时录多个主播。实测踩到的真实故障：
+   * ⚠️ 为什么不能只轮询 `cfg.room.roomId`：配置里的主房间只有一个，而 biliLive-tools
+   *   可以同时录多个主播。实测踩到的真实故障：
    *   配置写的是 `12345678`（乙主播），实际在录的是 `23456789`（甲主播）——
    *   于是触发每 60 秒都在问一个没有新文件的房间，新录播永远不进来，
    *   而"导入录播"清单（`recordings.ts` 会读 biliLive-tools 配置里所有房间）
    *   却能看到它们。两处范围不一致，表现为「清单里看得见、却永远不自动跑」。
    *
-   * 房间来源：配置里的那个（保底）+ biliLive-tools 配置里所有被录制的房间。
-   * 读不到对方配置时退化为只轮询配置里的房间，并给出可执行提示。
+   * 房间来源（三处取并集）：
+   *   ① `room.roomId`      —— 主直播间（保底，旧配置只有它）
+   *   ② `room.roomIds[]`   —— 设置页「添加直播」加进来的附加直播间
+   *   ③ biliLive-tools 配置里所有被录制的房间（读不到时退化为 ①②，并给出可执行提示）
+   *
+   * 触发（`pollOnce`）与补漏对账（`reconcile`）都走这一个口径 —— 两处各写一套范围，
+   * 迟早出现「触发能发现、对账不认」这种自相矛盾。
    */
   private async resolveRoomIds(): Promise<string[]> {
-    const ids = new Set<string>([this.cfg.room.roomId].filter(Boolean));
+    const ids = new Set<string>([this.cfg.room.roomId, ...(this.cfg.room.roomIds ?? [])].map((x) => String(x ?? '').trim()).filter(Boolean));
     try {
       const raw = await this.client.getConfig();
       for (const id of roomIdsFromConfig(raw)) ids.add(id);
@@ -239,7 +244,7 @@ export class Trigger {
       if (!this.roomIdsWarned) {
         this.roomIdsWarned = true;
         this.logger.warn(
-          `读取 biliLive-tools 配置失败，本轮只轮询配置里的房间 ${this.cfg.room.roomId}。` +
+          `读取 biliLive-tools 配置失败，本轮只轮询配置里的 ${ids.size} 个房间（${[...ids].join('、')}）。` +
             `若还有别的主播在录，他们的新录播不会自动进来 —— 检查 biliLive-tools 是否在线`,
           { data: { error: (e as Error).message } },
         );
@@ -278,7 +283,10 @@ export class Trigger {
           const id = String((c as { id?: unknown }).id ?? '');
           if (id && seenRecordIds.has(id)) continue; // 同一条录制可能被两个房间视图返回
           if (id) seenRecordIds.add(id);
-          recent.push(c);
+          // ★ 多主播：recent-clips 记录本身不带 room_id，这里把来源房间号标上去。
+          //   否则任务创建时 roomId 只能退化成全局 cfg.room.roomId，两个主播会张冠李戴
+          //   （简介的 @昵称 / 空间链接 / 原直播链接全错位）。
+          recent.push({ ...c, room_id: roomId });
         }
       } catch (e) {
         this.logger.warn(`拉取 recent-clips 失败（房间 ${roomId}），跳过该房间`, { data: { error: (e as Error).message } });
@@ -579,7 +587,10 @@ export class Trigger {
           this.logger.warn(`补漏对账失败（房间 ${roomId} 第 ${page} 页）`, { data: { error: (e as Error).message } });
           break;
         }
-        for (const raw of list) collected.push(normalizeRecord(raw));
+        /* ★ 多主播：与 pollOnce 同理，record-history/list 的记录不带 room_id，
+           这里必须把来源房间号标上去 —— 否则启动补漏/对账创建的任务 roomId
+           会兜底成 cfg.room.roomId，乙主播的任务挂到甲主播头上（实测踩过）。 */
+        for (const raw of list) collected.push(normalizeRecord({ ...raw, room_id: roomId }));
         if (list.length < pageSize) break;
       }
     }

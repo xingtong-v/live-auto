@@ -4,3 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>直播切片助手</title>
+<!-- ★ 2026-10-16：主题必须在**首屏渲染之前**定下来。
+     放在这里（head、body 之前）而不是等 46-启动.js 跑完再设 ——
+     否则每次刷新都会先闪一下浅色底再变深，深色下特别刺眼。
+     取值优先级：localStorage → 系统偏好(prefers-color-scheme) → 浅色。 -->
+<script>
+(function () {
+  try {
+    var saved = localStorage.getItem('liveauto.theme');
+    var dark = saved ? saved === 'dark'
+      : !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    if (dark) document.documentElement.setAttribute('data-theme', 'dark');
+  } catch (e) { /* 隐私模式下 localStorage 会抛，忽略即可，退回浅色 */ }
+})();
+</script>

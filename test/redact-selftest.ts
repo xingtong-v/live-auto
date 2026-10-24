@@ -198,7 +198,7 @@ console.log('\n=== 6) 反向验证：闸门的边界 ===');
     '残血翻盘那一刻，弹幕直接炸了。观众表示：这也行？',
     '分区：游戏/单机游戏；标签：名场面、高能、游戏；评分 9.2',
     'http://127.0.0.1:18010/task/abc123 任务已完成',
-    'dtime = submitTime + 7800 + (N - 1) × 7500 + random(0, 1800)',
+    'dtime = submitTime + 1200 + (N - 1) × 7500 + random(0, 1800)',
   ];
   for (const p of prose) {
     check(`自然语言不被误伤：${p.slice(0, 20)}…`, redactText(p) === p, redactText(p));

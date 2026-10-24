@@ -86,10 +86,13 @@ try {
        这与本用例要验的"干净台账 ⇒ 没有需要处理的事"无关。
        原断言直接数 items.length，在真实录制期间会假红（实测就是这么红的）。 */
     /* 环境相关条目的 key 清单（它们取决于机器此刻状态或 B站 上已有的历史数据，
-       与"干净夹具台账"无关）：录制质量体检 / B站 稿件的重复分P。
+       与"干净夹具台账"无关）：录制质量体检 / B站 稿件的重复分P / **待删清单到点**。
        —— 2026-10-13 实测：直播在录 + B站 上有历史遗留的重复分P，这两条都会让本用例假红。
-       加 filter 时顺手把"多出来的是什么"打出来，否则只知道数字不对、还得再跑一次才知道原因。 */
-    const ENV_KEYS = ['recording-health', 'duplicate-parts'];
+       加 filter 时顺手把"多出来的是什么"打出来，否则只知道数字不对、还得再跑一次才知道原因。
+       —— 2026-10-16 追加 `pending-delete-due`：它与本用例的夹具台账无关，只取决于
+       **真实 `data/pending-delete.json` 的到点时间**（实测线上有 8 个文件 1 小时内到期、
+       5.3 GB，于是这条稳定出现）。它既不是夹具产生的、也不是本用例要验的性质。 */
+    const ENV_KEYS = ['recording-health', 'duplicate-parts', 'pending-delete-due'];
     const envItems = t.items.filter((x: { key?: string }) => ENV_KEYS.includes(String(x.key ?? '')));
     const items = t.items.filter((x) => !envItems.includes(x));
     eq(

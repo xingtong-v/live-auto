@@ -5,7 +5,14 @@
  * 为什么值得单独测：自动重试的代价是"可能重复投稿"，比漏重试严重得多 ——
  * 所以每条判据都要有断言守着，尤其是**保守默认**与**确定性优先**这两条容易被"优化"掉的设计。
  */
-import { classifyFailure, describeVerdict, shouldAutoRetry } from '../src/failure-class.ts';
+import {
+  RATE_LIMIT_DEFAULT_WAIT_SEC,
+  classifyFailure,
+  describeVerdict,
+  isUploadRateLimited,
+  parseRateLimitWaitSec,
+  shouldAutoRetry,
+} from '../src/failure-class.ts';
 
 let pass = 0;
 let fail = 0;
@@ -23,6 +30,9 @@ function ok(title: string, cond: unknown, detail = ''): void {
 function kind(label: string, input: Parameters<typeof classifyFailure>[0], want: 'retryable' | 'manual'): void {
   const got = classifyFailure(input);
   ok(label, got.kind === want, `期望 ${want}，实际 ${got.kind}（${got.why}）`);
+}
+function eq<T>(label: string, got: T, want: T): void {
+  ok(label, got === want, `期望 ${JSON.stringify(want)}，实际 ${JSON.stringify(got)}`);
 }
 function section(t: string): void {
   console.log(`\n\x1b[1m${t}\x1b[0m`);
@@ -71,6 +81,26 @@ ok('说明里带理由（写日志用）', /上传阶段/.test(shouldAutoRetry({
 section('5. 结论可读（写进日志/台账）');
 ok('可重试的说明里带理由', /可自动重试一次（.+）/.test(describeVerdict(classifyFailure({ message: '连接超时' }))), describeVerdict(classifyFailure({ message: '连接超时' })));
 ok('留人工的说明里带理由', /留给人工（.+）/.test(describeVerdict(classifyFailure({ message: '稿件已被锁定' }))), describeVerdict(classifyFailure({ message: '稿件已被锁定' })));
+
+section('6. ★ 投稿限流识别（「您投稿的频率过快，请稍等2秒」——2026-10-17 线上事故）');
+/* 为什么单独锁这一组：这两条判据一旦误判，代价是**同一次投稿被提交两次**（可能多出一个分P）。
+   线上原话必须认得出，普通失败必须认不出。 */
+ok('线上原话（带 BiliResponseError 前缀）⇒ 是限流', isUploadRateLimited('BiliResponseError: 您投稿的频率过快，请稍等2秒'));
+ok('线上原话（不带前缀）⇒ 是限流', isUploadRateLimited('您投稿的频率过快，请稍等2秒'));
+ok('「投稿频率过快」变体 ⇒ 是限流', isUploadRateLimited('投稿频率过快，请稍后再试'));
+ok('「投稿过快」变体 ⇒ 是限流', isUploadRateLimited('投稿过快'));
+ok('只带「请稍等 N 秒」⇒ 是限流', isUploadRateLimited('请稍等 5 秒'));
+ok('英文变体 ⇒ 是限流', isUploadRateLimited('Too Many Requests'));
+ok('空消息 ⇒ 不是限流（不给重试借口）', !isUploadRateLimited('') && !isUploadRateLimited(undefined));
+ok('★ 稿件锁定 ⇒ 不是限流（重投一万次也不会成）', !isUploadRateLimited('稿件已被锁定，无法投稿'));
+ok('★ 标题违规 ⇒ 不是限流', !isUploadRateLimited('投稿失败：标题违规'));
+ok('★ 网络超时 ⇒ 不是限流（走的是另一条重试判据）', !isUploadRateLimited('连接超时（60000ms）'));
+eq('解析「请稍等2秒」⇒ 2', parseRateLimitWaitSec('BiliResponseError: 您投稿的频率过快，请稍等2秒'), 2);
+eq('解析「请稍等 5 秒」（带空格）⇒ 5', parseRateLimitWaitSec('请稍等 5 秒'), 5);
+eq('解析英文「wait 3s」⇒ 3', parseRateLimitWaitSec('rate limited, wait 3s'), 3);
+eq('没有秒数 ⇒ undefined（由调用方给保守默认值）', parseRateLimitWaitSec('您投稿的频率过快'), undefined);
+eq('空消息 ⇒ undefined', parseRateLimitWaitSec(''), undefined);
+ok('保守默认值是正数（解析不到时至少等这么久）', RATE_LIMIT_DEFAULT_WAIT_SEC >= 2, String(RATE_LIMIT_DEFAULT_WAIT_SEC));
 
 console.log('\n' + '─'.repeat(74));
 console.log(`\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);

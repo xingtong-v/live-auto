@@ -50,10 +50,15 @@ const PRE_TRANSCRIBE_IDLE_ROUNDS = 3;
 export function nextPreTranscribeDelayMs(idleRounds: number): number {
   return idleRounds >= PRE_TRANSCRIBE_IDLE_ROUNDS ? PRE_TRANSCRIBE_IDLE_MS : PRE_TRANSCRIBE_ACTIVE_MS;
 }
+
+/** 切片库对账：「我的稿件列表」一页取多少 —— 与 refreshPerformance / 墓碑核对保持一致 */
+const RECONCILE_LIST_PAGE_SIZE = 100;
+/** 切片库对账：相邻两次稿件详情请求之间的间隔（手动点一次也可能有几十个稿件，别给 B站 上强度） */
+const RECONCILE_PACE_MS = 150;
 import v8 from 'node:v8';
-import { BiliLiveClient } from './api.ts';
+import { BiliLiveClient, fetchAllArchivePages } from './api.ts';
 import type { AppConfig } from './config.ts';
-import { ConfigStore, resolveDataPath } from './config.ts';
+import { ConfigStore, isClipPublishModeExplicit, resolveClipPublishMode, resolveDataPath } from './config.ts';
 import type { Ledger } from './ledger.ts';
 import { ledger as defaultLedger } from './ledger.ts';
 import type { Alerter } from './alert.ts';
@@ -70,6 +75,11 @@ import {
   type AsrMediaAdapter,
 } from './asr.ts';
 import { decideShutdown, executeCancelShutdown, executeShutdown, inShutdownWindow, type ShutdownConditions } from './auto-shutdown.ts';
+import {
+  gatherRecordingGate,
+  type RecordingSignalsResult,
+  type WatcherOutcomeLike,
+} from './recording-signals.ts';
 import { planSegmentCalls } from './media-plan.ts';
 import { transcribeInWorker } from './asr-worker-client.ts';
 import type { ProgressPayload } from './asr-progress.ts';
@@ -84,6 +94,8 @@ import {
   extractTitleDate,
   guessAnchorName,
   isArchiveGoneError,
+  isStrongArchiveGoneError,
+  normalizeTitleForMatch,
   resolveResumeTarget,
   taskDateText,
 } from './publish.ts';
@@ -138,9 +150,11 @@ import {
   fmtLocal,
   nowIso,
   readJson,
+  ROOT_DIR,
   sleep,
   writeJsonAtomic,
 } from './util.ts';
+import { BuildInfo } from './build-info.ts';
 import { Logger, log as globalLog } from './logger.ts';
 import type { TriggerDecision } from './trigger.ts';
 
@@ -206,6 +220,11 @@ export class Orchestrator {
   readonly analyzer: Analyzer;
   readonly transcriber: Transcriber;
   readonly publisher: Publisher;
+  /**
+   * 构建指纹（2026-10-25）：进程启动时定格一份，随时可与磁盘现值比对。
+   * 用户的核心痛点：「修复到底更新到没有」—— 之前只能靠翻进程启动时间猜。
+   */
+  readonly buildInfo: BuildInfo;
   readonly cleaner: Cleaner;
   readonly alerter: Alerter;
   readonly trigger: Trigger;
@@ -307,6 +326,9 @@ export class Orchestrator {
 
   constructor(opts: OrchestratorOptions = {}) {
     this.opts = opts;
+    /* 构建指纹必须先定格：它就是"本进程跑的到底是哪份代码"的锚点，
+       晚于任何文件读写都不影响正确性，但越早越能代表启动时的状态。 */
+    this.buildInfo = new BuildInfo({ rootDir: ROOT_DIR });
     this.store = new ConfigStore(opts.configPath);
     const cfg = this.store.config;
     // 应用 CLI 覆盖（不落盘）
@@ -371,8 +393,16 @@ export class Orchestrator {
         return words;
       },
     });
-    this.publisher = new Publisher({ client: this.client, config: cfg, ledger: this.ledger, logger: this.logger });
+    /* ⚠️ 顺序：告警器必须先建 —— Publisher 需要它发「投稿配额限流」那一条（2026-10-21 事故），
+       没有它的话配额限流只会写进日志，用户看不到"别重投、等 30 分钟"。 */
     this.alerter = new DefaultAlerter({ config: cfg.alert, logger: this.logger });
+    this.publisher = new Publisher({
+      client: this.client,
+      config: cfg,
+      ledger: this.ledger,
+      logger: this.logger,
+      alerter: this.alerter,
+    });
     this.cleaner = new Cleaner({
       config: cfg,
       ledger: this.ledger,
@@ -393,6 +423,11 @@ export class Orchestrator {
       ledger: this.ledger,
       logger: this.logger,
       client: this.client,
+      /* ★ 必须显式给 statePath（QA 2026-10-21 指出）：不给就用 `DATA_DIR/watch-import-state.json`，
+         也就是**生产台账目录** —— 内建测试用临时 dataDir 跑一遍就会去动生产的导入状态文件
+         （目前构造只读，暂时无害，但一旦有写路径就是"测试改生产"的定时炸弹）。
+         跟着台账目录走：生产环境两者本来就指同一个路径，行为不变。 */
+      statePath: path.join(path.dirname(this.ledger.publishLogPath), 'watch-import-state.json'),
       importFn: async (input) => {
         /* ★ 必须显式传 source:'auto'：否则这条自动导入的任务会被标成「手动导入」，
            界面上与用户自己点「导入录播」建的任务长得一模一样（实测缺陷）。 */
@@ -514,22 +549,48 @@ export class Orchestrator {
     }
 
     // 目标直播间是否有录制记录（陷阱 #1 / #2：这两个原因都会静默返回空数组）
+    /* 逐个房间查：设置页「添加直播」加的附加直播间也要覆盖 —— 否则自检会说"触发链路可用"，
+       而附加房间其实一条录制记录都没有（新录播永远不会自动进来）。 */
     try {
-      const recent = await this.client.recentClips(cfg.room.roomId, cfg.room.platform, this.logger);
-      if (recent.length === 0) {
-        const hist = await this.client.recordHistoryList({ roomId: cfg.room.roomId, platform: cfg.room.platform, page: 1, pageSize: 5 });
-        if (hist.total === 0) {
-          push(
-            false,
-            '目标直播间录制记录',
-            `直播间 ${cfg.room.roomId} 在 record-history 中没有任何记录 —— recent-clips 会**静默返回空数组**，触发逻辑永不生效（陷阱 #2）`,
-            `在 biliLive-tools 中为直播间 ${cfg.room.roomId} 添加录制任务并至少完成一次录制；platform 必须为 "Bilibili"（首字母大写，陷阱 #1）`,
-          );
-        } else {
-          push(true, '目标直播间录制记录', `recent-clips 为空但历史有 ${hist.total} 条记录（可能是历史较久），触发链路可用`);
+      const roomIds = [cfg.room.roomId, ...(cfg.room.roomIds ?? [])].map((x) => String(x ?? '').trim()).filter(Boolean);
+      const stats: Array<{ roomId: string; recent: number; hist: number }> = [];
+      const bad: string[] = [];
+      for (const roomId of roomIds) {
+        try {
+          const recent = await this.client.recentClips(roomId, cfg.room.platform, this.logger);
+          if (recent.length > 0) {
+            stats.push({ roomId, recent: recent.length, hist: 0 });
+            continue;
+          }
+          const hist = await this.client.recordHistoryList({ roomId, platform: cfg.room.platform, page: 1, pageSize: 5 });
+          if (hist.total === 0) {
+            bad.push(`直播间 ${roomId} 在 record-history 中没有任何记录 —— recent-clips 会**静默返回空数组**，触发逻辑永不生效（陷阱 #2）`);
+          } else {
+            stats.push({ roomId, recent: 0, hist: hist.total });
+          }
+        } catch (e) {
+          bad.push(`直播间 ${roomId} 查询失败：${(e as Error).message}`);
         }
+      }
+      if (bad.length) {
+        push(
+          false,
+          '目标直播间录制记录',
+          bad.join('；'),
+          '在 biliLive-tools 中为这些直播间添加录制任务并至少完成一次录制；platform 必须为 "Bilibili"（首字母大写，陷阱 #1）',
+        );
+      } else if (stats.length <= 1) {
+        // 单房间保持原文案（用户已经熟悉这两句，不要因为上线多房间就改口径）
+        const s = stats[0];
+        if (!s) throw new Error('没有配置任何直播间房间号');
+        if (s.recent > 0) push(true, '目标直播间录制记录', `recent-clips 返回 ${s.recent} 条，触发链路可用`);
+        else push(true, '目标直播间录制记录', `recent-clips 为空但历史有 ${s.hist} 条记录（可能是历史较久），触发链路可用`);
       } else {
-        push(true, '目标直播间录制记录', `recent-clips 返回 ${recent.length} 条，触发链路可用`);
+        push(
+          true,
+          '目标直播间录制记录',
+          `${stats.length} 个直播间均可触发（${stats.map((s) => `${s.roomId}: recent ${s.recent} / 历史 ${s.hist}`).join('；')}）`,
+        );
       }
     } catch (e) {
       push(false, '目标直播间录制记录', `查询失败：${(e as Error).message}`);
@@ -617,8 +678,9 @@ export class Orchestrator {
     ensureDir(LOGS_DIR);
     ensureDir(ERROR_REPORT_DIR);
 
+    const extraRooms = (cfg.room.roomIds ?? []).filter(Boolean);
     this.logger.info(
-      `live_auto 启动：房间 ${cfg.room.roomId}，模式 ${cfg.publish.autoPublish ? '全自动' : '半自动（需确认后发布）'}` +
+      `live_auto 启动：房间 ${cfg.room.roomId}${extraRooms.length ? `（+${extraRooms.length} 个附加：${extraRooms.join('、')}）` : ''}，模式 ${cfg.publish.autoPublish ? '全自动' : '半自动（需确认后发布）'}` +
         `${this.opts.dryRun ? '，dry-run' : ''}${this.opts.allowPaid ? '，allow-paid' : ''}`,
     );
 
@@ -1086,7 +1148,10 @@ export class Orchestrator {
     const rec: TaskRecord = {
       id: taskId,
       ...(first.id ? { recordingId: first.id } : {}),
-      roomId: cfg.room.roomId,
+      /* ★ 多主播：优先用录制记录自带的房间号（trigger 在逐个房间拉取时标注的 `room_id`）。
+         之前写死 cfg.room.roomId —— 配置里只有一个房间，两个主播同时录时，
+         乙主播的任务 roomId 也会写成甲主播的，简介/轮询全部错位。 */
+      roomId: String((first.raw as { room_id?: unknown })?.room_id ?? cfg.room.roomId),
       platform: cfg.room.platform,
       title: first.title || `${fmtLocal().slice(0, 16)} 直播录像`,
       ...(first.liveStartTime !== undefined ? { liveStartTime: first.liveStartTime } : {}),
@@ -1320,11 +1385,58 @@ export class Orchestrator {
   }
 
   /**
+   * 收集「还在录」的**多源**证据（2026-10-24 修复；详见 `src/recording-signals.ts` 的头注释）。
+   *
+   * ★ 为什么必须多源（真实教训，别改回去）：旧实现只统计 watcher 的 **mp4 导入候选项**
+   *   （`possiblyRecording` / `pendingParts > 0`）。而 biliLive-tools 的分段录制写的是 `.ts`
+   *   （实测 `2026-10-24 17-59-44-718 玩《深空当铺》，当极致倒勾-PART007.ts`，1.13 GB、0.76 MB/s），
+   *   watcher 从不把它当导入候选 ⇒ 这一项**永远是 0**，界面于是显示「可能还在录的场次 0 场」。
+   *   后果不是数字难看，而是 `llcQueue=[]` + 流水线空闲时其余门槛一旦满足，
+   *   **自动关机会在直播录制中途把机器关掉** —— 那一场录制直接废掉（数据丢失）。
+   *
+   * 三个源互不覆盖，任一为真即算"还在录"：
+   *   ① watcher 的轮询候选项（原有的那条，保留）；
+   *   ② 录制目录里**体积还在长的原始分段**（本次新增，与 `/api/observe` 的 `recording[].growing` 同源同函数）；
+   *   ③ biliLive-tools 录制器自报 `state === 'recording'`（最权威；问不到时进 `failed`，调用方按"还在录"处理）。
+   *
+   * 每个源独立 try/catch：一个源挂了不能把其余两源一起废掉，但**必须记账**（`failed`），
+   * 否则用户只会看到"永远不关机"却不知道为什么。
+   */
+  private async collectRecordingSignals(now: Date): Promise<RecordingSignalsResult> {
+    const failed: string[] = [];
+    let dirs: string[] = [];
+    let outcomes: WatcherOutcomeLike[] = [];
+    let recorders: Awaited<ReturnType<Orchestrator['client']['recorderList']>> | undefined;
+
+    /* ① watcher 状态（目录 + 上一轮结论；它同时提供 ② 要扫的目录） */
+    try {
+      const st = this.watcher.status();
+      dirs = Array.isArray(st?.dirs) ? st.dirs : [];
+      outcomes = st?.lastOutcomes ?? [];
+    } catch {
+      failed.push('目录轮询状态');
+    }
+
+    /* ③ 录制器自报（问不到 ⇒ 记失败，绝不据此判"没在录"） */
+    try {
+      recorders = await this.client.recorderList();
+    } catch {
+      failed.push('biliLive-tools 录制器状态');
+    }
+
+    /* ② 扫盘在 gatherRecordingGate 里做（失败会自动记进 failed）。
+       判据全部在那边（纯函数、可被 fixture 钉死），这里只负责把 IO 取回来并逐个源记账：
+       一个源挂了不能把其余源一起废掉，但必须让用户看见是哪一源查不到，
+       否则只会觉得"永远不关机"却不知道为什么。 */
+    return gatherRecordingGate({ now: now.getTime(), dirs, outcomes, recorders, failed });
+  }
+
+  /**
    * 评估一次「要不要关机」。
    *
    * 六条事实全部来自既有接口，**任何一条拿不准都按"别关"处理**：
    *   · biliLive-tools 队列查不到（超时/它没开）→ 当作"有任务在跑"，绝不当空闲；
-   *   · watcher 说某场"可能还在录"（possiblyRecording / 还有分段在写）→ 绝不当空闲。
+   *   · 任一"还在录"信号源查不到，或任一源说在录（watcher / 原始分段在写 / 录制器 recording）→ 绝不当空闲。
    * 这两条正是踩一次就丢数据的地方（分段写一半、压制白跑）。
    */
   async evaluateAutoShutdown(): Promise<{ shutdown: boolean; reason: string }> {
@@ -1340,14 +1452,17 @@ export class Orchestrator {
       llcQueueLength = 1;
     }
 
+    /* 「还在录」：三个源归并去重后得到"几场"，再组装成一道门（gate） */
+    const recordingGateResult = (await this.collectRecordingSignals(now)).gate;
+
     const conditions: ShutdownConditions = {
       enabled: this.shutdownEnabledOverride ?? p.enabled,
       busy: this.busy,
       queueLength: this.queue.length,
       activeTranscriptions: listActiveLocalAsrRuns().length,
-      recordingSessions: this.watcher
-        .status()
-        .lastOutcomes.filter((o) => o.possiblyRecording === true || (o.pendingParts ?? 0) > 0).length,
+      recordingSessions: recordingGateResult.count,
+      /* 只传"来源"那半句：reason 自己会写「有 N 场可能正在录制（…）」，再传整句就成了括号套括号 */
+      recordingDetail: recordingGateResult.sources,
       llcQueueLength,
       now,
     };
@@ -1360,9 +1475,9 @@ export class Orchestrator {
       { key: 'enabled', label: '开关已打开', ok: conditions.enabled, detail: conditions.enabled ? '本次运行有效' : '在页面上点「打开」或改 config.json' },
       {
         key: 'recording',
-        label: '没有正在录制 / 可能还在录的场次',
-        ok: conditions.recordingSessions === 0,
-        detail: conditions.recordingSessions > 0 ? `${conditions.recordingSessions} 场可能还在录` : '0 场',
+        label: recordingGateResult.label,
+        ok: recordingGateResult.ok,
+        detail: recordingGateResult.detail,
       },
       {
         key: 'pipeline',
@@ -1396,10 +1511,12 @@ export class Orchestrator {
       },
     ];
 
-    /* 六条门槛（不含冷静期）是否都过了 —— 用来维护"空闲起点" */
+    /* 六条门槛（不含冷静期）是否都过了 —— 用来维护"空闲起点"。
+       "还在录"这一条直接用 gate 的结论：它已经把"某源查不到 ⇒ 保守按在录"算进去了，
+       这里再写一次 `recordingSessions === 0` 就等于有两套口径（本项目踩过好几次这种坑）。 */
     const gatesOk =
       conditions.enabled &&
-      conditions.recordingSessions === 0 &&
+      recordingGateResult.ok &&
       !conditions.busy &&
       conditions.queueLength === 0 &&
       conditions.activeTranscriptions === 0 &&
@@ -1740,12 +1857,17 @@ export class Orchestrator {
            · `publish.fullVideoBy="assistant"`，或任务级 `overrides.fullVideoBy="assistant"`；
            · 且不是多分P 模式（多分P 时完整版作为 P1 与切片一起投，不能单独再投一次）。 */
       const fullVideoOwner = this.fullVideoOwner(task);
+      /* 切片怎么投决定了完整版怎么走：追加模式下切片要进「完整版那个稿件」，
+         所以完整版归谁投必须说清楚；单独投稿模式下切片与完整版互不相干。 */
+      const clipModeHere = resolveClipPublishMode(this.config.publish);
       if (fullVideoOwner === 'bililive-tools') {
         log.info(
-          '完整版（弹幕版 + 纯享版）由 biliLive-tools 自己投 —— 本服务只把切片追加进它那个稿件（同一个稿件）',
+          clipModeHere === 'standalone'
+            ? '完整版（弹幕版 + 纯享版）由 biliLive-tools 自己投 —— 本场切片按「单独投稿」各自一个稿件，不等它、也不追加进它那个稿件'
+            : '完整版（弹幕版 + 纯享版）由 biliLive-tools 自己投 —— 本服务只把切片追加进它那个稿件（同一个稿件）',
         );
-      } else if (this.config.publish.multiPart === true) {
-        log.info('多分P模式（例外：切片助手投完整版）：完整版将作为该稿件的 P1 与切片一并投递，不单独上传');
+      } else if (clipModeHere === 'append') {
+        log.info('切片投稿方式 = 追加切片投稿（例外：切片助手投完整版）：完整版将作为该稿件的 P1 与切片一并投递，不单独上传');
       } else {
         this.kickFullVideoUpload(task).catch((e) => log.warn('完整版上传支线异常（不影响切片流程）', { data: { error: (e as Error).message } }));
       }
@@ -2079,22 +2201,31 @@ export class Orchestrator {
 
     this.ledger.setStatus(taskId, 'CLIPPING', { stage: 'ANALYZED' });
 
-    /* ★ 多分P模式（publish.multiPart）必须在这里分流。
+    /* ★ 切片投稿去向（publish.clipPublishMode：追加切片投稿 / 单独投稿）必须在这里分流。
        曾经的缺陷：`publish.multiPart` 这个配置项**在自动流程里完全没被读取** ——
        `publishAsMultiPart()` 只有手动工具 `tools/publish-multipart.ts` 会调，
        于是配了 multiPart=true 的场次仍然「一个切片一个稿件」：
        8 个切片 = 8 个独立稿件 = 占 8 个每日额度，而多分P只需 1 个。
        实测就是这样把一场 8 个切片全投成了单片。 */
-    const useMultiPart = cfg.publish.multiPart === true;
-    /* 默认规则（完整版由 biliLive-tools 投、切片追加进同一个稿件）只能通过多分P 续传实现。
-       单切片一稿模式下每个切片是**独立稿件**，与完整版不在同一个稿件里 —— 直接拦住，
-       不要让配置错位悄悄投出一堆单片（那种错误事后要人工去 B站 一个个删）。 */
-    if (!useMultiPart && this.fullVideoOwner(task) === 'bililive-tools') {
+    const clipMode = resolveClipPublishMode(cfg.publish);
+    const useMultiPart = clipMode === 'append';
+    /* 【单独投稿】是用户的**明确选择**：每个切片各自一个稿件，不等 biliLive-tools 的完整版稿件。
+       所以那种「等它投出来再追加」的链路完全不参与（否则会白等最多 resumeWaitMin 分钟）。 */
+    if (!useMultiPart) {
+      log.info(
+        '切片投稿方式 = 单独投稿：每个切片各自一个稿件（不会再等 / 追加到 biliLive-tools 的完整版稿件）',
+      );
+    }
+    /* 老配置的错位拦截：`multiPart=false` 但用户**没有**动过「切片投稿方式」时，
+       「完整版由 biliLive-tools 投、切片只追加进它那个稿件」的规则不成立 —— 这是配置错位，
+       不是意图，拦下来别投出一堆单片（那种错误事后要人工去 B站 一个个删）。
+       显式选了「单独投稿」时不拦：那是明确要每片一稿。 */
+    if (!useMultiPart && !isClipPublishModeExplicit(cfg.publish) && this.fullVideoOwner(task) === 'bililive-tools') {
       throw new StageError(
         'CLIPPED',
         '按当前规则「完整版由 biliLive-tools 投、切片助手只追加切片分P 到同一个稿件」，必须开启 publish.multiPart=true；' +
           '当前 multiPart=false 会把每个切片投成独立稿件（与完整版不在同一个稿件）。' +
-          '如确实要一个切片一个稿件，请显式设 publish.fullVideoBy="assistant" 表示由切片助手自行投稿。',
+          '确实要一个切片一个稿件时，在设置里把「切片投稿方式」改成「单独投稿」（publish.clipPublishMode="standalone"）。',
         'contract',
       );
     }
@@ -2121,7 +2252,14 @@ export class Orchestrator {
     const failed = clips.filter((c) => c.status === 'FAILED').length;
     const selectedCount = clips.filter((c) => c.selected).length;
 
-    this.ledger.setStatus(taskId, published + submitted > 0 ? 'CLIPPED' : 'ANALYZED', { stage: 'CLIPPED' });
+    /* ★ 配额限流把本轮停掉时，本场**不能回退成 ANALYZED**（2026-10-21）：
+       切片产物都在、状态是 CANDIDATE（待投），它实际处于「已切片 · 待发布」，
+       与"今日额度用完"那种截断同一种形态。回退成 ANALYZED 会让界面显示成"待分析"，
+       而重新分析又会把已切好的片再切一遍。 */
+    const quotaStopped = res.results.some((r) => r.quotaLimited);
+    /* 账号受限闸门命中的那一轮：results 为空，但本场同样**不能回退成待分析**（切片产物都在盘上） */
+    const quotaBlock = (res as { quotaBlocked?: { until: string; rejections: number; note: string } }).quotaBlocked;
+    this.ledger.setStatus(taskId, published + submitted > 0 || quotaStopped || quotaBlock ? 'CLIPPED' : 'ANALYZED', { stage: 'CLIPPED' });
 
     for (const r of res.results) {
       if (r.ok && !r.skipped) {
@@ -2133,6 +2271,10 @@ export class Orchestrator {
           isOnlySelf: cfg.publish.isOnlySelf === 1,
         });
       } else if (!r.ok) {
+        /* ★ 配额级限流**不发「投稿失败」**（2026-10-21）：它不是失败，切片留在待投，
+           Publisher 已经发过一条更准确的 warn（含"等 30 分钟"）。再补一条 error
+           会和它自相矛盾，也会把用户推去"重投/查代码"。 */
+        if (r.quotaLimited) continue;
         await this.alerter.publishFailed({
           taskId,
           title: clips[r.clipIndex]?.title ?? '',
@@ -2170,11 +2312,23 @@ export class Orchestrator {
           `（默认规则：完整版由它投，切片助手只追加切片分P 到同一个稿件）—— 等它投出后自动追加`,
       );
     } else if (stuck && published + submitted === 0) {
-      /* 无可投（额度用完 / 切片全失败）：本场到此为止，如实说明，不谎报成功也不挂着 */
+      /* 无可投（额度用完 / 配额限流 / 切片全失败）：本场到此为止，如实说明，不谎报成功也不挂着 */
       this.ledger.setStatus(taskId, 'CLIPPED', { stage: 'CLIPPED' });
+      const why = res.failed > 0
+        ? `${res.failed} 个切片切片失败`
+        : quotaBlock
+          ? quotaBlock.note
+          : quotaStopped
+            ? 'B站 投稿配额限流（等 30 分钟后再重跑发布阶段）'
+            : '今日额度已用完';
       log.warn(
-        `本场未能投稿：${res.failed > 0 ? `${res.failed} 个切片切片失败` : '今日额度已用完'}` +
-          `（勾选 ${selectedCount} 个，已有切片产物 ${withOutput} 个）—— 等额度恢复后可重跑发布阶段`,
+        `本场未能投稿：${why}` +
+          `（勾选 ${selectedCount} 个，已有切片产物 ${withOutput} 个）` +
+          (quotaBlock
+            ? '——账号受限期间不会发起任何提交；确认 B站 恢复后到「发布排期」点「解除账号受限」再重跑'
+            : quotaStopped
+              ? '——切片都已留在「待投」，配额恢复后重跑发布阶段即可，不用重切'
+              : '——等额度恢复后可重跑发布阶段'),
       );
     } else if (allDone && withOutput > 0) {
       this.ledger.setStatus(taskId, 'PUBLISHED', { stage: 'PUBLISHED', publishedAt: nowIso() });
@@ -2717,6 +2871,31 @@ export class Orchestrator {
     this.clearProgress(taskId);
 
     if (!r.ok) {
+      /* ★ 配额级限流（2026-10-21）**不是失败**：切片已由 Publisher 留在 CANDIDATE（待投）。
+         必须把 quotaLimited 透传到 results —— 否则 publishStageInner 会
+         ① 把本场状态回退成 ANALYZED（界面显示"待分析"，用户点重新分析会把已切好的片再切一遍）；
+         ② 对每条结果补发「投稿失败」error 告警，与 Publisher 那条 warn 自相矛盾。
+         QA 2026-10-21 实测：漏了这一步时状态是 ANALYZED、还多发 2 条投稿失败。 */
+      if (r.quotaLimited) {
+        const q = r.quotaLimited;
+        log.warn(
+          `多分P投稿被**配额限流**暂停：${r.error ?? q.message}` +
+            `（${cutOk.length} 个切片留在待投，建议 ${q.retryAfterMin} 分钟后重试）`,
+        );
+        return {
+          results: cutRes.results.map((c) => ({
+            ...c,
+            ok: false,
+            error: { type: 'upload-failed', message: r.error ?? q.message },
+            quotaLimited: q,
+          })),
+          submitted: 0,
+          skipped: 0,
+          failed: 0,
+          stuck: true,
+          multipart: true,
+        };
+      }
       log.error(`多分P投稿失败：${r.error ?? '未知原因'}`);
       return {
         results: cutRes.results.map((c) => (c.ok ? { ...c, ok: false, error: { type: 'internal', message: r.error ?? '多分P投稿失败' } } : c)),
@@ -3005,6 +3184,353 @@ export class Orchestrator {
     const r = await this.publisher.confirmPublished(taskId);
     await this.alertStalled(taskId, r.stalled);
     return { checked, confirmed: r.confirmed.length, pending: r.pending.length, stalled: r.stalled.length };
+  }
+
+  /**
+   * 切片库的「去 B站 对账」刷新（2026-10-17 用户要求：
+   * 「切片库 增加一个刷新按钮 刷新时去B站 按当前的切片库的稿件去对账 然后刷新状态」）。
+   *
+   * 三步，全部**只读 B站 + 只写本地台账/表现数据**，不触发任何投稿动作：
+   *
+   *   ① 先把「已提交待确认」的切片确认一遍（SUBMITTED → PUBLISHED）：
+   *      逐场调 `publisher.confirmPublished` —— 与 5 分钟一轮的周期反查**同一套逻辑**
+   *      （按分P 标题确认落地、补 bvid、登记指纹、按批次对账、查重复分P），
+   *      区别只是这里由用户手动触发、当场出结果，不用等下一轮；
+   *
+   *   ② 再按切片库当前的每个 bvid 逐个对账**稿件还在不在**：
+   *      先按服务端 count 翻页取全「我的稿件列表」（`fetchAllArchivePages`），再拉稿件详情。
+   *      「已不存在」只认**强证据**（`isStrongArchiveGoneError`）且列表确认真没有它；
+   *      「啥都木有」这类弱证据、列表没取全、稿件在列表里但 state≠0（锁定/审核中）
+   *      一律算「没查清 / 取不到统计」，**绝不误判成已删除**
+   *      （2026-10-17 墓碑误解除事故的教训，判据详见 tombstone-reconcile.ts 顶部注释）；
+   *
+   *   ③ 还在的稿件顺手拉一次最新统计（播放/点赞/投币/收藏/弹幕）写进 performance.jsonl，
+   *      **忽略「每日一次」** —— 用户点「刷新」就是要最新的，与表现页「强制重拉」同口味。
+   *      切片库的「播放/点赞」两列读的就是这份文件，不拉的话对账完看到的还是旧数字。
+   *
+   * 范围是切片库**全部**带 bvid 的稿件（不受当时的搜索/筛选影响）：
+   * 筛选只是看法，状态刷新要一致 —— 只刷可见行会让藏着的行继续旧着，计数也会对不上。
+   */
+  async reconcileClipLibrary(): Promise<{
+    /** 参与对账的去重稿件数（切片库里带 bvid 的） */
+    checked: number;
+    /** 本轮新确认落地的切片数（SUBMITTED → PUBLISHED） */
+    confirmed: number;
+    /** 确认已不在 B站 的 bvid（列表取全 + 详情强证据，已标记不再反复拉） */
+    gone: string[];
+    /** 本轮清除的切片数（稿件已不在 ⇒ 回退待投 + 清稿件字段 + 删指纹，可重投） */
+    cleared: number;
+    /** 稿件在列表里但锁定/审核中，统计取不到的 bvid */
+    unavailable: string[];
+    /** 拉到最新统计的稿件数 */
+    statsUpdated: number;
+    /** 没查清的（限流/500/弱证据/列表没取全时的存疑稿件） */
+    failed: Array<{ bvid: string; error: string }>;
+    /** 未到定时发布时间、本轮跳过存亡判定的切片数 */
+    pendingRelease: number;
+    /** 撤销「已不存在」误标记的切片数 */
+    healed: number;
+    /** 按投稿日志复原的（曾被误清除 bvid 的）切片数 */
+    restored: number;
+    notes: string[];
+  }> {
+    const notes: string[] = [];
+    const failed: Array<{ bvid: string; error: string }> = [];
+    const gone: string[] = [];
+    const unavailable: string[] = [];
+
+    /* ---- ① 确认「已提交待确认」的切片（与 5 分钟一轮的 confirmPendingPublished 同一套逻辑） ---- */
+    let confirmed = 0;
+    for (const t of this.ledger.listTasks({ limit: 500 })) {
+      if (!this.ledger.getClips(t.id).some((c) => c.status === 'SUBMITTED')) continue;
+      try {
+        const r = await this.publisher.confirmPublished(t.id);
+        confirmed += r.confirmed.length;
+      } catch (e) {
+        notes.push(`任务 ${t.id} 的待确认切片反查失败（不影响其它场次）：${(e as Error).message.slice(0, 80)}`);
+      }
+    }
+
+    /* ---- ②③ 按切片库当前的 bvid 逐个对账存在性 + 拉最新统计 ---- */
+    /* 定时稿未到点 ⇒ 本轮跳过：这类稿件在 B站 侧本来就不可见，判「已删除」是误伤。
+       2026-10-17 21:56 的事故就出在这里（dtime=22:42 的稿件被判 gone，见 isAwaitingRelease）。 */
+    let pendingRelease = 0;
+    const byBvid = new Map<string, { taskId: string; clipIndex: number; title: string; score?: number }>();
+    for (const t of this.ledger.listTasks({ limit: 500 })) {
+      for (const c of this.ledger.getClips(t.id)) {
+        if (!c.bvid) continue;
+        if (isAwaitingRelease(c)) {
+          pendingRelease++;
+          continue;
+        }
+        if (!byBvid.has(c.bvid)) {
+          byBvid.set(c.bvid, { taskId: t.id, clipIndex: c.index, title: c.title, ...(typeof c.score === 'number' ? { score: c.score } : {}) });
+        }
+      }
+    }
+    /* 稿件列表：一次翻页取全。「已删除」判定的前提 —— 列表没取全时不敢说"不在"（2026-10-17 事故教训） */
+    const listedMap = new Map<string, { state?: number }>();
+    let listOk = false;
+    let listComplete = false;
+    try {
+      const all = await fetchAllArchivePages({
+        fetchPage: (page) => this.client.biliArchivesPage({ page, pageSize: RECONCILE_LIST_PAGE_SIZE }),
+        pageSize: RECONCILE_LIST_PAGE_SIZE,
+      });
+      for (const a of all.items) {
+        const bvid = String((a as Record<string, unknown>)['bvid'] ?? '').trim();
+        if (bvid) {
+          listedMap.set(bvid, {
+            ...(typeof (a as Record<string, unknown>)['state'] === 'number' ? { state: (a as Record<string, unknown>)['state'] as number } : {}),
+          });
+        }
+      }
+      listOk = true;
+      listComplete = all.complete;
+      for (const n of all.notes) notes.push(n);
+    } catch (e) {
+      notes.push(`读取我的稿件列表失败（单个稿件仍会对账，只是「已删除」的判定会保守一些）：${(e as Error).message.slice(0, 80)}`);
+    }
+
+    let statsUpdated = 0;
+    const today = fmtLocal().slice(0, 10);
+
+    /* ---- ②' 自愈：名单里看得到的稿件，撤掉历史上「已不存在」的误标记 ----
+       为什么必须有这一步：误判一旦落账（archiveGoneAt + 一条 gone 记录），**没有任何代码会撤销它** ——
+       稿件后来正常上线了，切片库仍然一直标红（2026-10-17 那批 13 个就是这么来的）。 */
+    let healed = 0;
+    if (listOk) {
+      for (const t of this.ledger.listTasks({ limit: 500 })) {
+        for (const c of this.ledger.getClips(t.id)) {
+          if (!c.bvid || !c.archiveGoneAt || !listedMap.has(c.bvid)) continue;
+          this.ledger.setClipStatus(t.id, c.index, 'PUBLISHED', {}, { unset: ['archiveGoneAt'] as Array<keyof typeof c> });
+          this.ledger.recordPerformance({
+            bvid: c.bvid,
+            taskId: t.id,
+            clipIndex: c.index,
+            date: today,
+            gone: false,
+            ...(c.title ? { title: c.title } : {}),
+            ...(typeof c.score === 'number' ? { score: c.score } : {}),
+          });
+          healed++;
+          this.logger.info(`自愈：切片 #${c.index}「${c.title}」的稿件 ${c.bvid} 仍在稿件列表里 —— 已撤销「稿件已不存在」的误标记`, {
+            taskId: t.id,
+            mod: 'ledger',
+            data: { clipIndex: c.index, bvid: c.bvid },
+          });
+        }
+      }
+      if (healed) notes.push(`已撤销 ${healed} 个切片的「稿件已不存在」误标记（名单里能看到它们）`);
+    }
+
+    /* ---- ②'' 用投稿日志给「bvid 已被清除过」的切片收尾 —— 两个方向，证据同源 ----
+       清除步骤会把 bvid 一起抹掉，但 publish-log 里留着当初 confirm 的证据。按证据分两种收尾：
+         a) 稿件**仍在稿件列表里** ⇒ 复原（撤销误清除，把 bvid 补回去）；
+         b) 稿件**不在稿件列表里** ⇒ 确认它确实没了 ⇒ 撤掉「稿件已不存在」红标 + 回退为待投（可重投）。
+       b) 是 2026-10-17 那批事故的收尾：那一轮「清除」抹了 bvid 却没抹 archiveGoneAt，
+       于是切片既没有稿件、又永远挂着红标 —— 界面上没有任何入口能把它弄干净。 */
+    let restored = 0;
+    /* 本轮清除计数被两处共用（④ 的 gone 步骤 + 下面的「确认不存在」步骤）：
+       稿件字段都清空了，红标就不该留着 —— 两处必须写同一套 unset，否则又会留下上面那种哑状态。 */
+    let clearedByGone = 0;
+    let clearedByEvidence = 0;
+    const clearedTasks = new Set<string>();
+    if (listOk) {
+      /* 注意：这里**不再**按「bvid 在列表里」过滤 —— 两个方向都要用同一份证据，
+         方向判断推迟到下面命中时再做（「在列表里」优先，复原的语义更强）。 */
+      const confirmByClip = new Map<string, { bvid: string; title: string }>();
+      for (const row of this.ledger.readPublishLog({ limit: 5000 })) {
+        if (String(row['action'] ?? '') !== 'confirm') continue;
+        const bvid = String(row['bvid'] ?? '').trim();
+        const taskId = String(row['taskId'] ?? '').trim();
+        const idx = Number(row['clipIndex']);
+        if (!bvid || !taskId || !Number.isFinite(idx)) continue;
+        const key = `${taskId}#${idx}`;
+        const prev = confirmByClip.get(key);
+        /* 同一个 `${taskId}#${clipIndex}` 可能有多条 confirm（重投过）：以最后一条为准，
+           但**不要让一条"看不到"的记录覆盖掉"仍在列表里"的记录** —— 复原优先。 */
+        if (!prev || listedMap.has(bvid) || !listedMap.has(prev.bvid)) {
+          confirmByClip.set(key, { bvid, title: String(row['title'] ?? '') });
+        }
+      }
+      if (confirmByClip.size) {
+        const claimed = new Set<string>();
+        for (const t of this.ledger.listTasks({ limit: 500 })) {
+          for (const c of this.ledger.getClips(t.id)) if (c.bvid) claimed.add(c.bvid);
+        }
+        for (const t of this.ledger.listTasks({ limit: 500 })) {
+          for (const c of this.ledger.getClips(t.id)) {
+            if (c.bvid) continue;
+            if (c.status !== 'CANDIDATE' && c.status !== 'SUBMITTED') continue;
+            const hit = confirmByClip.get(`${t.id}#${c.index}`);
+            if (!hit) continue;
+            /* 标题也必须对上：同一个 taskId#clipIndex 在不同轮次可能指**不同的内容**
+               （重切之后候选全换），只按位置复原会把旧 bvid 贴到新片上 —— 宁可不动。 */
+            const a = normalizeTitleForMatch(hit.title);
+            const b = normalizeTitleForMatch(c.title);
+            if (!a || !b || a !== b) continue;
+            if (listedMap.has(hit.bvid)) {
+              /* ---- 方向 a：稿件还在列表里 ⇒ 复原 ---- */
+              if (claimed.has(hit.bvid)) continue;
+              this.ledger.setClipStatus(t.id, c.index, 'PUBLISHED', { bvid: hit.bvid, publishedAt: nowIso() } as never);
+              claimed.add(hit.bvid);
+              restored++;
+              this.logger.warn(`复原：切片 #${c.index}「${c.title}」的稿件信息曾被误清除，已按投稿日志补回 ${hit.bvid}（该稿件在 B站 上仍存在，勿重投）`, {
+                taskId: t.id,
+                mod: 'ledger',
+                data: { clipIndex: c.index, bvid: hit.bvid },
+              });
+              continue;
+            }
+            /* ---- 方向 b：confirm 过、但稿件列表里确实没有 ⇒ 确认已不存在，收掉红标 ----
+               保守起见只处理「本来就被判过 gone（archiveGoneAt 还在）」的切片：
+               没有这个标记的，说明它的 bvid 是被别的原因清掉的，不在这里越权处理。
+               同样不碰墓碑拦截的切片（与 ④ 同一口径：它们有自己的解除入口）。 */
+            if (!c.archiveGoneAt) continue;
+            if (c.blockedByTombstone) continue;
+            this.ledger.clearFingerprintsFor([{ taskId: t.id, clipIndex: c.index }]);
+            this.ledger.setClipStatus(t.id, c.index, 'CANDIDATE', {}, {
+              unset: ['archiveGoneAt', 'bvid', 'publishedAt', 'dtime', 'submitTime', 'uploadTaskId'] as Array<keyof ClipRecord>,
+            });
+            clearedByEvidence++;
+            clearedTasks.add(t.id);
+            this.logger.info('确认稿件 ' + hit.bvid + ' 已不存在 → 已清除「稿件已不存在」红标并回退为待投（可重投）', {
+              taskId: t.id,
+              mod: 'ledger',
+              data: { clipIndex: c.index, bvid: hit.bvid, title: c.title },
+            });
+          }
+        }
+      }
+      if (restored) notes.push(`已复原 ${restored} 个被误清除的稿件记录（按投稿日志 + B站 现状核对）`);
+    }
+
+    let firstDetail = true;
+    for (const [bvid, meta] of byBvid) {
+      /* 节奏与墓碑核对一致（150ms）：手动点一次也可能有几十个稿件，宁可慢一点也别给 B站 上强度 */
+      if (!firstDetail) await new Promise((r) => setTimeout(r, RECONCILE_PACE_MS));
+      firstDetail = false;
+      try {
+        const detail = await this.client.biliArchiveDetail(bvid, { retry: 0, tag: 'clip-lib' });
+        const view = ((detail as { View?: unknown }).View ?? detail) as {
+          title?: string;
+          stat?: Record<string, number | undefined>;
+          videos?: number;
+          pubdate?: number;
+          ctime?: number;
+        };
+        const stat = view.stat ?? {};
+        const pubRaw = view.pubdate ?? view.ctime;
+        this.ledger.recordPerformance({
+          bvid,
+          taskId: meta.taskId,
+          clipIndex: meta.clipIndex,
+          date: today,
+          view: stat['view'] ?? 0,
+          like: stat['like'] ?? 0,
+          coin: stat['coin'] ?? 0,
+          favorite: stat['favorite'] ?? 0,
+          danmaku: stat['danmaku'] ?? 0,
+          reply: stat['reply'] ?? 0,
+          share: stat['share'] ?? 0,
+          ...(view.title !== undefined ? { title: view.title } : {}),
+          ...(meta.score !== undefined ? { score: meta.score } : {}),
+          ...(typeof view.videos === 'number' ? { parts: view.videos } : {}),
+          ...(typeof pubRaw === 'number' && pubRaw > 0 ? { pubdate: pubRaw } : {}),
+        });
+        statsUpdated++;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (isArchiveGoneError(msg)) {
+          const metaListed = listOk ? listedMap.get(bvid) : undefined;
+          if (isStrongArchiveGoneError(msg) && listOk && listComplete && !metaListed) {
+            /* 列表取全了也没有它 + 详情强证据报「不可见」⇒ 确实没了（用户删稿 / 下架）。
+               标记后切片库与表现页都会显示「稿件已不存在」，且当天不再反复拉它。 */
+            this.markPerformanceGone(
+              { bvid, taskId: meta.taskId, clipIndex: meta.clipIndex, title: meta.title, ...(meta.score !== undefined ? { score: meta.score } : {}) },
+              today,
+              '已不在稿件列表（被删或下架）',
+            );
+            gone.push(bvid);
+          } else if (metaListed && typeof metaListed.state === 'number' && metaListed.state !== 0) {
+            /* 列表里在、但锁定/审核中：B站 侧不公开就取不到统计，如实标注，绝不写 0 冒充数据 */
+            unavailable.push(bvid);
+            notes.push(`稿件 ${bvid} 在稿件列表里但状态非公开（state=${metaListed.state}），统计取不到`);
+          } else {
+            /* 弱证据（「啥都木有」等：可能是审核中/仅自己可见/接口异常）或列表没取全 ⇒ 不删标记、不当已删除 */
+            failed.push({ bvid, error: `详情取不到（${msg.slice(0, 60)}），证据不足未标记` });
+          }
+        } else {
+          failed.push({ bvid, error: msg.slice(0, 80) });
+        }
+      }
+    }
+
+    /* ---- ④ 清除「稿件已不存在」的切片（2026-10-17 用户口径：「不管定时的，只要看不到就清除」）----
+       清除 = 回退为待投（CANDIDATE，保留切片产物供重投时复用）+ 清稿件字段 + **删幂等指纹（不立碑）**。
+       指纹必须一起清：留着的话，「重新切片与投稿」的幂等 1 会命中并把切片恢复成 PUBLISHED，
+       清除就成了空操作；转成墓碑（deleteClip 的惯例）同样拦重投，也不符合本语义。
+       ⚠️ 这一步**主动打开了重复投稿的口子**：gone 判定虽是强证据（详情「不可见」+ 稿件列表取全仍无它），
+       但 B站 对定时稿件的处理（到点后先审核、审核前列表与详情都不可见）同样满足这两条 ——
+       用户已明确接受：这类片清掉后若重投产生双份，由用户到创作中心自行处理。
+       墓碑拦截的切片不越权（blockedByTombstone）：它们有自己的解除入口。
+       archiveGoneAt 必须一起 unset：稿件信息都清空了，红标再留着就是「既没有稿件、又永远标红」
+       的哑状态（2026-10-17 那两条就是这么来的）—— 清干净才能重投。 */
+    if (gone.length) {
+      const goneSet = new Set(gone);
+      for (const t of this.ledger.listTasks({ limit: 500 })) {
+        for (const c of this.ledger.getClips(t.id)) {
+          if (!c.bvid || !goneSet.has(c.bvid)) continue;
+          if (c.blockedByTombstone) continue;
+          this.ledger.clearFingerprintsFor([{ taskId: t.id, clipIndex: c.index }]);
+          this.ledger.setClipStatus(t.id, c.index, 'CANDIDATE', {}, {
+            unset: ['archiveGoneAt', 'bvid', 'publishedAt', 'dtime', 'submitTime', 'uploadTaskId'] as Array<keyof ClipRecord>,
+          });
+          clearedByGone++;
+          clearedTasks.add(t.id);
+          this.logger.info(
+            `对账清除：切片 #${c.index}「${c.title}」的稿件 ${c.bvid} 已不在 B站 —— 已回退为待投` +
+              `（切片产物保留，重投时直接复用；幂等指纹已一并清除，可以重新投稿）`,
+            { taskId: t.id, mod: 'ledger', data: { clipIndex: c.index, bvid: c.bvid } },
+          );
+        }
+      }
+    }
+    /* 清除总数：本轮对账判定的 + 投稿日志确认此前已不存在的（②'' 方向 b）。
+       两条来源都要过同一套「任务级状态回退」，否则任务卡片会顶着「已发布」却一片没发出去。 */
+    const cleared = clearedByGone + clearedByEvidence;
+    if (cleared) {
+      const breakdown =
+        clearedByEvidence > 0 ? `；其中 ${clearedByGone} 个由本轮对账判定、${clearedByEvidence} 个由投稿日志确认此前已不存在` : '';
+      notes.push(`已清除 ${cleared} 个切片的稿件信息（回退为待投、指纹已清，可重投${breakdown}）`);
+      /* 任务级状态跟着回退：切片全被清掉的任务还顶着「已发布」，与列表数字自相矛盾
+         （实测：清除后 pub=0 但 status=PUBLISHED）。回退成 CLIPPED —— 任务卡片显示
+         「已切片 · 待发布」，与「重新切片与投稿」的入口语义正好衔接。 */
+      for (const tid of clearedTasks) {
+        const tNow = this.ledger.getTask(tid);
+        const clips = this.ledger.getClips(tid);
+        if (tNow?.status === 'PUBLISHED' && clips.length > 0 && clips.every((c) => c.status !== 'PUBLISHED' && c.status !== 'SUBMITTED')) {
+          this.ledger.setStatus(tid, 'CLIPPED', { stage: 'CLIPPED' });
+          notes.push(`任务 ${tNow.title || tid} 的切片已全部清除，任务状态回退为「已切片 · 待发布」`);
+        }
+      }
+    }
+
+    notes.unshift(
+      `切片库对账：核对 ${byBvid.size} 个稿件 —— 新确认落地 ${confirmed} 个切片、更新统计 ${statsUpdated} 个稿件` +
+        `、已不在 B站 ${gone.length} 个${unavailable.length ? `、锁定/审核中 ${unavailable.length} 个` : ''}` +
+        `${pendingRelease ? `、未到定时发布时间 ${pendingRelease} 个（本轮不判存亡）` : ''}` +
+        `${healed ? `、撤销误标 ${healed} 个` : ''}${restored ? `、复原稿件 ${restored} 个` : ''}` +
+        `${cleared ? `、清除回退待投 ${cleared} 个` : ''}` +
+        `${failed.length ? `、没查清 ${failed.length} 个` : ''}` +
+        (listOk ? `（我的稿件 ${listedMap.size} 个${listComplete ? '，列表已取全' : '，⚠ 列表可能被截断'}）` : '（⚠ 稿件列表没取到）'),
+    );
+    this.logger.info(notes[0]!, {
+      mod: 'ledger',
+      data: { checked: byBvid.size, confirmed, gone: gone.length, cleared, statsUpdated, pendingRelease, healed, restored },
+    });
+    return { checked: byBvid.size, confirmed, gone, unavailable, cleared, statsUpdated, failed, notes, pendingRelease, healed, restored };
   }
 
   /** 「提交很久了、B站 侧始终没出现」的切片告警（5 分钟一轮与手动刷新共用，口径只此一处） */
@@ -3642,12 +4168,17 @@ export class Orchestrator {
     const PAGE_SIZE = 100;
     let listed: Array<{ bvid: string; title?: string; ctime?: number; state?: number; stateDesc?: string }> = [];
     let listOk = false;
-    /* ★ 列表拿满了（返回条数 == 页大小）说明后面还有页 —— 这时**不能**用"列表里没有"推断"稿件没了"：
-       稿件数超过 100 时，第 101 个往后的稿件每次都会被误判成"已删"并写进台账。 */
+    /* ★ 列表没拿满时**不能**用"列表里没有"推断"稿件没了"。
+       2026-10-17 事故：单页请求被服务端静默降级（100 → 10 条），旧判据「返回条数 < 页大小」
+       恒为真，61 个稿件只看得见 10 个 —— 16 个 bvid 被误标 `gone:true` 永久停拉表现数据。
+       现在按 count 循环翻页取全（fetchAllArchivePages），没拿全就如实报 complete=false。 */
     let listComplete = false;
     try {
-      const archives = await this.client.biliArchives({ page: 1, pageSize: PAGE_SIZE });
-      listed = archives
+      const all = await fetchAllArchivePages({
+        fetchPage: (page) => this.client.biliArchivesPage({ page, pageSize: PAGE_SIZE }),
+        pageSize: PAGE_SIZE,
+      });
+      listed = all.items
         .map((a) => ({
           bvid: String(a.bvid ?? '').trim(),
           ...(typeof a.title === 'string' ? { title: a.title } : {}),
@@ -3657,7 +4188,8 @@ export class Orchestrator {
         }))
         .filter((a) => a.bvid.length > 0);
       listOk = true;
-      listComplete = archives.length < PAGE_SIZE;
+      listComplete = all.complete;
+      for (const n of all.notes) notes.push(n);
     } catch (e) {
       notes.push(`读取我的稿件列表失败（只影响「完整版稿件」的枚举与稿件状态判定）：${(e as Error).message.slice(0, 80)}`);
     }
@@ -3784,6 +4316,20 @@ export class Orchestrator {
     today: string,
     reason: string,
   ): void {
+    /* 定时稿未到点 ⇒ 拒绝判定。B站 对定时发布的稿件在到点前列表/详情都查不到，
+       与「真被删了」完全同形；2026-10-17 21:56 就是这样把一批 dtime=22:42 的稿件判成 gone 的。
+       两个入口（表现回流 / 切片库对账）都从这里落账，所以守在这一层最省心。 */
+    if (item.taskId && item.clipIndex !== undefined) {
+      const clip = this.ledger.getClips(item.taskId).find((c) => c.index === item.clipIndex);
+      if (clip && isAwaitingRelease(clip)) {
+        this.logger.info(`稿件 ${item.bvid} 仍在定时发布窗口内（dtime 未到），本轮不判存亡`, {
+          taskId: item.taskId,
+          mod: 'ledger',
+          data: { clipIndex: item.clipIndex, dtime: clip.dtime },
+        });
+        return;
+      }
+    }
     this.ledger.recordPerformance({
       bvid: item.bvid,
       ...(item.taskId !== undefined ? { taskId: item.taskId } : {}),
@@ -4137,7 +4683,18 @@ export class Orchestrator {
    * 健康快照（§8 WP7 健康面板）
    * ---------------------------------------------------------------------- */
 
-  async health(): Promise<{
+  /**
+   * health() 的短缓存（P2）。
+   *
+   * health() 要跑一圈**磁盘与日志统计**：`storageOverview()` 会对最多 1000 个任务的
+   * 每个源文件做 statSync、`todayPublishedCount()` 读投稿日志、`errorCountLastHours()`
+   * 读错误事件流；而监控面板每 5 秒刷一次 —— 每次都重算同一批东西是纯浪费。
+   * TTL 与面板轮询周期对齐（5 秒），"队列/账号"这类快速变化的字段最多滞后一个刷新周期，
+   * 与界面本身的节奏一致。需要"此刻真值"的调用方传 `{ fresh: true }`。
+   */
+  private healthCache?: { at: number; data: Awaited<ReturnType<Orchestrator['health']>> };
+
+  async health(opts: { fresh?: boolean } = {}): Promise<{
     bililive: { ok: boolean; version?: string; expected: string; drift: boolean; baseUrl: string; message: string };
     account?: { uid: number | string; name?: string; daysLeft?: number; expired: boolean; message: string };
     disk?: { freeGB: number; totalGB: number; thresholdGB: number; low: boolean };
@@ -4152,6 +4709,15 @@ export class Orchestrator {
     version: string;
     uptimeSec: number;
     /**
+     * 本进程 pid。
+     *
+     * 为什么要暴露：热更新监督进程（[src/hot-watch.ts](src/hot-watch.ts)）重载后要确认
+     * "端口上应答的就是我刚拉起的那个子进程"。只看 `/api/bootstrap` 返回 200 是不够的 ——
+     * 端口被**别的进程**（例如上次遗留的孤儿服务）占着时，新子进程会 bind 失败但仍存活
+     * （cli.ts 里 Web UI 启动失败只记日志、继续跑），探测会拿到孤儿的 200 而误判"就绪"。
+     */
+    pid: number;
+    /**
      * 进程内存快照（MB）。
      *
      * 为什么要暴露它：2026-10-07 01:17:03 服务**崩过一次**，stderr 里是
@@ -4161,9 +4727,17 @@ export class Orchestrator {
      * ③ 启动参数带 `--report-on-fatalerror`，下次真的 OOM 会在 data/logs 留下诊断报告。
      */
     memory: { rssMB: number; heapUsedMB: number; heapTotalMB: number; heapLimitMB: number; externalMB: number };
+    /**
+     * 构建指纹（2026-10-25）：`id` 是**本进程启动时**算出的代码摘要（永远不变，
+     * 代表"你正在跑的那份代码"）；`diskId` 是现在磁盘上的；`stale` 为 true 表示
+     * 代码已改但没重启 —— 界面据此标红提醒，避免"修复落盘了却以为生效"。
+     */
+    build: { id: string; at: number; stale: boolean; diskId: string; note: string };
     mode: { autoPublish: boolean; isOnlySelf: boolean; dryRun: boolean; allowPaid: boolean };
     prompts: ReturnType<PromptStore['list']>;
   }> {
+    const cached = this.healthCache;
+    if (!opts.fresh && cached && Date.now() - cached.at < HEALTH_CACHE_MS) return cached.data;
     const cfg = this.config;
     const mem = process.memoryUsage();
     const out: Awaited<ReturnType<Orchestrator['health']>> = {
@@ -4176,7 +4750,13 @@ export class Orchestrator {
       trigger: this.trigger.stateSnapshot(),
       tombstones: this.ledger.tombstoneCount(),
       version: APP_VERSION,
+      /* 构建指纹：`id` 是"正在跑的代码"，`stale` 表示磁盘上已经更新但没重启 */
+      build: (() => {
+        const b = this.buildInfo.status();
+        return { id: b.running.id, at: b.running.latestMtimeMs, stale: b.stale, diskId: b.disk.id, note: b.note };
+      })(),
       uptimeSec: Math.round((Date.now() - Date.parse(this.bootedAt)) / 1000),
+      pid: process.pid,
       memory: {
         rssMB: Math.round(mem.rss / 1048576),
         heapUsedMB: Math.round(mem.heapUsed / 1048576),
@@ -4249,6 +4829,7 @@ export class Orchestrator {
       /* ignore */
     }
     void ERRORS_PATH;
+    this.healthCache = { at: Date.now(), data: out };
     return out;
   }
 
@@ -4273,6 +4854,28 @@ export const APP_VERSION = '1.0.0';
  * 用户看到的现象就是"切片助手在反复重启"。3 次之后停手并留警告。
  */
 const MAX_AUTO_RESUME = 3;
+
+/**
+ * 定时发布的稿件**还没到点**吗？
+ *
+ * 为什么必须单独判：B站 对「定时发布」的稿件，在到点前**稿件列表与详情接口都查不到**
+ * —— 与「真的被删了」在接口层面完全同形。2026-10-17 21:56 的对账就栽在这里：
+ * 一批 `dtime=22:42` 的稿件被判「已不存在」，13 个切片被标红、2 个连 bvid 都被清掉了；
+ * 22:42 一到它们全部正常上线（现在查得到、有播放量）。
+ *
+ * 留 60 秒余量：对账与 B站 侧的发布存在秒级偏差，刚过点那一瞬也可能还没出现在列表里。
+ */
+function isAwaitingRelease(clip: { dtime?: number }): boolean {
+  const at = Number(clip.dtime);
+  return Number.isFinite(at) && at > 0 && at * 1000 + 60_000 > Date.now();
+}
+
+/**
+ * health() 短缓存的 TTL（毫秒）。
+ * 与监控面板的 5 秒轮询对齐：不会因为缓存让"队列/账号"这类字段比界面本身还旧，
+ * 但把一轮磁盘/日志统计摊到多个刷新周期上（P2）。
+ */
+const HEALTH_CACHE_MS = 5000;
 
 /** 带阶段信息的错误，用于精确定位失败阶段 */
 export class StageError extends Error {

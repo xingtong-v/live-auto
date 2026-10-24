@@ -60,11 +60,21 @@ export class Logger {
   private dir: string;
   private maxBytes: number;
   private keepDays: number;
-  /** 当前写入的文件日期，跨天自动换文件 */
-  private currentDate = '';
+  /** 当前写入文件所属的逻辑日（YYYY-MM-DD）；跨天时重置 */
+  private dayKey = '';
+  /** 当日文件序号：0 = 日期名文件；>0 = 轮转出来的 `-partN` 文件 */
+  private partSeq = 0;
   private stream: fs.WriteStream | null = null;
   /** 上次"日志写盘失败"告警时刻（用于抑制刷屏） */
   private lastStreamErrorAt = 0;
+  /**
+   * 当前日志文件已写入的字节数（内存计数）。
+   *
+   * 为什么不用 `statSync` 现查：那是**每条日志一次同步系统调用** —— 本项目日志量大
+   * （轮询结果、进度上报、清理），Windows 上单次 stat 成本更高，事件循环被切碎。
+   * 开流时取一次文件现有大小，之后按写入长度累加即可（同一文件只有本进程在写）。
+   */
+  private writtenBytes = 0;
 
   constructor(opts: LoggerOptions = {}) {
     this.level = opts.level ?? 'info';
@@ -95,45 +105,67 @@ export class Logger {
     if (dir === this.dir) return;
     this.dir = dir;
     this.stream = null; // 让下一次写入按新目录重新建流
-    this.currentDate = '';
+    this.dayKey = '';
+    this.partSeq = 0;
+    this.writtenBytes = 0;
   }
 
   setConsole(enabled: boolean): void {
     this.useConsole = enabled;
   }
 
+  private dateKey(date = new Date()): string {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  }
+
   private filePath(date = new Date()): string {
-    const d = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-    return path.join(this.dir, `live_auto-${d}.jsonl`);
+    return path.join(this.dir, `live_auto-${this.dateKey(date)}.jsonl`);
+  }
+
+  /** 轮转文件名。仍以 `live_auto-` 开头 —— pruneOld() 与日志接口都按这个前缀匹配 */
+  private rotatedPath(seq: number): string {
+    return path.join(this.dir, `live_auto-${this.dayKey}-part${seq}.jsonl`);
   }
 
   /** 懒打开写入流；跨天或超限时轮转 */
   private getStream(): fs.WriteStream | null {
     if (!this.useFile) return null;
     try {
-      const today = this.filePath();
-      if (this.stream && this.currentDate === today) {
-        // 大小轮转：超限时改名并重开
-        try {
-          const st = fs.statSync(today);
-          if (st.size > this.maxBytes) {
-            this.stream.end();
-            const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-            fs.renameSync(today, path.join(this.dir, `live_auto-${stamp}.jsonl`));
-            this.stream = null;
-          } else {
-            return this.stream;
-          }
-        } catch {
-          return this.stream;
+      const todayKey = this.dateKey();
+      if (this.dayKey !== todayKey) {
+        // 跨天：关掉昨天的流，从「日期名 + 序号 0」重新开始
+        if (this.stream) {
+          this.stream.end();
+          this.stream = null;
         }
-      }
-      if (this.stream && this.currentDate !== today) {
+        this.dayKey = todayKey;
+        this.partSeq = 0;
+        this.writtenBytes = 0;
+      } else if (this.stream) {
+        // 大小轮转。判据是**内存计数**（不再每行 statSync），方式是**切到新文件**：
+        // 旧文件原样保留、不 rename —— Windows 上对刚 end() 的句柄 rename 必然 EPERM
+        // （实测），旧实现因此"每行 stat 一次却从未真正轮转过"。切名字没有句柄冲突。
+        if (this.writtenBytes <= this.maxBytes) return this.stream;
         this.stream.end();
         this.stream = null;
+        this.partSeq += 1;
+        this.writtenBytes = 0;
       }
+
       ensureDir(this.dir);
-      const stream = fs.createWriteStream(today, { flags: 'a' });
+      let target = this.partSeq === 0 ? this.filePath() : this.rotatedPath(this.partSeq);
+      // 开流前取一次现有大小作为计数起点（此路径很稀少：首次 / 跨天 / 轮转 / 换目录）。
+      // 必须在 createWriteStream 之前 stat —— 流是异步打开的，之后文件可能还不存在。
+      this.writtenBytes = this.sizeOf(target);
+      // 目标文件已经超限（上次运行留下的，或轮转序号被占用）：直接跳到下一个，
+      // 免得"再写一行才轮转"。
+      while (this.writtenBytes > this.maxBytes) {
+        this.partSeq += 1;
+        target = this.rotatedPath(this.partSeq);
+        this.writtenBytes = this.sizeOf(target);
+      }
+
+      const stream = fs.createWriteStream(target, { flags: 'a' });
       /* ★ 必须挂 error 处理器。没有它时，异步写失败（目录被删掉、磁盘满、权限变化）
          会以**未捕获的 'error' 事件**形式抛出来，直接带走整个进程 ——
          而抛出者居然是"日志"。实测踩过两次：端到端测试删掉临时目录后（ENOENT），
@@ -141,13 +173,20 @@ export class Logger {
          正在投稿的服务干掉是大事。 */
       stream.on('error', (e: Error) => this.onStreamError(e));
       this.stream = stream;
-      this.currentDate = today;
       this.pruneOld();
       return this.stream;
     } catch {
       // 磁盘满 / IO 拥塞时不得让日志把业务拖死
       this.useFile = false;
       return null;
+    }
+  }
+
+  private sizeOf(p: string): number {
+    try {
+      return fs.statSync(p).size;
+    } catch {
+      return 0;
     }
   }
 
@@ -164,7 +203,7 @@ export class Logger {
       /* ignore */
     }
     this.stream = null;
-    this.currentDate = '';
+    // 不改 dayKey/partSeq：下一条日志会重开同一个文件（打开时按实际大小重算计数）
     const now = Date.now();
     if (now - this.lastStreamErrorAt > 60_000) {
       this.lastStreamErrorAt = now;
@@ -195,7 +234,9 @@ export class Logger {
     const stream = this.getStream();
     if (stream) {
       try {
-        stream.write(`${JSON.stringify(entry)}\n`);
+        const line = `${JSON.stringify(entry)}\n`;
+        stream.write(line);
+        this.writtenBytes += Buffer.byteLength(line);
       } catch {
         /* 忽略写盘异常 */
       }

@@ -129,6 +129,9 @@ function makeEnv(tmpRoot: string, opts: { resumeAid?: string } = {}): Env {
        其它状态决定"读不到分P 列表"时往哪边倒）。桩要给 `completed` —— 真实链路里
        biliUpload 返回后任务终态就是 completed，给不出状态会被判成「未确认」而不是 PUBLISHED。 */
     taskDetail: async (): Promise<unknown> => ({ status: 'completed' }),
+    /* ⚠️ 2026-10-17：`publishAsMultiPart` 开头要 `ensureAnchorUid`（按房间号查主播 UID），
+       桩缺这个方法会直接抛 TypeError（与本次改动无关，属既有桩的缺口 —— 补上才能跑到投稿逻辑）。 */
+    anchorInfoByRoom: async (): Promise<{ uid: string; name: string }> => ({ uid: '12345', name: '测试主播' }),
   };
 
   const publisher = new Publisher({

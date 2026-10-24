@@ -30,7 +30,7 @@ import { renderGlossaryForPrompt, type Glossary } from './glossary.ts';
 import { streamerPromptLine, type StreamerGuess } from './streamer.ts';
 import { LlmClient, LlmError, chatJsonBatch } from './llm.ts';
 import { densityFallbackClips, signalsToPromptText } from './danmaku.ts';
-import { ROOT_DIR, fmtDuration, nowIso, safeFileName, writeJsonAtomic } from './util.ts';
+import { ROOT_DIR, fmtDuration, maxOf, nowIso, safeFileName, writeJsonAtomic } from './util.ts';
 import { SPEECH_DB, energyProfileCached, findSpeechOffset, findSpeechOnset, type EnergyProfile } from './speech-energy.ts';
 import { log as globalLog, type Logger } from './logger.ts';
 
@@ -222,11 +222,14 @@ export function mapCategoryToTid(
 }
 
 /** 标签去重、截断、过滤敏感词，并保证 1–10 个（硬约束 #3 / #16） */
+/** 标签个数上限（B站规则，硬约束 #3） */
+export const TAG_LIMIT = 10;
+
 export function sanitizeTags(
   tags: string[],
   opts: { extra?: string[]; sensitive?: string[]; max?: number; maxLen?: number },
 ): { tags: string[]; removed: string[] } {
-  const max = opts.max ?? 10;
+  const max = opts.max ?? TAG_LIMIT;
   const maxLen = opts.maxLen ?? 12;
   const sensitive = (opts.sensitive ?? []).map((s) => s.toLowerCase());
   const removed: string[] = [];
@@ -262,6 +265,145 @@ export function sanitizeTags(
     out.push(t);
   }
   return { tags: out, removed };
+}
+
+/**
+ * 用配置里的「默认标签」给**已经清洗过**的标签补位：内容标签在前，默认词只填空位，封顶 `limit` 个。
+ *
+ * ★ 顺序是刻意的（2026-10-17 用户反馈「投稿的切片标签没有带上」之后定的）：
+ *   最早是「无条件前置追加」，实测 9/9 个候选标签完全一样、观众侧 SEO 零区分度，所以被回退成
+ *   「只兜底、不追加」；但那样用户配的词永远不会出现在切片稿件上，而设置面板写的偏偏是
+ *   「与 LLM 生成的标签合并」，两边对不上（用户就是照那句话来问的）。现在取中：
+ *   内容词一个都不会被挤掉，默认词按顺序补足到上限 —— 既带上了身份词，又不会让所有稿件标签变成同一串。
+ *
+ * 与 `sanitizeTags` 的分工：候选里的重复（大小写不敏感）/敏感词/纯数字**静默丢弃**，不产 warning，
+ * 否则每个片段都会刷一条「标签被移除（重复）」的噪音（这是当初回退的直接原因之一）。
+ */
+export function fillDefaultTags(
+  tags: string[],
+  defaults: string[],
+  sensitive: string[] = [],
+  limit: number = TAG_LIMIT,
+): string[] {
+  const slots = Math.max(0, limit - tags.length);
+  if (slots === 0 || defaults.length === 0) return tags;
+  const seen = new Set(tags.map((t) => t.toLowerCase()));
+  const candidates: string[] = [];
+  for (const raw of defaults) {
+    const t = String(raw).replace(/[#＃\s]/g, '');
+    if (!t || /^\d+$/.test(t)) continue;
+    const low = t.toLowerCase();
+    if (seen.has(low)) continue;
+    seen.add(low); // 候选之间也去重：`2D` / `2d` 只留先出现的那个
+    candidates.push(t);
+  }
+  const filled = sanitizeTags(candidates, { sensitive, max: slots }).tags;
+  return filled.length ? [...tags, ...filled] : tags;
+}
+
+/**
+ * 「必带标签」里的占位符：投稿时替换成**本场主播名**，例如 `乙主播`。
+ *
+ * 来自用户 2026-10-17 的规格：「必有的标签 虚拟主播、2D、3D、VTuber、vup，还有一个占位符
+ * 根据主播不同、标签为主播的 ID」。四个写法等价，随手写哪个都行。
+ */
+export const STREAMER_TAG_PLACEHOLDERS = ['{主播}', '{主播名}', '{主播昵称}', '{昵称}'] as const;
+
+/**
+ * 解析「必带标签」：替换 `{主播}` 占位符 → 本场主播名，并对必带标签自身静默去重（大小写不敏感）。
+ *
+ * 与 `sanitizeTags` 的分工：必带标签是**配置项**，里面写 `2D` / `2d` 属于正常写法，重复静默丢弃；
+ * 但「命中敏感词 / 纯数字 / 占位符没东西可换」都是**配置问题**，必须让用户看见 —— 收进 `skipped`，
+ * 由调用方汇总成一条 warning（不要逐片刷屏）。
+ */
+export function resolveIdentityTags(
+  identityTags: string[],
+  streamerName: string | undefined,
+  sensitive: string[] = [],
+  limit: number = TAG_LIMIT,
+): { tags: string[]; skipped: string[] } {
+  const name = String(streamerName ?? '').trim();
+  const skipped: string[] = [];
+  const expanded: string[] = [];
+  for (const raw of identityTags) {
+    const t = String(raw).replace(/[#＃]/g, '').trim();
+    if (!t) continue;
+    const holders = STREAMER_TAG_PLACEHOLDERS.filter((p) => t.includes(p));
+    if (holders.length === 0) {
+      expanded.push(t);
+      continue;
+    }
+    if (!name) {
+      // 占位符换不出东西时**整条丢掉**，不要把 `{主播}` 原样投成标签
+      skipped.push(`${t}（本场没识别出主播名）`);
+      continue;
+    }
+    let replaced = t;
+    for (const p of holders) replaced = replaced.split(p).join(name);
+    expanded.push(replaced);
+  }
+
+  const sensitiveLower = sensitive.map((s) => s.toLowerCase());
+  const seen = new Set<string>();
+  const tags: string[] = [];
+  for (const raw of expanded) {
+    let t = raw.replace(/\s+/g, '');
+    if (!t) continue;
+    // 与 sanitizeTags 的默认 maxLen 保持一致（B站单标签长度口径未单独验证过，沿用既有实现）
+    if (t.length > 12) t = t.slice(0, 12);
+    const low = t.toLowerCase();
+    if (sensitiveLower.some((s) => s && low.includes(s))) {
+      skipped.push(`${t}（命中敏感词）`);
+      continue;
+    }
+    if (/^\d+$/.test(t)) {
+      skipped.push(`${t}（纯数字，B站不收）`);
+      continue;
+    }
+    if (seen.has(low)) continue; // 必带标签之间的重复：静默
+    if (tags.length >= limit) {
+      skipped.push(`${t}（必带标签超过 ${limit} 个上限）`);
+      continue;
+    }
+    seen.add(low);
+    tags.push(t);
+  }
+  return { tags, skipped };
+}
+
+/**
+ * 合并「必带标签」与内容词：必带在前且**优先占位**，内容词按顺序补满剩余名额，大小写不敏感去重。
+ *
+ * 与 `fillDefaultTags` 的差别是**谁被挤掉**：默认标签只填空位、内容词优先；必带标签反过来 ——
+ * 用户 2026-10-17 的规格是「必有的标签 …，其他的为 LLM 生成的，还要有去重」，所以内容词超上限时
+ * 会被丢弃，收进 `dropped` 让调用方**每个任务汇总一条** warning（逐片刷屏是当初回退的直接原因）。
+ * 内容词与必带词重复（LLM 很爱写「虚拟主播」）静默丢弃 —— 那是预期内的。
+ */
+export function mergeIdentityTags(
+  identity: string[],
+  content: string[],
+  limit: number = TAG_LIMIT,
+): { tags: string[]; dropped: string[] } {
+  const seen = new Set<string>();
+  const tags: string[] = [];
+  const dropped: string[] = [];
+  for (const t of identity) {
+    const low = t.toLowerCase();
+    if (seen.has(low)) continue;
+    seen.add(low);
+    tags.push(t);
+  }
+  for (const t of content) {
+    const low = t.toLowerCase();
+    if (seen.has(low)) continue;
+    if (tags.length >= limit) {
+      dropped.push(t);
+      continue;
+    }
+    seen.add(low);
+    tags.push(t);
+  }
+  return { tags, dropped };
 }
 
 /** 标题后处理：去换行、去多余空白、截断到 80 字符 */
@@ -510,6 +652,13 @@ export function sanitizeClips(
     defaultTags: string[];
     tagSensitiveWords: string[];
     extraTags?: string[];
+    /**
+     * **必带标签**（配置 `publish.identityTags`）：永远排在标签最前，占位优先。
+     * 支持 `{主播}` 占位符 → 本场主播名（见 `resolveIdentityTags`）。不传 = 旧行为。
+     */
+    identityTags?: string[];
+    /** 本场主播名（用于替换必带标签里的 `{主播}` 占位符）。 */
+    streamerName?: string;
     autoSelectScoreFloor: number;
     /** 默认勾选项数上限（按评分降序取头部）。见 config 里 autoSelectTopN 的说明。 */
     autoSelectTopN: number;
@@ -555,6 +704,13 @@ export function sanitizeClips(
   const dropped: SanitizeReport['dropped'] = [];
   const warnings: string[] = [];
   const kept: ClipRecord[] = [];
+  /* ★ 必带标签（配置项，2026-10-17 用户规格）：先整批解析一次 —— 占位符替换 + 静默去重，
+     配置本身的问题（`{主播}` 换不出名字 / 命中敏感词）这里汇总成一条 warning，不逐片刷。 */
+  const identity = resolveIdentityTags(opts.identityTags ?? [], opts.streamerName, opts.tagSensitiveWords);
+  if (identity.skipped.length) warnings.push(`必带标签跳过：${identity.skipped.join('、')}`);
+  /* 内容词被上限挤掉的片数/词数：循环结束后汇总一条，避免每片一条噪音 */
+  let overLimitClips = 0;
+  let overLimitWords = 0;
   // 按 start 升序（snap* 的搜索依赖有序），并剔除时间非法的段
   const segs = [...(opts.transcriptSegments ?? [])]
     .filter((s) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start)
@@ -729,23 +885,32 @@ export function sanitizeClips(
     const cat = mapCategoryToTid(c.category, opts.tidWhitelist, opts.defaultCategory);
     if (cat.note) warnings.push(cat.note);
 
-    // ★ 标签**只信 LLM 给的那几个**，绝不把 defaultTags 强制追加到每个切片上。
-    //   曾经写成 `extra: [...opts.defaultTags, ...extraTags]`，后果是每个候选都被塞进
-    //   同样的两个词（实测 9/9 个候选的标签完全一致），观众侧 SEO 零区分度，
-    //   而且每个切片都会刷一条「标签被移除：直播切片（重复）、名场面（重复）」的噪音警告
-    //   （LLM 本来就会学着写这两个词，于是必然重复）。
-    //   defaultTags 的定位改为**只在 LLM 一个标签都没给出时的兜底**，见下面 tags.length === 0 分支。
-    //   extraTags 是 UI「本场设置」的手动覆盖，属于人工显式意图，保留追加语义。
+    // ★ 标签三层（2026-10-17 用户明确规格后定的最终口径）：
+    //   ① 必带标签（`identityTags`，含 `{主播}` 占位符 → 本场主播名）：永远在最前，**占位优先**；
+    //   ② 内容词（LLM 按内容生成 + 本场 extraTags 手改）：按顺序补满剩余名额，与①去重（大小写不敏感）；
+    //   ③ 默认标签（`defaultTags`）：①+② 都空时兜底，否则只补①+② 用不完的空位。
+    //   历史（三次反复，别再来回改）：无条件前置追加 → 只兜底 → 「内容词在前 + 默认词补位」→ 现在这条。
+    //   前两次的后果都实测过：所有稿件标签一模一样（9/9 候选完全一致）、用户配的词永远不上稿件
+    //   （设置面板那行提示却写着「合并」，2026-10-17 用户据此反馈「投稿的切片标签没有带上」）。
+    //   extraTags 是 UI「本场设置」的手动覆盖，属于人工显式意图，直接追加进内容词。
     const tagRes = sanitizeTags(c.tags, {
       ...(opts.extraTags?.length ? { extra: opts.extraTags } : {}),
       sensitive: opts.tagSensitiveWords,
     });
     if (tagRes.removed.length) warnings.push(`片段 ${i} 标签被移除：${tagRes.removed.join('、')}`);
-    let tags = tagRes.tags;
+    const merged = mergeIdentityTags(identity.tags, tagRes.tags, TAG_LIMIT);
+    if (merged.dropped.length) {
+      overLimitClips += 1;
+      overLimitWords += merged.dropped.length;
+    }
+    let tags = merged.tags;
     if (tags.length === 0) {
-      // 兜底：LLM 没给出任何可用标签时才动用 defaultTags
+      // 兜底：必带标签与 LLM 都没给出任何可用标签时才动用 defaultTags
       tags = sanitizeTags(opts.defaultTags.length ? opts.defaultTags : ['直播切片'], { sensitive: opts.tagSensitiveWords }).tags;
-      warnings.push(`片段 ${i} LLM 未给出可用标签，已用配置的默认标签兜底：${tags.join('、')}`);
+      warnings.push(`片段 ${i} 没有任何可用标签，已用配置的默认标签兜底：${tags.join('、')}`);
+    } else {
+      // ★ 剩下的空位交给默认标签补位（内容词在前，只填空位）—— 见 fillDefaultTags 的说明。
+      tags = fillDefaultTags(tags, opts.defaultTags, opts.tagSensitiveWords);
     }
 
     const coverTs =
@@ -789,6 +954,14 @@ export function sanitizeClips(
   kept.forEach((k, i) => {
     k.index = i;
   });
+
+  /* 必带标签优先的代价：内容词被上限挤掉。汇总成**一条**（逐片刷屏是当初回退标签方案的原因之一）。 */
+  if (overLimitClips > 0) {
+    warnings.push(
+      `有 ${overLimitClips} 个片段的标签超过 ${TAG_LIMIT} 个上限：必带标签（${identity.tags.join('、')}）优先，` +
+        `共丢弃 ${overLimitWords} 个内容词。想多留内容词就精简「必带标签」配置`,
+    );
+  }
 
   return { clips: kept, dropped, warnings };
 }
@@ -1212,6 +1385,23 @@ export class Analyzer {
     lines.push(`## 弹幕信号摘要（全场）`);
     lines.push(renderSignalsSummary(signals));
     lines.push('');
+    /* 标签口径（2026-10-17 用户规格之后加）：身份标签由系统固定带上并优先占位，
+       所以得让 LLM 别把名额浪费在这几个词上 —— 否则它写的 tags 会有一半在去重时被丢掉，
+       既浪费 prompt 预算，又让真正的内容词变少。 */
+    const identityForPrompt = resolveIdentityTags(
+      this.cfg.publish.identityTags,
+      opts.streamer?.name,
+      this.cfg.publish.tagSensitiveWords,
+    ).tags;
+    if (identityForPrompt.length) {
+      lines.push(`## 标签口径（重要）`);
+      lines.push(
+        `身份标签（${identityForPrompt.join('、')}）由系统自动带上并**排在最前面**，` +
+          `你**不要**在 tags 里再写这些词（写了会被去重丢掉，白占名额）。` +
+          `你的 tags 只给 3–4 个**内容向**短词：人名/梗/事件/地名/食物/游戏等，要具体、能被搜到、彼此不重复。`,
+      );
+      lines.push('');
+    }
     lines.push(`## 可选分区（白名单，写文字描述即可，不要写数字 ID）`);
     lines.push(Object.keys(this.cfg.publish.tidWhitelist).slice(0, 60).join('、'));
     return lines.join('\n');
@@ -1292,6 +1482,9 @@ export class Analyzer {
       defaultCategory: this.cfg.publish.defaultCategory,
       defaultTags: this.cfg.publish.defaultTags,
       tagSensitiveWords: this.cfg.publish.tagSensitiveWords,
+      // 必带标签（配置项）：永远在最前，支持 `{主播}` 占位符 → 本场主播名
+      identityTags: this.cfg.publish.identityTags,
+      ...(opts.streamer?.name ? { streamerName: opts.streamer.name } : {}),
       ...(opts.extraTags ? { extraTags: opts.extraTags } : {}),
       autoSelectScoreFloor: this.cfg.clip.autoSelectScoreFloor,
       autoSelectTopN: this.cfg.clip.autoSelectTopN,
@@ -1441,7 +1634,8 @@ export function speechDensityFallbackClips(
   if (segs.length === 0) return [];
 
   const windowSec = Math.max(5, opts.windowSec ?? 10);
-  const total = Math.max(...segs.map((s) => s.end), 0);
+  // 用 maxOf 而不是 Math.max(...)：分段数上万时展开会抛 RangeError，让整条降级路径失败（P6）
+  const total = maxOf(segs.map((s) => s.end), 0);
   if (total <= 0) return [];
 
   // 每个窗口内「说了多少字」（按时间占比折算，避免长句跨窗时被整段计入）
@@ -1463,7 +1657,7 @@ export function speechDensityFallbackClips(
   }
   if (buckets.size === 0) return [];
 
-  const maxChars = Math.max(...[...buckets.values()].map((v) => v.chars));
+  const maxChars = maxOf([...buckets.values()].map((v) => v.chars));
   if (maxChars <= 0) return [];
 
   // 按字符数降序取候选窗口

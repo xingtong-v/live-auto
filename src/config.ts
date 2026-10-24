@@ -30,6 +30,15 @@ export interface BililiveConfig {
 
 export interface RoomConfig {
   roomId: string;
+  /**
+   * 附加直播间（**不含** roomId 本身）。
+   *
+   * 为什么不是把 `roomId` 直接改成数组：它被十几处只读代码引用（启动日志、告警、自检、
+   * 导入默认值、CLI…），改类型会波及一片；而"要多覆盖几个房间"的真实需求只落在
+   * **开播触发 / 补漏对账的轮询范围**上 —— 那个口径统一由 `Trigger.resolveRoomIds()` 取并集，
+   * 所以主房间留原字段、其余放这里，改动面最小。
+   */
+  roomIds: string[];
   platform: string;
   pollIntervalSec: number;
   reconcileIntervalMin: number;
@@ -434,11 +443,79 @@ export interface ClipConfig {
 
 export type CoverSource = 'default' | 'preset' | 'fullVideo';
 
+/**
+ * **切片投稿去向**（用户级二选一开关，2026-10-16 用户要求）：
+ *
+ *   `'append'`     —— **追加切片投稿**：切片作为「同一个稿件」的分P。
+ *                     完整版由 biliLive-tools 投时，切片追加进**它那个稿件**（多分P 续传）；
+ *                     完整版由切片助手投时，切片与完整版/纯享版合成一个 2+N 稿件。
+ *   `'standalone'` —— **单独投稿**：每个切片各自一个稿件（各带自己的标题/简介/标签），
+ *                     不等 biliLive-tools 的完整版稿件、不追加进任何已有稿件。
+ *
+ * 与 `multiPart` 的关系：这个开关是**用户口径**，`multiPart` 是**实现口径**（多分P 机制）。
+ * 两者一一对应（append ⇔ multiPart=true），新建/保存配置时由界面同步写；手改 config.json
+ * 只写了一个时，以 `resolveClipPublishMode()` 为准（`clipPublishMode` 优先，见该函数）。
+ */
+export type ClipPublishMode = 'append' | 'standalone';
+
+/**
+ * dtime 距提交时刻的余量下限（秒）。
+ *
+ * **口径修正（2026-10-17）**：这里此前是 7200，且注释把它写成「B站硬限」——**那是错的**。
+ * B站投稿页的底线是「定时发布晚于当前 ≥5 分钟、且不晚于 15 天」；
+ * 7200 秒来自本项目任务书的「硬约束 #4」，性质是**防风控的自律措施**。
+ *
+ * 现在取 1200 = 平台底线 300 秒 + 900 秒余量：既满足平台规则，
+ * 首片也不必再干等 2 小时以上（1200 秒 = 20 分钟）。
+ * ⚠️ 它是「**下限**」而不是「必须等于」——想更保守就把 `publish.submitGapSec` 调大。
+ */
+export const DTIME_MIN_MARGIN_SEC = 1200;
+
 export interface PublishConfig {
   autoPublish: boolean;
   isOnlySelf: 0 | 1;
+  /**
+   * 首片发布余量（秒）：首片 dtime = 提交时刻 + 本值。
+   * **必须 ≥ 1200**（≥ `DTIME_MIN_MARGIN_SEC`）——那是**本项目**的硬约束 #4 自律下限，
+   * 不是平台规则：B站只要求 dtime 晚于当前 300 秒（投稿页口径「定时发布 ≥5 分钟」）。
+   * 默认 1200 = 平台底线 300 + 900 秒余量。想更保守就调大。
+   */
   submitGapSec: number;
+  /**
+   * **相邻切片之间的发布时间间隔（秒）** —— 默认 `300` = 每片 5 分钟。
+   *
+   * ⚠️ 这是**我们自己的**错峰值，不是平台规则：B站 只要求「每片的 dtime 晚于**它自己**的提交时刻
+   * 300 秒」（投稿页口径「≥5 分钟」），与上一个切片无关 ⇒ 调大调小都合法。
+   *
+   * **两个模式都生效**（2026-10-17 更正口径）：
+   *   · 「单独投稿」（`clipPublishMode='standalone'`）⇒ 就是每片一稿之间的实际间隔，
+   *     **下限 = `STANDALONE_CLIP_GAP_SEC`（300 秒）**：填得比 300 小会被抬到 300
+   *     （B站 要求每片 dtime 晚于**它自己**的提交时刻 300 秒，低于这条线就是对不齐平台底线），
+   *     填得更大则**照用**（想每片 8 分钟就填 480）。
+   *   · 「追加切片投稿」（`clipPublishMode='append'`）⇒ 多分P 稿件只有一个 dtime，
+   *     片之间排不开，本键**不逐片生效**（只影响批量排期）。
+   *
+   * ⚠️ 2026-10-16 曾把单独投稿下的本键**钉死**为 300（用户当时口径是「每片 5 分钟」）；
+   * 2026-10-17 用户明确要求「这里改成对定时投稿也生效」⇒ 改为「以本键为准、300 保底」。
+   * 生效口径的唯一判定见 `resolveClipPublishSchedule()`，别在别处再算一遍。
+   *
+   * 与 `jitterSec` 的关系：抖动必须严格小于本值，否则第 N 片的随机抖动会越过第 N+1 片的最小值
+   * ⇒ 排期倒挂（第 2 片比第 1 片先公开）。系统会自动把抖动压到 `生效间隔 - 30` 以内
+   * （见 `effectiveJitterSec`）。
+   */
   clipGapSec: number;
+  /**
+   * dtime 的随机抖动上限（秒）。**`0` = 等距**（严格按 `clipGapSec` 间隔发布，默认值）。
+   *
+   * 想要「看不太出来是机器排的」就填 60–120 秒；填大于等于 `clipGapSec` 的值没有意义，
+   * 会被自动压到 `clipGapSec - 30`（见 `effectiveJitterSec`）。
+   * 注意：**投稿提交**的间隔抖动是另一个键（`minSubmitIntervalSec`），与本键无关。
+   *
+   * ⚠️ 与 `clipGapSec` 一样**两个模式都生效**（2026-10-17 更正口径）：单独投稿下就是每片
+   * dtime 的随机抖动上限；唯一的夹取是「必须小于生效片间隔」——
+   * 生效抖动 = `min(本值, max(0, 生效间隔 - 30))`（见 `effectiveJitterSec`）。
+   * 2026-10-16 曾把它在单独投稿下钉死为 0，2026-10-17 用户要求「随机抖动对定时投稿也生效」。
+   */
   jitterSec: number;
   /**
    * 首片发布时间（本地时间，格式 `YYYY-MM-DDTHH:mm`）。留空则按公式自动算。
@@ -446,8 +523,8 @@ export interface PublishConfig {
    * 用途：想「今晚 23:30 开始发」或「明早 8 点开始发」时直接指定，
    * 比调 submitGapSec 秒数直观得多。
    *
-   * 约束：**不得早于「提交时刻 + 7200 秒」**（B站硬限制）。若指定时间太早，
-   * 会自动推迟到最早合法时间并在日志与 UI 上说明原因，而不是让投稿被拒。
+   * 约束：**不得早于「提交时刻 + 1200 秒」**（本项目硬约束 #4 的自律下限）。
+   * 若指定时间太早，会自动推迟到最早合法时间并在日志与 UI 上说明原因，而不是让投稿被拒。
    */
   firstPublishAt: string;
   /**
@@ -475,6 +552,19 @@ export interface PublishConfig {
   defaultCategory: string;
   tidWhitelist: Record<string, number>;
   defaultTags: string[];
+  /**
+   * **必带标签**：所有切片稿件的标签列表里**永远排在最前面**，占位优先于内容词。
+   *
+   * 支持占位符 `{主播}`（`{主播名}` / `{主播昵称}` / `{昵称}` 同义）—— 投稿时替换成**本场主播名**
+   * （例如 `乙主播`）；该场没识别出主播名时，带占位符的那一条**整条跳过**并在任务警告里说明。
+   *
+   * 与 `defaultTags` 的分工（2026-10-17 用户规格「必有的标签 虚拟主播、2D、3D、VTuber、vup，
+   * 还有一个占位符根据主播不同、标签为主播的 ID，其他的为 LLM 生成的，还要有去重」）：
+   *   - 这里 = 账号身份标签，**必带**，不会被内容词挤掉；
+   *   - `defaultTags` = 可选的补充词，只在必带 + 内容词没用满 10 个时补位。
+   * 大小写不敏感去重（`2D` / `2d` 只留先出现的），去重、敏感词过滤与 10 个上限见 `sanitizeTags`。
+   */
+  identityTags: string[];
   tagSensitiveWords: string[];
   defaultTitleSuffix: string;
   descTemplate: string;
@@ -485,6 +575,12 @@ export interface PublishConfig {
    * ---------------------------------------------------------------------- */
 
   /**
+   * **切片投稿去向** —— 见 `ClipPublishMode` 的说明。界面上的「切片投稿方式」二选一开关就是它。
+   *
+   * 留空（老配置手改时可能没有这一项）时按 `multiPart` 反推，行为与加入这个键之前逐字一致。
+   */
+  clipPublishMode?: ClipPublishMode;
+  /**
    * 是否用「多分P单稿件」替代「每片一稿」。
    *
    * 开启后结构为 `2 + N` 个分P：
@@ -493,6 +589,9 @@ export interface PublishConfig {
    * **主要收益是省额度**：一次投稿只占 1 个每日投稿数（`dailyLimit`）。
    * **代价是失去错峰**：多P稿件只有一个 `dtime`，所有分P同一时刻上线
    * （原来的「相邻切片间隔 clipGapSec」在这种模式下不生效）。
+   *
+   * ⚠️ 界面已不再单独暴露这个开关：它就是 `clipPublishMode` 的实现口径
+   * （`append` ⇒ true · `standalone` ⇒ false），保存时由界面同步写入。
    */
   multiPart: boolean;
   /** P1 完整版的分P标题 */
@@ -591,12 +690,19 @@ export interface PublishConfig {
    * **立即发布**（不传 `dtime`）。
    *
    * 默认 `false`：走定时发布（`submitGapSec + (N-1)×clipGapSec + 抖动`），
-   * 满足任务书硬约束 #4「dtime 必须 > 提交时刻 + 7200 秒」。
+   * 满足本项目硬约束 #4「dtime 必须 ≥ 提交时刻 + 1200 秒」。
    *
    * 置 `true` 时投稿**不带 `dtime`**，稿件通过审核后直接公开。
    * ⚠️ 它会绕过上述硬约束（那是任务书为降低风控风险设的自律措施，**不是 B站规则**：
-   * B站只在「传了 dtime」时才要求它 ≥ 提交后 2 小时）。
+   * B站只在「传了 dtime」时才要求它 ≥ 提交后 5 分钟）。
    * 代价与风险见 README；试跑期建议保持 `false`。
+   *
+   * ⚠️ **对「单独投稿」的切片不生效**（2026-10-16 定，2026-10-17 复核仍成立）：那个模式下切片
+   * 固定走定时投稿 —— 否则「每片按间隔发」根本无从谈起（立即发布压根不传 dtime）。
+   * 注意这与 `clipGapSec` / `jitterSec` 不同：那两个键在单独投稿下**是生效的**
+   * （间隔 300 保底、抖动受「小于间隔」夹取），本键是唯一真正不参与的旋钮。
+   * 它仍然管**完整版**（`fullVideoBy='assistant'` 时由本服务投）—— 那个语义是
+   * 「别等定时、过审即公开」，不该因为切片换了去向就一起改掉。判定见 `resolveClipPublishSchedule()`。
    */
   immediatePublish: boolean;
   /** 失败自动重试一次（仅限判据认为是临时性的失败，见 src/failure-class.ts）；失败仍如实上报 */
@@ -731,7 +837,8 @@ export interface AppConfig {
  * 默认值（与 config.example.json 保持一致；example 缺失时也能跑起来）
  * ------------------------------------------------------------------------- */
 
-function defaults(): AppConfig {
+/** 全量默认配置（`loadConfig` 拿它当底，用户 config.json 覆盖上去）。导出供测试断言默认口径。 */
+export function defaults(): AppConfig {
   // 示例文件优先（它同时充当「可读的默认值文档」），但**必须用下面的内置字面量兜底**。
   // 曾经这里写成 `return raw as AppConfig`（直接返回示例文件、不合并）——
   // 结果是示例文件里漏掉任何一个键，该键在运行时就是 undefined，
@@ -768,6 +875,7 @@ function builtinDefaults(): AppConfig {
     },
     room: {
       roomId: '',
+      roomIds: [],
       platform: 'Bilibili',
       pollIntervalSec: 60,
       reconcileIntervalMin: 60,
@@ -927,9 +1035,11 @@ function builtinDefaults(): AppConfig {
     publish: {
       autoPublish: false,
       isOnlySelf: 1,
-      submitGapSec: 7800,
-      clipGapSec: 7500,
-      jitterSec: 1800,
+      submitGapSec: 1200,
+      /* 每片 5 分钟（用户口径）。这是错峰值、非平台规则，见 PublishConfig.clipGapSec 注释 */
+      clipGapSec: 300,
+      /* 默认等距：用户要的是「每片正好 5 分钟」。想要扰动就填 60–120（会被夹到 < clipGapSec） */
+      jitterSec: 0,
       firstPublishAt: '',
       dailyLimit: 5,
       minSubmitIntervalSec: 120,
@@ -944,15 +1054,27 @@ function builtinDefaults(): AppConfig {
       seasonId: 0,
       sectionId: 0,
       defaultCategory: '游戏/单机游戏',
-      tidWhitelist: { '游戏/单机游戏': 17, '游戏/网络游戏': 65, 生活: 21, 综合: 21 },
+      /* 出厂白名单：tid 必须和官方分区表一致（2026-10-17 逐条校对过）。
+         B站 现在**没有**「虚拟主播」分区，旧的 145 已从示例与线上配置里删掉；
+         defaultCategory 必须自己也在白名单里，否则 mapCategoryToTid 会回退到白名单第一项。 */
+      tidWhitelist: { '游戏/单机游戏': 17, '游戏/网络游戏': 65, '生活/日常': 21, '娱乐/娱乐粉丝创作': 242 },
       defaultTags: ['直播切片', '名场面'],
+      /* 必带标签的出厂默认：用户 2026-10-17 明确要求的五个身份词 + 主播名占位符。
+         `{主播}` 替换成本场主播名；识别不出主播名时那条会跳过（并在任务警告里写清楚），其余照常。 */
+      identityTags: ['虚拟主播', '2D', '3D', 'VTuber', 'vup', '{主播}'],
       tagSensitiveWords: [],
       defaultTitleSuffix: '',
-      descTemplate: '本片段来自 {{date}} 的直播《{{liveTitle}}\n原直播：{{roomUrl}}\n{{desc}}',
+      descTemplate: '欢迎关注 👉 @{{anchorName}} https://space.bilibili.com/{{anchorUid}}\n本片段来自 {{date}} 的直播《{{liveTitle}}》\n原直播：{{roomUrl}}\n{{desc}}',
       autoCutTimeoutSec: 1800,
       /* 默认 true：规则是「一场直播 = 一个稿件（完整版 + 切片）」，只有多分P 续传能做到。
          关掉它会退化成「一个切片一个稿件」，与完整版不在同一个稿件里。 */
       multiPart: true,
+      /* ⚠️ 这里**刻意不给 `clipPublishMode` 默认值**（2026-10-16）：
+         这个键一旦由默认值补齐，"用户没动过开关"与"用户显式选了追加"就再也分不出来 ——
+         而 `multiPart=false` + 没动开关是**配置错位**（必须拦住，否则投出一堆单片），
+         `multiPart=false` + 显式选了单独投稿才是**意图**（必须放行）。
+         没有默认值时：键缺失 ⇒ resolveClipPublishMode 按 multiPart 反推 ⇒ 老配置行为逐字不变；
+         界面读不到这个键时用 clipModeOf() 反推出同一个结论，用户一保存就写成显式值。 */
       fullPartTitle: '完整版',
       purePartTitle: '纯享版（无弹幕）',
       pureSource: 'remux',
@@ -1064,6 +1186,15 @@ function applyEnvOverrides(cfg: AppConfig): AppConfig {
     const v = env[envKey];
     if (v !== undefined && v !== '') setPath(cfg as unknown as Record<string, unknown>, dotted, v);
   }
+  /* 附加直播间走单独一条：roomIds 是数组，上面那个通用 setPath 只会写字符串
+     （`typeof prev === 'number'/'boolean'` 之外的都落到 else，写进去会变成 "a,b" 这种脏值）。 */
+  const extraRooms = env['LIVE_AUTO_ROOM_IDS'];
+  if (extraRooms !== undefined && extraRooms.trim() !== '') {
+    cfg.room.roomIds = extraRooms
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
   return cfg;
 }
 
@@ -1077,6 +1208,199 @@ export interface ConfigIssue {
   message: string;
   /** 可执行的修复建议 */
   fix?: string;
+}
+
+/**
+ * 把「切片投稿方式」解析成唯一口径 —— **全仓只此一处判定**，daemon / 校验 / 界面提示都调它。
+ *
+ * 优先级（2026-10-16 加）：
+ *   1. 显式设了 `clipPublishMode` → 以它为准（`'append'` / `'standalone'` 都认）；
+ *   2. 没设（手改 config.json 的老配置）→ 按 `multiPart` 反推：true ⇒ append、false ⇒ standalone。
+ *
+ * 为什么要留第 2 条：加入这个键之前，`multiPart` 是唯一的判据，既有配置里可能只有它。
+ * 让老配置继续按 multiPart 走，行为与加键之前逐字一致（不需要用户改配置）。
+ */
+export function resolveClipPublishMode(publish: Pick<PublishConfig, 'clipPublishMode' | 'multiPart'>): ClipPublishMode {
+  if (publish.clipPublishMode === 'standalone') return 'standalone';
+  if (publish.clipPublishMode === 'append') return 'append';
+  return publish.multiPart === true ? 'append' : 'standalone';
+}
+
+/**
+ * 用户是否**显式**动过「切片投稿方式」这个开关（而不是靠 multiPart 反推出来的）。
+ *
+ * 用途：老规则下「multiPart=false 且完整版归 biliLive-tools」是**配置错位**，必须拦住；
+ * 而用户显式选「单独投稿」是**明确意图**，不该拦。两者只能靠这个函数区分。
+ */
+export function isClipPublishModeExplicit(publish: Pick<PublishConfig, 'clipPublishMode'>): boolean {
+  return publish.clipPublishMode === 'append' || publish.clipPublishMode === 'standalone';
+}
+
+/**
+ * 「单独投稿」下相邻稿件发布间隔的**下限**（秒）= B站 平台底线 300 秒（投稿页口径「定时发布 ≥5 分钟」）。
+ *
+ * ★ 2026-10-17 口径更正（用户原话：「这里改成对定时投稿也生效」，指的是设置里的
+ *   「相邻切片间隔 / 随机抖动」两个旋钮）：单独投稿**不再把片间隔钉死在 300**，
+ *   而是「以 `publish.clipGapSec` 为准、300 保底」——
+ *     生效间隔 = `max(STANDALONE_CLIP_GAP_SEC, clipGapSec)`
+ *   为什么**只能往上调、不能往下**：B站 要求每一片的 dtime 都晚于**它自己**的提交时刻
+ *   300 秒。填 100 时若真按 100 排，第 N+1 片会与第 N 片挤在 100 秒内，而提交是逐片往后推的
+ *   ⇒ 靠后的片会撞上平台底线，只能靠 `clampDtimeForSubmit` 事后抬时间（排期形同虚设，
+ *   且日志里会出现一串「被合规修正」）。所以这里**当场抬到 300**，并在 note / 校验 / 界面
+ *   三处都如实说明「你填的值低于平台底线，实际按 300」。
+ *
+ * 历史（别再改回去）：2026-10-16 曾把单独投稿的片间隔**钉死**成这个常量，理由是当时
+ * `clipGapSec` 在追加模式下完全不起作用（多分P 只有一个 dtime），担心用户为追加模式调过的
+ * 老值（线上曾是 7500 秒 = 125 分钟）在切到单独投稿时突然生效、把 8 个切片摊成 16 小时。
+ * 现在的做法是「尊重用户的数、但不许低于平台底线」——用户既然把「相邻切片间隔 / 随机抖动」
+ * 摆出来给定时投稿用，就该按他填的走，而不是替他锁死。
+ */
+export const STANDALONE_CLIP_GAP_SEC = 300;
+
+/**
+ * 抖动上限的**有效值**：必须严格小于片间隔。
+ *
+ * 为什么必须有这道夹子（实测会踩）：抖动是**每片独立**随机的，
+ * 第 N 片的 dtime = 基准 + (N-1)×间隔 + random(0, 抖动上限)。
+ * 抖动 ≥ 间隔时，第 N 片的最大值会越过第 N+1 片的最小值 ⇒ **排期倒挂**
+ * （第 2 片比第 1 片先公开，观众看到的顺序是乱的）。
+ * 30 秒是安全带：保证「第 N 片最晚」仍早于「第 N+1 片最早」。
+ *
+ * 例：片间隔 300 秒（每片 5 分钟）+ 抖动上限 1800 ⇒ 实际抖动被压到 270 秒。
+ *
+ * ★ 放在 `config.ts` 而不是 `publish.ts`（2026-10-17）：`resolveClipPublishSchedule()`
+ *   在单独投稿分支里也要用同一道夹子，而 `publish.ts` 已经 import 了 `config.ts` ——
+ *   反过来 import 会成环。纯函数放这里，`publish.ts` 再导出一次同名符号（老调用点不变）。
+ */
+export function effectiveJitterSec(jitterSec: number, clipGapSec: number): number {
+  if (!(jitterSec > 0)) return 0;
+  return Math.min(jitterSec, Math.max(0, clipGapSec - 30));
+}
+
+/** 单个切片投稿时的**实际生效**排期口径（由 `resolveClipPublishSchedule` 算出） */
+export interface ClipPublishSchedule {
+  /** 当次生效的「切片投稿方式」 */
+  mode: ClipPublishMode;
+  /** `true` = 定时投稿（payload 带 `dtime`）；`false` = 立即发布（不传 `dtime`） */
+  scheduled: boolean;
+  /** 相邻切片稿件的发布时间间隔（秒） */
+  gapSec: number;
+  /** dtime 随机抖动上限（秒）；`0` = 严格等距 */
+  jitterSec: number;
+  /** 一句话说明这个口径是怎么来的（日志与界面直接用，避免两端各写一遍文案） */
+  note: string;
+}
+
+/**
+ * 切片排期的**唯一判定**：把「切片投稿方式」翻译成实际生效的
+ * 「定时/立即 + 间隔 + 抖动」三件套。
+ *
+ * 规则：
+ *
+ *   · `standalone`（单独投稿）⇒ **固定定时投稿**（`scheduled` 恒为 true），
+ *     间隔 = `max(STANDALONE_CLIP_GAP_SEC, clipGapSec)`、抖动 = `effectiveJitterSec(jitterSec, 间隔)`。
+ *     也就是**设置里的「相邻切片间隔 / 随机抖动」在单独投稿下确实生效**（2026-10-17 用户要求），
+ *     只有两条硬边界：① 间隔不得低于 B站 平台底线 300 秒；② 抖动必须小于间隔（防排期倒挂）。
+ *     唯一**不参与**的是 `immediatePublish` —— 立即发布压根不传 dtime，
+ *     「每片按间隔发」就无从谈起，所以单独投稿恒定走定时投稿（见 `describeScheduleOverride`）。
+ *   · `append`（追加切片投稿）⇒ 逐字沿用 config 口径（`immediatePublish` /
+ *     `clipGapSec` / `jitterSec`）—— 老行为一字未改。
+ *
+ * ⚠️ 只影响**切片**投稿。完整版（`fullVideoBy='assistant'` 时由本服务投）仍按
+ * `immediatePublish` 走：用户那个开关的语义是「别等定时、过审即公开」，
+ * 没有理由因为切片换了去向就把它一起改掉。
+ */
+export function resolveClipPublishSchedule(
+  publish: Pick<PublishConfig, 'clipPublishMode' | 'multiPart' | 'immediatePublish' | 'clipGapSec' | 'jitterSec'>,
+): ClipPublishSchedule {
+  const mode = resolveClipPublishMode(publish);
+  if (mode === 'standalone') {
+    /* 非数字 / 负数一律回到「没填」的语义（0 ⇒ 保底到 300），绝不让 NaN 流进 computeDtime
+       （NaN 会让 dtime 变 NaN，payload 里就是脏数据，B站 只回一个看不懂的 400）。 */
+    const wantGap = Number(publish.clipGapSec);
+    const rawGap = Number.isFinite(wantGap) && wantGap > 0 ? Math.floor(wantGap) : STANDALONE_CLIP_GAP_SEC;
+    const gapSec = Math.max(STANDALONE_CLIP_GAP_SEC, rawGap);
+    const wantJitter = Number(publish.jitterSec);
+    const rawJitter = Number.isFinite(wantJitter) && wantJitter > 0 ? Math.floor(wantJitter) : 0;
+    const jitterSec = effectiveJitterSec(rawJitter, gapSec);
+    /* note 必须说真话 —— 它同时进日志、设置面板与任务详情页。
+       用户改过的值**没完全生效**时（低于底线 / 抖动被夹），要在这里就说清被改成了多少，
+       否则"我明明填了 100，怎么还是 5 分钟"就是下一轮困惑。 */
+    const parts: string[] = [];
+    if (rawGap < STANDALONE_CLIP_GAP_SEC) {
+      parts.push(`间隔按平台底线抬到 ${gapSec} 秒（你填的 ${publish.clipGapSec} 低于 B站 要求的 300 秒）`);
+    }
+    if (rawJitter > jitterSec) {
+      parts.push(`抖动压到 ${jitterSec} 秒（你填的 ${publish.jitterSec} 必须小于片间隔 ${gapSec}，否则排期倒挂）`);
+    }
+    return {
+      mode,
+      scheduled: true,
+      gapSec,
+      jitterSec,
+      note:
+        `单独投稿：每片一稿、固定定时投稿，相邻稿件间隔 ${gapSec} 秒（${fmtMinutes(gapSec)}）` +
+        (jitterSec > 0 ? `，每片再加 0~${jitterSec} 秒随机抖动` : '等距（抖动 0）') +
+        '（口径 = 设置里的「相邻切片间隔 / 随机抖动」）' +
+        (parts.length ? `；但 ${parts.join('；')}` : ''),
+    };
+  }
+  return {
+    mode,
+    scheduled: publish.immediatePublish !== true,
+    gapSec: publish.clipGapSec,
+    jitterSec: publish.jitterSec,
+    note:
+      publish.immediatePublish === true
+        ? '追加切片投稿：所有分P 共用一次投稿（立即发布，不传 dtime）'
+        : `追加切片投稿：所有分P 共用一次投稿（定时发布，间隔 ${publish.clipGapSec} 秒只影响批量排期）`,
+  };
+}
+
+/** 把秒数说成人话（只在 note 里用；`300 ⇒ 5 分钟`、`470 ⇒ 7 分 50 秒`） */
+function fmtMinutes(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  const m = Math.floor(s / 60);
+  const rest = s % 60;
+  if (m === 0) return `${rest} 秒`;
+  return rest === 0 ? `${m} 分钟` : `${m} 分 ${rest} 秒`;
+}
+
+/**
+ * 把 config 里那些**已改实、但当前模式下不生效 / 只部分生效**的排期键列出来，供日志与界面如实说明。
+ *
+ * 为什么要专门写一句：这类"我改了配置但没反应"的困惑，本仓库已经踩过两次
+ * （`multiPart` 配了没人读、`llm_dtype` 传错位置）。第三种形态是「改了、但没有完全生效」
+ * （间隔低于平台底线被抬、抖动大于片间隔被夹）—— 那比完全不生效更容易让人抓狂，
+ * 所以这里也必须**说清被改成了多少**，而不是静默。
+ *
+ * 返回空字符串 = 没有需要说明的项（干净配置不该被念）。
+ */
+export function describeScheduleOverride(
+  publish: Pick<PublishConfig, 'clipPublishMode' | 'multiPart' | 'immediatePublish' | 'clipGapSec' | 'jitterSec'>,
+): string {
+  const s = resolveClipPublishSchedule(publish);
+  if (s.mode !== 'standalone') return '';
+  const notes: string[] = [];
+  /* ① 确实不参与：立即发布。单独投稿恒定走定时投稿（不传 dtime 就没有「每片按间隔发」）。 */
+  if (publish.immediatePublish === true) {
+    notes.push('publish.immediatePublish=true 对切片不生效（单独投稿固定走定时投稿；由本服务投完整版时仍按它走）');
+  }
+  /* ② 生效但被抬：间隔低于 B站 平台底线。 */
+  if (Number(publish.clipGapSec) < STANDALONE_CLIP_GAP_SEC) {
+    notes.push(
+      `publish.clipGapSec=${publish.clipGapSec} 低于 B站 平台底线，实际按 ${s.gapSec} 秒排期（只能往上调、不能往下）`,
+    );
+  }
+  /* ③ 生效但被夹：抖动必须小于片间隔，否则排期倒挂。 */
+  const wantJitter = Number(publish.jitterSec) > 0 ? Number(publish.jitterSec) : 0;
+  if (wantJitter > s.jitterSec) {
+    notes.push(
+      `publish.jitterSec=${publish.jitterSec} 已压到 ${s.jitterSec} 秒（抖动必须小于片间隔 ${s.gapSec}，否则排期倒挂）`,
+    );
+  }
+  if (notes.length === 0) return '';
+  return `单独投稿排期：${notes.join('；')}`;
 }
 
 export function validateConfig(cfg: AppConfig): ConfigIssue[] {
@@ -1147,17 +1471,65 @@ export function validateConfig(cfg: AppConfig): ConfigIssue[] {
   if (!cfg.room.roomId || /^123456$/.test(cfg.room.roomId)) {
     err('room.roomId', '未设置目标直播间房间号', '填写真实房间号（例如 12345678）');
   }
+  /* 附加直播间（设置页的「添加直播」）：可为空；填了就必须是"能用的房间号"，且不能与主房间重复。
+     不在这里去重/纠正 —— 校验只报告，改由用户改（与其它字段口径一致）。 */
+  if (!Array.isArray(cfg.room.roomIds)) {
+    err('room.roomIds', 'roomIds 必须是字符串数组', '在设置页用「添加直播」维护；手改请写成 ["12345678"]');
+  } else {
+    const seenRooms = new Set<string>([String(cfg.room.roomId ?? '').trim()]);
+    cfg.room.roomIds.forEach((raw, i) => {
+      const v = String(raw ?? '').trim();
+      if (!v) {
+        err(`room.roomIds[${i}]`, '附加直播间房间号为空', '删掉这一行，或填真实房间号（例如 23456789）');
+        return;
+      }
+      if (!/^\d+$/.test(v)) {
+        warn(`room.roomIds[${i}]`, `房间号「${v}」不是纯数字`, 'B站 房间号通常是数字；写成别的会让 recent-clips 静默返回空数组');
+      }
+      if (seenRooms.has(v)) {
+        err(`room.roomIds[${i}]`, `房间号重复：${v}`, '主直播间与附加直播间不能重复，否则同一份录制历史会被拉两遍');
+      }
+      seenRooms.add(v);
+    });
+  }
   // 陷阱 #1：platform 必须首字母大写
   if (cfg.room.platform !== 'Bilibili') {
     err('room.platform', `platform 必须为 "Bilibili"（当前 "${cfg.room.platform}"）`, '改为 Bilibili；传错会静默返回空数组');
   }
 
-  // 硬约束 #4：dtime 余量
-  if (cfg.publish.submitGapSec <= 7200) {
-    err('publish.submitGapSec', `首片提交余量必须 > 7200 秒（当前 ${cfg.publish.submitGapSec}）`, '建议 7800');
+  // 硬约束 #4：dtime 余量（**本项目**的自律下限，不是平台规则；平台底线仅 300 秒）
+  if (cfg.publish.submitGapSec < DTIME_MIN_MARGIN_SEC) {
+    err(
+      'publish.submitGapSec',
+      `首片提交余量必须 ≥ ${DTIME_MIN_MARGIN_SEC} 秒（当前 ${cfg.publish.submitGapSec}）；B站平台底线只有 300 秒，多出来的是本项目防风控的自律余量`,
+      `建议 ${DTIME_MIN_MARGIN_SEC} 或更大`,
+    );
   }
-  if (cfg.publish.clipGapSec < 7200) {
-    warn('publish.clipGapSec', `相邻切片间距 ${cfg.publish.clipGapSec} 秒偏小；B站要求是相对各稿件提交时刻 >7200，取 7500 属保守余量`);
+  /* 片间隔（`clipGapSec`）是**我们自己的**错峰值，不是平台要求：
+     平台规则是「每片的 dtime 必须晚于**它自己**的提交时刻 300 秒」（投稿页口径「≥5 分钟」），与上一个切片无关
+     ⇒ 早先这里「< 7200 就告警」的写法会把我们自己的保守取值说成平台规则，
+     用户按 5 分钟间隔排期时会被这条假告警反复干扰（实测误导）。现在只守真正的不变量：
+     ① 间隔别小到等于同时发布；② 抖动必须小于间隔，否则排期倒挂。
+
+     ★ 2026-10-17：两条都用**生效值**（`resolveClipPublishSchedule`）判，不用 config 的原始值 ——
+     单独投稿下间隔会被抬到 300、抖动会被夹到「间隔−30」，拿原始值判会把"其实没事"的配置
+     报成告警（`clipGapSec=100 + jitterSec=200` 在单独投稿下实际是 300/200，完全合法）。
+     越界本身由下面 standalone 那一段逐键说明「实际跑成了多少」。 */
+  const schedForCheck = resolveClipPublishSchedule(cfg.publish);
+  if (schedForCheck.gapSec < 60) {
+    warn(
+      'publish.clipGapSec',
+      `生效的相邻切片间隔只有 ${schedForCheck.gapSec} 秒，实际等于同时发布`,
+      '按分钟级错峰才有意义，建议 ≥300（每片 5 分钟）',
+    );
+  }
+  if (schedForCheck.jitterSec >= schedForCheck.gapSec && schedForCheck.gapSec > 0) {
+    const capped = Math.max(0, schedForCheck.gapSec - 30);
+    warn(
+      'publish.jitterSec',
+      `生效抖动 ${schedForCheck.jitterSec} 秒 ≥ 生效片间隔 ${schedForCheck.gapSec} 秒，排期可能倒挂（第 2 片比第 1 片先公开）`,
+      `已自动压到 ${capped} 秒；要严格等距就把 jitterSec 设为 0`,
+    );
   }
   /* 切片阶段并发（有界流水线）：默认 1 = 与历史行为逐字一致 */
   const cutConc = cfg.clip.concurrency ?? 1;
@@ -1179,14 +1551,65 @@ export function validateConfig(cfg: AppConfig): ConfigIssue[] {
 
   /* 完整版（弹幕版 + 纯享版）的归属：默认由 biliLive-tools 投，切片助手只追加切片分P。
      这条规则要求「切片与完整版在同一个稿件」，而只有多分P 续传（`vid` → editMedia）能做到 ——
-     单切片一稿模式下每个切片是独立稿件，天然满足不了。所以这里必须拦住。 */
-  if (cfg.publish.fullVideoBy !== 'assistant' && cfg.publish.multiPart !== true) {
+     单切片一稿模式下每个切片是独立稿件，天然满足不了。所以这里必须拦住。
+     ⚠️ 例外：用户**显式**选了「单独投稿」（`clipPublishMode='standalone'`）—— 那是明确意图，
+     不是配置错位，此时不该拦（拦了就等于这个开关点了没反应）。 */
+  if (cfg.publish.clipPublishMode !== 'standalone' && cfg.publish.fullVideoBy !== 'assistant' && cfg.publish.multiPart !== true) {
     err(
       'publish.multiPart',
       '默认规则是「完整版由 biliLive-tools 投、切片助手只追加切片分P 到同一个稿件」，' +
         '这要求 publish.multiPart=true（多分P 续传）；当前 multiPart=false 会把每个切片投成独立稿件',
-      '把 publish.multiPart 设为 true；若确实要让切片助手自己投完整版，显式设 publish.fullVideoBy="assistant"',
+      '把 publish.multiPart 设为 true；确实要让每个切片单独投稿时，在设置里把「切片投稿方式」改成「单独投稿」' +
+        '（等价于 publish.clipPublishMode="standalone"）',
     );
+  }
+  /* 两个口径打架时以「切片投稿方式」为准，并如实说明 —— 不能静默按其中一个跑。
+     典型来路：手改 config.json 只改了一个键，或界面保存的是旧版本。 */
+  if (cfg.publish.clipPublishMode === 'append' && cfg.publish.multiPart !== true) {
+    err(
+      'publish.multiPart',
+      '「切片投稿方式 = 追加切片投稿」要求 publish.multiPart=true（多分P 续传是唯一的追加手段），当前为 false',
+      '把 publish.multiPart 设为 true；或把「切片投稿方式」改成「单独投稿」',
+    );
+  }
+  if (cfg.publish.clipPublishMode === 'standalone' && cfg.publish.multiPart === true) {
+    warn(
+      'publish.clipPublishMode',
+      '「切片投稿方式 = 单独投稿」会忽略 publish.multiPart=true：本场切片各自一个稿件，不追加进完整版稿件',
+      '要追加进同一个稿件就把「切片投稿方式」改回「追加切片投稿」（界面保存时会同步两个键）',
+    );
+  }
+  /* 单独投稿下的排期：片间隔/抖动**确实生效**（2026-10-17 起），但有两条硬边界 ——
+     ① 间隔不得低于 B站 平台底线 300 秒；② 抖动必须小于片间隔（防排期倒挂）。
+     用户填了越界的值时，实际值会被抬/压，所以必须**逐个键**如实说清「你填的 X 实际跑成了 Y」
+     （逐键而不是一句话打包：界面按 field 显示与定位，打包成一条就看不出是哪个键了）。
+     仅 `immediatePublish` 在单独投稿下对切片不参与（固定定时投稿）。 */
+  if (cfg.publish.clipPublishMode === 'standalone') {
+    const sched = resolveClipPublishSchedule(cfg.publish);
+    if (cfg.publish.immediatePublish === true) {
+      warn(
+        'publish.immediatePublish',
+        `单独投稿固定走「定时投稿」（不传 dtime 就没有「每片按间隔发」），publish.immediatePublish=true 对切片不生效` +
+          '（由本服务投完整版时仍按它走：过审即公开）',
+        '要让切片过审即公开就切回「追加切片投稿」；否则把这一项关掉',
+      );
+    }
+    if (Number(cfg.publish.clipGapSec) < STANDALONE_CLIP_GAP_SEC) {
+      warn(
+        'publish.clipGapSec',
+        `publish.clipGapSec=${cfg.publish.clipGapSec} 低于 B站 平台底线 ${STANDALONE_CLIP_GAP_SEC} 秒` +
+          `（每片 dtime 必须晚于它自己的提交时刻 300 秒），实际按 ${sched.gapSec} 秒排期`,
+        `改成 ≥ ${STANDALONE_CLIP_GAP_SEC}（想每片 5 分钟就填 300，想更散就填更大）`,
+      );
+    }
+    if (Number(cfg.publish.jitterSec) > sched.jitterSec) {
+      warn(
+        'publish.jitterSec',
+        `publish.jitterSec=${cfg.publish.jitterSec} 大于「片间隔 − 30」，实际压到 ${sched.jitterSec} 秒` +
+          `（抖动 ≥ 片间隔会让第 N+1 片抢在第 N 片之前公开 ⇒ 排期倒挂）`,
+        `改成 ≤ ${sched.jitterSec}；或把「相邻切片间隔」调大`,
+      );
+    }
   }
   if (cfg.publish.fullVideoBy === 'assistant') {
     warn(

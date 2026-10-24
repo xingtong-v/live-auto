@@ -4,366 +4,703 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>直播切片助手</title>
+<!-- ★ 2026-10-16：主题必须在**首屏渲染之前**定下来。
+     放在这里（head、body 之前）而不是等 46-启动.js 跑完再设 ——
+     否则每次刷新都会先闪一下浅色底再变深，深色下特别刺眼。
+     取值优先级：localStorage → 系统偏好(prefers-color-scheme) → 浅色。 -->
+<script>
+(function () {
+  try {
+    var saved = localStorage.getItem('liveauto.theme');
+    var dark = saved ? saved === 'dark'
+      : !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    if (dark) document.documentElement.setAttribute('data-theme', 'dark');
+  } catch (e) { /* 隐私模式下 localStorage 会抛，忽略即可，退回浅色 */ }
+})();
+</script>
 <style>
+  /* ============================================================================
+   * 设计令牌（2026-10-16 UI 评审落地）
+   *
+   * 为什么要有这一层：改版前全文件有 16 级字号、13 种圆角、33 种颜色，都是各写各的。
+   * 现在收敛成一张表，规则只有三条：
+   *   ① 字号只允许从 --fs-* 取；相邻两级至少差 1px，正文不小于 12px
+   *   ② 圆角只允许 sm / md / pill 三档
+   *   ③ 所有用于**文字**的颜色，对比度必须 ≥ 4.5:1（WCAG AA 小字门槛）
+   *
+   * 对比度实测（白底 / --bg 底）：
+   *   --text   17.58 / 16.28      --text-2  5.79 / 5.30
+   *   --text-3  4.98 /  4.57      --blue    5.51
+   *   --pink    4.82              --green   5.39
+   *
+   * 品牌粉拆成两个：--pink 供文字与主按钮（够深才达标）；
+   * --pink-deco 保留原来的亮粉，只用于不承载文字的装饰面（进度条等）。
+   * ========================================================================== */
   :root{
-    --bg:#f4f5f7; --card:#fff; --border:#e6e8eb; --border-2:#f0f1f3;
-    --text:#18191c; --text-2:#61666d; --text-3:#9499a0;
-    --pink:#fb7299; --pink-soft:#fff1f5; --blue:#00aeec; --green:#2bb673;
-    --amber:#f5a623; --red:#d94a4a; --radius:10px;
+    color-scheme: light;
+    /* ---- 颜色 ---- */
+    --bg:#f4f5f7; --card:#fff; --border:#e3e6ea; --border-2:#eef0f3;
+    --text:#18191c; --text-2:#5c6169; --text-3:#6b7078; --text-4:#6b7078;
+    --pink:#c73f6c; --pink-deco:#fb7299; --pink-hover:#b33560; --pink-soft:#fff1f5;
+    --blue:#0b6ea8; --blue-soft:#e9f4fb;
+    --green:#0f7a48; --green-soft:#e8f6ee;
+    --amber:#8a5a00; --amber-soft:#fdf3e0;
+    --red:#b3261e; --red-soft:#fdeceb;
+    --violet:#5a4296; --violet-soft:#f0ecfa;
+    --focus:#3a6bd6;
+
+    /* ---- 面与线（深色模式只需要换这一组）----
+       为什么单独抽出来：改版前这些值散在 60 多处硬编码（#fafbfc / #f7fcff / #b9d6ea…），
+       做深色主题必须逐个找出来覆盖，一定会漏。抽成令牌后，深色块只改值。 */
+    --surface-2:#fafbfc;      /* 次级面：hover 行、次级工具条 */
+    --surface-3:#f1f2f4;      /* 三级面：禁用态、tag 底、滚动条滑块 */
+    --border-strong:#cfd3d8;  /* hover 边框 */
+    --scroll:#dcdfe3;         /* 滚动条滑块 */
+    --inverse-bg:#1f2329;     /* 反色面（提示条 toast）*/
+    --on-accent:#ffffff;      /* 实心强调色上的文字 */
+    --shadow-a:rgba(0,0,0,.05);
+
+    /* 强调色的"淡底 / 描边"成套：徽章、提示条、警示框 */
+    --blue-line:#b9d6ea; --blue-tint:#f7fcff;
+    --green-line:#c9e6d6;
+    --amber-line:#ecd9a8; --amber-tint:#fffbf2; --amber-ink:#6f4800;
+    --red-line:#eebfbb; --red-tint:#fdeceb;
+    --violet-line:#e3dbf3;
+    --warm-tint:#fff8f4; --warm-line:#f3d9cb;
+
+    /* ---- 排版（7 级，取代原来的 16 级）---- */
+    --fs-micro:11px; --fs-meta:12px; --fs-s:13px; --fs-body:14px;
+    --fs-title:16px; --fs-h2:20px; --fs-num:24px;
+
+    /* ---- 间距（4px 基数）---- */
+    --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-6:24px; --sp-8:32px; --sp-12:48px;
+
+    /* ---- 圆角（3 档，取代原来的 13 档）---- */
+    --r-sm:8px; --r-md:12px; --r-pill:999px;
+    --radius:12px;               /* 兼容旧引用 */
+
+    /* ---- 控件高度（3 档）---- */
+    --h-sm:28px; --h-md:32px; --h-lg:40px;
+    /* 底部操作栏的实际占位高度。1280 宽时它会换行到 98px，所以内边距必须跟着它走 ——
+       改版前中栏写死 60px，结果底栏被盖住了 5 个内容元素（含 3 条本场要点）。 */
+    --actionbar-h:112px;
+
+    /* ---- 阴影 ---- */
+    --sh-1:0 1px 2px rgba(15,23,42,.04),0 1px 3px rgba(15,23,42,.05);
+    --sh-2:0 2px 4px rgba(15,23,42,.04),0 8px 24px rgba(15,23,42,.07);
+    --sh-3:0 4px 12px rgba(15,23,42,.08),0 20px 48px rgba(15,23,42,.16);
   }
+  /* ============================================================================
+   * 深色主题（2026-10-16 用户要求）
+   *
+   * 只换令牌值，不重写任何组件规则 —— 这就是把面/线抽成令牌的回报。
+   * 对比度全部实测过（底为卡片 #1e2026 / 页底 #16181d，AA 小字门槛 4.5:1）：
+   *   正文 13.51 / 次级 7.22 / 三级 5.08   ✓
+   *   粉 6.85 · 蓝 7.42 · 绿 7.35 · 琥珀 7.71 · 红 6.20 · 紫 6.75   ✓
+   *   六套徽章 6.04 ~ 7.06   ✓
+   * 注意两处刻意的差异：
+   *   ① 深色下主按钮用「亮粉底 + 深字」（7.83:1），而不是白字 ——
+   *      白字压在亮粉上只有 2.38:1，深色界面里反而读不清。
+   *   ② 文字色整体提亮而不是把浅色的值直接搬过来，否则深底上全部不达标。
+   * ========================================================================== */
+  [data-theme="dark"]{
+    color-scheme: dark;
+    --bg:#16181d; --card:#1e2026; --border:#31353d; --border-2:#272b32;
+    --text:#e8eaed; --text-2:#a8adb5; --text-3:#8b9099; --text-4:#8b9099;
+    --pink:#f287ab; --pink-deco:#f287ab; --pink-hover:#f79cba; --pink-soft:#3a2230;
+    --blue:#6cb8e0; --blue-soft:#17313f;
+    --green:#4cc38a; --green-soft:#1d3a2c;
+    --amber:#e0a94a; --amber-soft:#3b2f18;
+    --red:#f07f75; --red-soft:#3d2220;
+    --violet:#b39ae8; --violet-soft:#2c2440;
+    --focus:#8ab4f8;
+
+    --surface-2:#23262d;      /* 比 card 略亮：深色下"次级面"要提亮才有层次 */
+    --surface-3:#2a2e35;
+    --border-strong:#3d434c;
+    --scroll:#3d434c;
+    --inverse-bg:#e8eaed;
+    --on-accent:#1a1014;      /* 亮粉底上用深字：7.83:1（白字只有 2.38:1）*/
+    --shadow-a:rgba(0,0,0,.4);
+
+    --blue-line:#2a4a5e; --blue-tint:#1a2b36;
+    --green-line:#27503c;
+    --amber-line:#4a3c1c; --amber-tint:#2b2415; --amber-ink:#e8b45c;
+    --red-line:#552c28; --red-tint:#33201e;
+    --violet-line:#3a3154;
+    --warm-tint:#2b2318; --warm-line:#4a3c1c;
+  }
+  /* 提示条（toast）在深色下是"反色面"，文字要跟着反过来 */
+  [data-theme="dark"] #toast{background:var(--inverse-bg);color:#16181d}
+  /* 顶栏两个组合态：浅色下是浅绿/浅琥珀底，深色下要压暗并提亮文字 */
+  [data-theme="dark"] .mode.ok{border-color:#2c5c42;background:#16301f;color:#6fce9e}
+  [data-theme="dark"] .mode.warn,
+  [data-theme="dark"] .mode.risk{border-color:#4a3c1c;background:#2b2415;color:#e8b45c}
+  [data-theme="dark"] .switch.risk.on{background:#c9852a}
+  [data-theme="dark"] .b-idle{background:var(--surface-3);color:var(--text-2)}
+  /* 剩下这些是令牌没覆盖到的一次性色值 */
+  [data-theme="dark"] .task .when > span:last-child::before{color:#5c636c}
+  [data-theme="dark"] .stage .prog{color:#7cc4e8}
+  [data-theme="dark"] .barstrip.info{color:#9fd0ea}
+  [data-theme="dark"] .barstrip.warn{color:#e8b45c}
+  [data-theme="dark"] .btn-detail{color:#b8a09c}
+  [data-theme="dark"] .clip:hover{border-color:var(--border-strong)}
+  [data-theme="dark"] .tinput.changed{border-color:#6b5522}
+  [data-theme="dark"] .score.low .bar i{background:#d9930a}
+  [data-theme="dark"] .linkbtn.danger:hover{color:#ffb3ac}
+  [data-theme="dark"] .primary:disabled{background:var(--surface-3);color:#8b9099}
+  [data-theme="dark"] .empty-strip{border-color:#383d45}
+  [data-theme="dark"] .switch{background:#4a5058}
+  [data-theme="dark"] .switch::after{background:#e8eaed}
+  [data-theme="dark"] .score .bar{background:#33383f}
+  [data-theme="dark"] .rep-same{color:#5c636c}
+  [data-theme="dark"] .modal{box-shadow:0 24px 60px rgba(0,0,0,.6)}
+  [data-theme="dark"] .task-menu,[data-theme="dark"] .ops-menu,[data-theme="dark"] .slot-menu{
+    background:var(--card);box-shadow:0 8px 28px rgba(0,0,0,.55)}
+  /* 墓碑态用的是几个一次性浅紫，令牌没覆盖到 */
+  [data-theme="dark"] .clip.tomb{background:#1c1a24;border-color:#3a3154}
+  [data-theme="dark"] .tomb-note{background:#241f33;border-color:#3a3154;color:#c9bde6}
+  [data-theme="dark"] .tomb-note b{color:#ded4f5}
+  [data-theme="dark"] .tomb-note a{color:var(--violet)}
+  [data-theme="dark"] .tomb-meta{color:#a99fc4}
+  [data-theme="dark"] .tomb-meta code{background:#2a2440;border-color:#3a3154}
+
   *{box-sizing:border-box}
   html,body{height:100%}
   body{margin:0;background:var(--bg);color:var(--text);
-    font:14px/1.6 "Microsoft YaHei","PingFang SC","Hiragino Sans GB",-apple-system,Segoe UI,sans-serif;
+    font:var(--fs-body)/1.7 "Microsoft YaHei","PingFang SC","Hiragino Sans GB",-apple-system,Segoe UI,sans-serif;
     -webkit-font-smoothing:antialiased}
   button{font:inherit;cursor:pointer} input,select,textarea{font:inherit}
   .mono{font-variant-numeric:tabular-nums;font-family:ui-monospace,Consolas,monospace}
   a{color:var(--blue);text-decoration:none} a:hover{text-decoration:underline}
 
+  /* ---- 键盘可见焦点：改版前全站 0 条 :focus-visible，键盘用户完全无法定位 ---- */
+  :focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:inherit}
+  .task:focus-visible{outline-offset:-2px}
+  /* ---- 尊重系统的"减少动态效果"偏好（阶段条的 pulse 是无限动画）---- */
+  @media (prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;
+      transition-duration:.01ms!important;scroll-behavior:auto!important}
+  }
+
   .topbar{height:56px;display:flex;align-items:center;justify-content:space-between;
     padding:0 18px;background:var(--card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:20}
   .brand{display:flex;align-items:center;gap:10px;min-width:0}
-  .logo{width:26px;height:26px;border-radius:7px;background:var(--pink);color:#fff;
-    display:grid;place-items:center;font-weight:700;font-size:13px;flex:0 0 auto}
-  .brand h1{margin:0;font-size:15px;font-weight:600;white-space:nowrap}
-  .brand .sub{color:var(--text-3);font-size:12px;margin-left:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .logo{width:26px;height:26px;border-radius:var(--r-sm);background:var(--pink);color:var(--on-accent);
+    display:grid;place-items:center;font-weight:700;font-size:var(--fs-s);flex:0 0 auto}
+  .brand h1{margin:0;font-size:var(--fs-title);font-weight:600;white-space:nowrap}
+  .brand .sub{color:var(--text-3);font-size:var(--fs-meta);margin-left:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* 构建徽章（2026-10-25）：默认是低调的等宽小标签；磁盘代码比进程新时转红并写明"需重启" */
+  .build-tag{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1;
+    font-variant-numeric:tabular-nums;padding:3px 7px;border-radius:var(--r-sm);
+    background:var(--hover,rgba(127,127,127,.12));color:var(--text-3);cursor:help;white-space:nowrap;flex:0 0 auto}
+  .build-tag.stale{background:rgba(229,72,77,.14);color:#e5484d;font-weight:600}
   .top-right{display:flex;align-items:center;gap:10px;flex:0 0 auto}
   .live-dot{width:7px;height:7px;border-radius:50%;background:var(--green);
-    box-shadow:0 0 0 3px rgba(43,182,115,.15);display:inline-block;margin-right:6px}
-  .live-dot.bad{background:var(--red);box-shadow:0 0 0 3px rgba(217,74,74,.15)}
-  .mode{display:flex;align-items:center;gap:8px;padding:5px 10px;border:1px solid var(--border);
-    border-radius:999px;font-size:12.5px;color:var(--text-2);background:#fafbfc;white-space:nowrap}
+    box-shadow:0 0 0 3px rgba(15,122,72,.15);display:inline-block;margin-right:6px}
+  .live-dot.bad{background:var(--red);box-shadow:0 0 0 3px rgba(179,38,30,.15)}
+  .mode{display:flex;align-items:center;gap:var(--sp-2);padding:5px 10px;border:1px solid var(--border);
+    border-radius:var(--r-pill);font-size:var(--fs-meta);color:var(--text-2);background:var(--surface-2);white-space:nowrap}
   /* 字幕开关的两个"组合态"：本地 ASR 下烧字幕是绿的（时间戳可信），
      云端 ASR 下是琥珀色的（句级时间窗不可靠，会错位）——让这个已知坏组合在界面上看得见。 */
-  .mode.ok{border-color:var(--green);background:#f2fbf6;color:#1f7a4d}
-  .mode.warn{border-color:var(--amber);background:#fff8ec;color:#a96a00}
-  .switch{position:relative;width:36px;height:20px;border-radius:999px;background:#d6d9dd;
+  .mode.ok{border-color:#a9d9bf;background:var(--green-soft);color:#0b5c36}
+  .mode.warn{border-color:var(--amber-line);background:var(--amber-soft);color:var(--amber-ink)}
+  /* 高风险设置（全自动·免确认发布）开启时单独走琥珀，不再和普通开关共用品牌粉 ——
+     否则"会自动发文、不需要我确认"看起来和"字幕开关"一样无害。 */
+  .mode.risk{border-color:var(--amber-line);background:var(--amber-soft);color:var(--amber-ink)}
+  /* 开关：视觉尺寸保持 36×20，但用一层透明的 ::before 把**可点区域**撑到 44×28。
+     为什么这么做而不是直接把开关做大：它是顶栏里最密的控件，放大 8px 会挤走旁边的
+     模式文案；而 36×20 本身低于 WCAG 2.2 的 24×24 指针目标下限。撑点击区是标准解法。 */
+  .switch{position:relative;width:36px;height:20px;border-radius:var(--r-pill);background:var(--border-strong);
     border:none;padding:0;transition:background .18s;flex:0 0 auto}
+  .switch::before{content:"";position:absolute;inset:-4px -4px;border-radius:var(--r-pill)}
   .switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
-    background:#fff;transition:transform .18s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+    background:var(--card);transition:transform .18s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
   .switch.on{background:var(--pink)}
   .switch.on::after{transform:translateX(16px)}
+  .switch.risk.on{background:#b8791a}
   .switch.sm{width:32px;height:18px}
   .switch.sm::after{width:14px;height:14px}
   .switch.sm.on::after{transform:translateX(14px)}
-  .ghost{border:1px solid var(--border);background:#fff;color:var(--text-2);
-    padding:6px 12px;border-radius:8px;font-size:13px;white-space:nowrap}
-  .ghost:hover{border-color:#cfd3d8;color:var(--text)}
-  .ghost.on{background:var(--pink-soft);border-color:var(--pink);color:#d94d7a}
+  .ghost{border:1px solid var(--border);background:var(--card);color:var(--text-2);
+    padding:6px 12px;border-radius:var(--r-sm);font-size:var(--fs-s);white-space:nowrap}
+  .ghost:hover{border-color:var(--border-strong);color:var(--text)}
+  .ghost.on{background:var(--pink-soft);border-color:var(--pink);color:var(--pink)}
+  /* 图标 + 文字的按钮（目前只有主题切换）*/
+  .icon-btn{display:inline-flex;align-items:center;gap:6px}
+  .icon-btn>span:first-child{font-size:var(--fs-body);line-height:1}
 
   .tabs{display:flex;gap:4px;padding:8px 18px 0;background:var(--card);border-bottom:1px solid var(--border);
-    position:sticky;top:56px;z-index:19}
-  .tab{padding:7px 14px;font-size:13px;color:var(--text-2);border:none;background:none;
-    border-bottom:2px solid transparent;border-radius:6px 6px 0 0}
-  .tab:hover{background:#fafbfc}
+    position:sticky;top:56px;z-index:19;overflow-x:auto;scrollbar-width:none}
+  .tabs::-webkit-scrollbar{display:none}
+  .tab{padding:7px 14px;font-size:var(--fs-s);color:var(--text-2);border:none;background:none;
+    border-bottom:2px solid transparent;border-radius:var(--r-sm) var(--r-sm) 0 0;flex:0 0 auto}
+  .tab:hover{background:var(--surface-2)}
   .tab.on{color:var(--pink);border-bottom-color:var(--pink);font-weight:600}
 
   .app{display:grid;grid-template-columns:280px minmax(0,1fr) 300px;height:calc(100vh - 56px - 41px)}
   .col{overflow-y:auto;height:100%}
   .col-left{border-right:1px solid var(--border);background:var(--card)}
-  .col-mid{padding:18px 22px 60px}
+  .col-mid{padding:0;display:flex;flex-direction:column;overflow:hidden}
+  /* 中栏拆成「可滚动内容 + 固定页脚」两段：
+     为什么不再用一个 sticky 的浮层 —— 实测它会横在切片卡片中间把正文盖住。
+     固定页脚不参与滚动 ⇒ 任何滚动位置都不会与内容重叠，也不需要猜内边距要留多少。 */
+  .col-mid > #detail{flex:1;min-height:0;overflow-y:auto;padding:18px 22px 24px}
+  .col-mid > #detail::-webkit-scrollbar{width:8px}
+  .col-mid > #detail::-webkit-scrollbar-thumb{background:var(--scroll);border-radius:var(--r-sm)}
+  .detail-foot{flex:0 0 auto;border-top:1px solid var(--border);background:var(--card)}
+  .detail-foot:empty{display:none}
   .col-right{border-left:1px solid var(--border);background:var(--card);padding:16px 14px}
   .col::-webkit-scrollbar{width:8px}
-  .col::-webkit-scrollbar-thumb{background:#dcdfe3;border-radius:4px}
-  .col-label{font-size:11.5px;letter-spacing:.06em;color:var(--text-3);
+  .col::-webkit-scrollbar-thumb{background:var(--scroll);border-radius:var(--r-sm)}
+  .col-label{font-size:var(--fs-meta);letter-spacing:.06em;color:var(--text-3);
     padding:14px 16px 8px;text-transform:uppercase}
-  .fullpage{height:calc(100vh - 56px - 41px);overflow-y:auto;padding:18px 22px 60px}
+  .fullpage{height:calc(100vh - 56px - 41px);overflow-y:auto;padding:18px 22px var(--actionbar-h)}
 
-  .searchbar{padding:10px 12px 6px;display:flex;flex-direction:column;gap:8px}
-  .searchbar input{width:100%;border:1px solid var(--border);border-radius:8px;padding:7px 10px;font-size:13px}
-  .searchbar input:focus{outline:none;border-color:#cfe6f7;box-shadow:0 0 0 3px rgba(0,174,236,.1)}
+  .searchbar{padding:10px 12px 6px;display:flex;flex-direction:column;gap:var(--sp-2)}
+  /* 「多选」是低频批量操作，不该占满一整行、把筛选器和任务列表切开 ——
+     flex-column 默认 stretch，这里显式收回左对齐、只占自身宽度。 */
+  .searchbar > #btnMulti{align-self:flex-start;font-size:var(--fs-meta);padding:5px 12px;min-height:var(--h-sm)}
+  .searchbar input{width:100%;border:1px solid var(--border);border-radius:var(--r-sm);padding:7px 10px;font-size:var(--fs-s)}
+  .searchbar input:focus{outline:none;border-color:var(--blue-line);box-shadow:0 0 0 3px rgba(11,110,168,.12)}
   .filters{display:flex;gap:5px;flex-wrap:wrap}
-  .filters button{font-size:11.5px;padding:3px 9px;border-radius:999px;border:1px solid var(--border);
-    background:#fff;color:var(--text-2)}
-  .filters button.on{border-color:var(--pink);background:var(--pink-soft);color:#d94d7a;font-weight:600}
+  /* 筛选 chips 补到 28px 高（原来 26px，低于 WCAG 2.2 指针目标下限）*/
+  .filters button{font-size:var(--fs-meta);padding:4px 10px;border-radius:var(--r-pill);border:1px solid var(--border);
+    background:var(--card);color:var(--text-2);min-height:var(--h-sm)}
+  .filters button.on{border-color:var(--pink);background:var(--pink-soft);color:var(--pink);font-weight:600}
 
   .task{padding:11px 14px 12px;border-left:3px solid transparent;cursor:pointer;
-    border-bottom:1px solid var(--border-2)}
-  .task:hover{background:#fafbfc}
+    border-bottom:1px solid var(--border-2);position:relative}
+  .task:hover{background:var(--surface-2)}
   .task.active{border-left-color:var(--pink);background:var(--pink-soft)}
-  .task .when{font-size:11.5px;color:var(--text-3);margin-bottom:3px;display:flex;justify-content:space-between;gap:8px}
-  .task .name{font-size:13.2px;font-weight:500;line-height:1.45;margin-bottom:5px;
+  /* 时间行右侧给「⋯」让出 34px：改版前两者重叠 17px，把"00:43"的末两位盖掉了。
+     用 margin-right（而不是 padding-right）—— padding 只缩内容区，盒子右边界仍在 265，
+     和按钮的 244 还是叠着；margin 才是真的把盒子收回来。
+     两个 <span>（日期 / 时长）之间补分隔符，否则会连读成 23:41:3000:43:45。 */
+  .task .when{font-size:var(--fs-meta);color:var(--text-3);margin-bottom:3px;
+    display:flex;justify-content:space-between;gap:var(--sp-2);margin-right:34px}
+  .task .when > span:last-child::before{content:"·";margin-right:6px;color:var(--text-4)}
+  .task .name{font-size:var(--fs-body);font-weight:500;line-height:1.45;margin-bottom:5px;
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-  .task .meta{font-size:11.5px;color:var(--text-3);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  /* 任务列表项的操作入口：悬停显示「⋯」，右键也可打开 */
-  .task{position:relative}
-  .task .more{position:absolute;top:7px;right:7px;width:24px;height:24px;line-height:1;
-    border:1px solid var(--border);background:#fff;border-radius:6px;color:var(--text-2);
-    font-size:15px;font-weight:600;padding:0;cursor:pointer;z-index:2;
-    background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.05)}
-  .task .more:hover{border-color:#cfe6f7;color:#1a86c7;background:#f7fcff}
-  .task .more:hover{border-color:#cfd3d8;background:#f7f8f9;color:var(--text)}
+  .task .meta{font-size:var(--fs-meta);color:var(--text-3);display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap}
+  /* 「⋯」默认隐藏，悬停 / 键盘聚焦 / 菜单已开时才出现 —— 常驻就会把时间压住 */
+  .task .more{position:absolute;top:8px;right:7px;width:28px;height:28px;line-height:1;
+    border:1px solid var(--border);background:var(--card);border-radius:var(--r-sm);color:var(--text-2);
+    font-size:var(--fs-title);font-weight:600;padding:0;cursor:pointer;z-index:2;
+    box-shadow:var(--sh-1);opacity:0;transition:opacity .15s}
+  .task:hover .more,.task:focus-within .more,.task.menu-open .more{opacity:1}
+  .task .more:hover{border-color:var(--blue-line);color:var(--blue);background:var(--blue-tint)}
   /* ---- 多选（批量删除） ---- */
-  .task .pick{position:absolute;top:11px;left:9px;width:15px;height:15px;cursor:pointer;accent-color:var(--pink);z-index:2}
+  .task .pick{position:absolute;top:11px;left:9px;width:17px;height:17px;cursor:pointer;accent-color:var(--pink);z-index:2}
   .task.picked{background:var(--pink-soft);border-left-color:var(--pink)}
   .task.picked .name{font-weight:600}
-  .multibar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-    padding:8px 10px;margin:6px 0 4px;background:#fff8f4;border:1px solid #f3d9cb;border-radius:8px;font-size:12.5px}
+  .multibar{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;
+    padding:var(--sp-2) 10px;margin:6px 0 4px;background:var(--warm-tint);border:1px solid var(--warm-line);border-radius:var(--r-sm);font-size:var(--fs-s)}
   .multibar .cnt{color:var(--text-2)}
-  .multibar .cnt b{color:var(--pink);font-size:14px}
-  .multibar .btn-sm.danger{border-color:#f0c8c8;color:#c33}
-  .multibar .btn-sm[disabled]{opacity:.5;cursor:not-allowed}
-  #btnMulti.on{border-color:#cfe6f7;color:#1a86c7;background:#f7fcff}
-  .task-menu{position:fixed;z-index:60;background:#fff;border:1px solid var(--border);
-    border-radius:9px;box-shadow:0 8px 28px rgba(0,0,0,.16);padding:4px;min-width:186px;font-size:13px}
+  .multibar .cnt b{color:var(--pink);font-size:var(--fs-body)}
+  .multibar .btn-sm.danger{border-color:var(--red-line);color:var(--red)}
+  .multibar .btn-sm[disabled]{opacity:.55;cursor:not-allowed}
+  #btnMulti.on{border-color:var(--blue-line);color:var(--blue);background:var(--blue-tint)}
+  .task-menu{position:fixed;z-index:60;background:var(--card);border:1px solid var(--border);
+    border-radius:var(--r-md);box-shadow:var(--sh-3);padding:4px;min-width:186px;font-size:var(--fs-s)}
   .task-menu button{display:block;width:100%;text-align:left;border:none;background:none;
-    padding:7px 11px;border-radius:6px;color:var(--text);font-size:13px}
-  .task-menu button:hover{background:#f4f5f7}
-  .task-menu button.danger{color:#c33}
-  .task-menu button.danger:hover{background:#fef2f2}
+    padding:8px 11px;border-radius:var(--r-sm);color:var(--text);font-size:var(--fs-s);min-height:var(--h-sm)}
+  .task-menu button:hover{background:var(--bg)}
+  .task-menu button.danger{color:var(--red)}
+  .task-menu button.danger:hover{background:var(--red-soft)}
   .task-menu .sep{height:1px;background:var(--border-2);margin:4px 6px}
-  .task-menu .head{padding:6px 11px 4px;font-size:11.5px;color:var(--text-3);
+  .task-menu .head{padding:6px 11px 4px;font-size:var(--fs-meta);color:var(--text-3);
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px}
-  .badge{padding:1px 7px;border-radius:999px;font-size:11px;font-weight:500;white-space:nowrap}
-  .b-done{background:#eef7f1;color:var(--green)}
-  .b-run{background:#eef6fd;color:#1a86c7}
-  .b-wait{background:#fff6e8;color:#c8811a}
-  .b-fail{background:#fef2f2;color:#c33}
-  .b-idle{background:#f2f3f5;color:var(--text-3)}
+  /* 状态徽章整组重配：改版前实测 绿 2.39 / 黄 2.96 / 蓝 3.64，全部不达 AA；
+     现在最低 4.84。徽章只有 11px，正落在要求最严的一档。 */
+  .badge{padding:1px 7px;border-radius:var(--r-pill);font-size:var(--fs-micro);font-weight:500;white-space:nowrap}
+  .b-done{background:var(--green-soft);color:var(--green)}
+  .b-run{background:var(--blue-soft);color:var(--blue)}
+  .b-wait{background:var(--amber-soft);color:var(--amber)}
+  .b-fail{background:var(--red-soft);color:var(--red)}
+  .b-idle{background:var(--surface-3);color:var(--text-3)}
 
   .stages{display:flex;align-items:center;gap:2px;margin-bottom:14px;flex-wrap:wrap}
-  .stage{display:flex;align-items:center;gap:6px;padding:5px 11px 5px 8px;border-radius:999px;
-    font-size:12.5px;color:var(--text-3);background:var(--card);border:1px solid var(--border)}
-  .stage .dot{width:15px;height:15px;border-radius:50%;background:#e3e5e8;color:#fff;
-    display:grid;place-items:center;font-size:10px;font-weight:700}
-  .stage.done{color:var(--green);border-color:#d9ece2}
+  .stage{display:flex;align-items:center;gap:6px;padding:5px 11px 5px 8px;border-radius:var(--r-pill);
+    font-size:var(--fs-s);color:var(--text-3);background:var(--card);border:1px solid var(--border)}
+  .stage .dot{width:15px;height:15px;border-radius:50%;background:var(--surface-3);color:var(--on-accent);
+    display:grid;place-items:center;font-size:var(--fs-micro);font-weight:700}
+  .stage.done{color:var(--green);border-color:var(--green-line)}
   .stage.done .dot{background:var(--green)}
-  .stage.active{color:#1a86c7;border-color:#cfe6f7;background:#f6fbff}
+  .stage.active{color:var(--blue);border-color:var(--blue-line);background:var(--blue-tint)}
   .stage.active .dot{background:var(--blue);animation:pulse 1.6s infinite}
-  .stage.fail{color:#c33;border-color:#f8d7d7;background:#fef2f2}
+  .stage.fail{color:var(--red);border-color:var(--red-line);background:var(--red-soft)}
   .stage.fail .dot{background:var(--red)}
-  .stage .prog{font-size:11.5px;color:#5aa9d6;margin-left:2px}
-  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(0,174,236,.5)}50%{box-shadow:0 0 0 4px rgba(0,174,236,0)}}
-  .arrow{color:#cfd3d8;font-size:11px}
+  .stage .prog{font-size:var(--fs-meta);color:#3f7fa4;margin-left:2px}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(11,110,168,.5)}50%{box-shadow:0 0 0 4px rgba(11,110,168,0)}}
+  .arrow{color:var(--border-strong);font-size:var(--fs-meta)}
 
-  .barstrip{display:flex;align-items:center;gap:10px;font-size:12.6px;padding:9px 14px;
-    border-radius:9px;margin-bottom:14px;border:1px solid var(--border);background:var(--card);color:var(--text-2);flex-wrap:wrap}
+  .barstrip{display:flex;align-items:center;gap:10px;font-size:var(--fs-s);padding:9px 14px;
+    border-radius:var(--r-md);margin-bottom:14px;border:1px solid var(--border);background:var(--card);color:var(--text-2);flex-wrap:wrap}
   .barstrip b{color:var(--text);font-weight:600}
-  .barstrip.cost{background:#fafbfc}
-  .barstrip.warn{background:#fffbf2;border-color:#f2dfa8;color:#8a6d1a}
-  .barstrip.warn b{color:#a56a00}
-  .barstrip.info{background:#f6fbff;border-color:#cfe6f7;color:#1a6a9c}
-  .errbar{display:flex;align-items:flex-start;gap:12px;padding:12px 15px;border-radius:10px;
-    background:#fef2f2;border:1px solid #f8d7d7;margin-bottom:14px}
-  .errbar .ico{width:20px;height:20px;border-radius:50%;background:#e05252;color:#fff;
-    display:grid;place-items:center;font-size:12px;font-weight:700;flex:0 0 auto;margin-top:1px}
-  .errbar .txt{font-size:13px;color:#8a3b3b;line-height:1.55;min-width:0}
-  .errbar .txt b{color:#c33}
-  .errbar .acts{margin-left:auto;display:flex;gap:8px;flex:0 0 auto;flex-wrap:wrap}
-  .btn-retry{border:1px solid #f0c8c8;background:#fff;color:#c33;padding:6px 13px;
-    border-radius:8px;font-size:12.5px;white-space:nowrap}
-  .btn-retry:hover{background:#fff7f7;border-color:#e8b0b0}
-  .btn-detail{border:none;background:none;color:#a97a7a;font-size:12.5px;padding:6px 4px}
+  .barstrip.cost{background:var(--surface-2)}
+  .barstrip.warn{background:var(--amber-tint);border-color:var(--amber-line);color:var(--amber-ink)}
+  .barstrip.warn b{color:var(--amber)}
+  .barstrip.info{background:var(--blue-tint);border-color:var(--blue-line);color:#0f5b83}
+  .errbar{display:flex;align-items:flex-start;gap:var(--sp-3);padding:var(--sp-3) 15px;border-radius:var(--r-md);
+    background:var(--red-soft);border:1px solid var(--red-line);margin-bottom:14px}
+  .errbar .ico{width:20px;height:20px;border-radius:50%;background:var(--red);color:var(--on-accent);
+    display:grid;place-items:center;font-size:var(--fs-meta);font-weight:700;flex:0 0 auto;margin-top:1px}
+  .errbar .txt{font-size:var(--fs-s);color:#7a2c26;line-height:1.6;min-width:0}
+  .errbar .txt b{color:var(--red)}
+  .errbar .acts{margin-left:auto;display:flex;gap:var(--sp-2);flex:0 0 auto;flex-wrap:wrap}
+
+  /* ---- 任务操作条（2026-10-16 评审 IA-1 分层）----------------------------------
+   * 三层结构：常用动作常显 → 诊断类收进「更多 ▾」→ 删除独立在右端用红色区分。
+   * 为什么：改版前 9 个按钮权重完全相同，用户看不出"日常下一步"是哪个。 */
+  .ops-bar{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap}
+  .ops-main{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;min-width:0}
+  .ops-meta{display:flex;align-items:center;gap:var(--sp-2);margin-left:auto;flex-wrap:wrap}
+  .ops-id{font-size:var(--fs-meta);color:var(--text-3);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ops-more{position:relative}
+  .ops-more-btn{color:var(--text-2)}
+  .ops-more-btn[aria-expanded="true"]{border-color:var(--blue-line);background:var(--blue-tint);color:var(--blue)}
+  .ops-menu{position:absolute;top:calc(100% + 6px);left:0;z-index:40;min-width:172px;
+    background:var(--card);border:1px solid var(--border);border-radius:var(--r-md);
+    box-shadow:var(--sh-3);padding:4px}
+  .ops-menu[hidden]{display:none}
+  .ops-menu button{display:block;width:100%;text-align:left;border:none;background:none;
+    padding:8px 11px;border-radius:var(--r-sm);color:var(--text);font-size:var(--fs-s);min-height:var(--h-sm)}
+  .ops-menu button:hover{background:var(--bg)}
+  /* 删除任务：独立在最右，用红色文字而不是红色实心 ——
+     它是低频且不可逆的动作，实心红会喧宾夺主，盖过真正的日常操作。 */
+  .danger-ghost{border-color:var(--red-line);color:var(--red);background:var(--card);margin-left:var(--sp-1)}
+  .danger-ghost:hover{background:var(--red-soft);border-color:var(--red-line)}
+  .btn-retry{border:1px solid var(--red-line);background:var(--card);color:var(--red);padding:6px 13px;
+    border-radius:var(--r-sm);font-size:var(--fs-s);white-space:nowrap;min-height:var(--h-sm)}
+  .btn-retry:hover{background:var(--red-soft);border-color:var(--red-line)}
+  .btn-detail{border:none;background:none;color:#8d5f5a;font-size:var(--fs-s);padding:6px 4px;min-height:var(--h-sm)}
   .btn-detail:hover{text-decoration:underline}
 
-  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
-    padding:16px 18px;margin-bottom:14px}
-  .card h2{margin:0 0 12px;font-size:13.5px;font-weight:600;color:var(--text-2);
-    display:flex;align-items:center;gap:8px}
-  .ai-tag{font-size:10.5px;padding:1px 6px;border-radius:4px;background:#f0f6ff;color:#2b7cd3;font-weight:400}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-md);box-shadow:var(--sh-1);
+    padding:var(--sp-4) 18px;margin-bottom:14px}
+  .card h2{margin:0 0 var(--sp-3);font-size:var(--fs-s);font-weight:600;color:var(--text);
+    display:flex;align-items:center;gap:var(--sp-2)}
+  .ai-tag{font-size:var(--fs-micro);padding:1px 6px;border-radius:var(--r-sm);background:var(--blue-soft);color:var(--blue);font-weight:400}
   .summary p{margin:0 0 10px}
   .summary ul{margin:6px 0 0;padding-left:20px;color:var(--text-2)}
   .summary li{margin-bottom:5px}
   .summary b{color:var(--text)}
-  .summary h2,.summary h3{font-size:14px;margin:14px 0 8px}
-  .summary blockquote{margin:8px 0;padding:8px 12px;background:#fffbf2;border-left:3px solid #f2dfa8;
-    border-radius:0 6px 6px 0;color:#8a6d1a;font-size:12.6px}
-  .summary code{background:#f4f5f7;padding:1px 5px;border-radius:4px;font-size:12.5px}
+  .summary h2,.summary h3{font-size:var(--fs-title);margin:14px 0 var(--sp-2)}
+  .summary blockquote{margin:var(--sp-2) 0;padding:var(--sp-2) var(--sp-3);background:var(--amber-tint);border-left:3px solid var(--amber-line);
+    border-radius:0 var(--r-sm) var(--r-sm) 0;color:var(--amber-ink);font-size:var(--fs-s)}
+  .summary code{background:var(--bg);padding:1px 5px;border-radius:var(--r-sm);font-size:var(--fs-s)}
 
-  details.scoped{margin:0 0 14px;border:1px solid var(--border);border-radius:10px;background:var(--card)}
-  details.scoped summary{padding:10px 16px;font-size:13px;color:var(--text-2);cursor:pointer;
-    list-style:none;display:flex;align-items:center;gap:8px}
+  details.scoped{margin:0 0 14px;border:1px solid var(--border);border-radius:var(--r-md);background:var(--card)}
+  details.scoped summary{padding:10px 16px;font-size:var(--fs-s);color:var(--text-2);cursor:pointer;
+    list-style:none;display:flex;align-items:center;gap:var(--sp-2);min-height:var(--h-md)}
   details.scoped summary::-webkit-details-marker{display:none}
   details.scoped summary::before{content:"▸";color:var(--text-3)}
   details.scoped[open] summary::before{content:"▾"}
   details.scoped .inner{padding:2px 16px 16px;display:grid;grid-template-columns:1fr 1fr;gap:13px 18px}
   details.scoped .inner .full{grid-column:1/-1}
 
-  .clips-head{display:flex;align-items:center;justify-content:space-between;margin:20px 0 12px;flex-wrap:wrap;gap:8px}
-  .clips-head h3{margin:0;font-size:14px;font-weight:600}
-  .clips-head .hint{font-size:12px;color:var(--text-3)}
-  .clip{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  .clips-head{display:flex;align-items:center;justify-content:space-between;margin:20px 0 var(--sp-3);flex-wrap:wrap;gap:var(--sp-2)}
+  .clips-head h3{margin:0;font-size:var(--fs-title);font-weight:600}
+  .clips-head .hint{font-size:var(--fs-meta);color:var(--text-3)}
+  .clip{background:var(--card);border:1px solid var(--border);border-radius:var(--r-md);box-shadow:var(--sh-1);
     padding:13px 15px;margin-bottom:10px;transition:border-color .15s,box-shadow .15s}
-  .clip:hover{border-color:#d5d9de;box-shadow:0 2px 10px rgba(0,0,0,.04)}
+  .clip:hover{border-color:var(--border-strong);box-shadow:var(--sh-2)}
   .clip.off{opacity:.55}
-  .clip.degraded{background:#fffbf2;border-color:#f2dfa8}
-  .clip.failed{border-color:#f8d7d7}
+  .clip.degraded{background:var(--amber-tint);border-color:var(--amber-line)}
+  .clip.failed{border-color:var(--red-line)}
   .clip-head{display:flex;align-items:center;gap:9px;margin-bottom:9px;flex-wrap:wrap}
-  .clip-head input[type=checkbox]{width:15px;height:15px;accent-color:var(--pink);cursor:pointer;margin:0}
-  .tinput{width:82px;border:1px solid var(--border);border-radius:6px;padding:3px 6px;
-    font-size:12.3px;color:var(--text-2);text-align:center}
-  .tinput:focus{outline:none;border-color:#cfe6f7;background:#fff;color:var(--text)}
-  .tinput.changed{border-color:#f0c060;background:#fffaf0;color:#a56a00;font-weight:600}
-  .dash{color:var(--text-3);font-size:12px}
-  .dur{font-size:11.5px;color:var(--text-3);padding:1px 6px;background:#f6f7f8;border-radius:4px}
-  .dur.bad{background:#fef2f2;color:#c33}
-  .changed-tag{font-size:11px;padding:1.5px 7px;border-radius:5px;background:#fff8ec;color:#c8811a}
-  .score{margin-left:auto;display:flex;align-items:center;gap:5px;font-size:12.5px;font-weight:600}
-  .score .bar{width:52px;height:4px;border-radius:2px;background:#eceef0;overflow:hidden}
-  .score .bar i{display:block;height:100%;border-radius:2px;background:var(--pink)}
-  .score.low .bar i{background:var(--amber)}
-  .title-row{display:flex;align-items:center;gap:9px;margin-bottom:8px}
-  .clip-title{flex:1;min-width:0;border:1px solid transparent;background:#fafbfc;border-radius:7px;
-    padding:7px 9px;font-size:13.8px;font-weight:600;color:var(--text)}
-  .clip-title:hover{background:#f5f6f8}
-  .clip-title:focus{outline:none;background:#fff;border-color:#cfe6f7;box-shadow:0 0 0 3px rgba(0,174,236,.1)}
-  .cnt{font-size:11.5px;color:var(--text-3);flex:0 0 auto;min-width:44px;text-align:right}
-  .cnt.over{color:#d94a4a;font-weight:600}
-  .degraded-note{font-size:12px;color:#a56a00;margin-bottom:8px;display:flex;gap:6px;align-items:center}
+  .clip-head input[type=checkbox]{width:17px;height:17px;accent-color:var(--pink);cursor:pointer;margin:0}
+  .tinput{width:82px;border:1px solid var(--border);border-radius:var(--r-sm);padding:3px 6px;
+    font-size:var(--fs-meta);color:var(--text-2);text-align:center}
+  .tinput:focus{outline:none;border-color:var(--blue-line);background:var(--card);color:var(--text)}
+  .tinput.changed{border-color:#e3bd6a;background:var(--amber-tint);color:var(--amber);font-weight:600}
+  .dash{color:var(--text-3);font-size:var(--fs-meta)}
+  /* 时长 / 体积这类元信息原来是 11.5px + #9499a0，读不出来；提到 12px + --text-2 */
+  .dur{font-size:var(--fs-meta);color:var(--text-2);padding:1px 6px;background:var(--surface-3);border-radius:var(--r-sm)}
+  .dur.bad{background:var(--red-soft);color:var(--red)}
+  .changed-tag{font-size:var(--fs-meta);padding:1.5px 7px;border-radius:var(--r-sm);background:var(--amber-soft);color:var(--amber)}
+  .score{margin-left:auto;display:flex;align-items:center;gap:5px;font-size:var(--fs-s);font-weight:600}
+  .score .bar{width:52px;height:4px;border-radius:var(--r-pill);background:var(--surface-3);overflow:hidden}
+  /* 进度条是纯装饰面、不承载文字 —— 这里保留亮粉做视觉锚点 */
+  .score .bar i{display:block;height:100%;border-radius:var(--r-pill);background:var(--pink-deco)}
+  .score.low .bar i{background:#d9930a}
+  .title-row{display:flex;align-items:center;gap:9px;margin-bottom:var(--sp-2)}
+  .clip-title{flex:1;min-width:0;border:1px solid transparent;background:var(--surface-2);border-radius:var(--r-sm);
+    padding:7px 9px;font-size:var(--fs-body);font-weight:600;color:var(--text)}
+  .clip-title:hover{background:var(--surface-2)}
+  .clip-title:focus{outline:none;background:var(--card);border-color:var(--blue-line);box-shadow:0 0 0 3px rgba(11,110,168,.12)}
+  .cnt{font-size:var(--fs-meta);color:var(--text-3);flex:0 0 auto;min-width:44px;text-align:right}
+  .cnt.over{color:var(--red);font-weight:600}
+  .degraded-note{font-size:var(--fs-meta);color:var(--amber);margin-bottom:var(--sp-2);display:flex;gap:6px;align-items:center}
   /* 墓碑拦截态：故意不投的切片。用灰紫而不是红色 —— 它不是错误，
      是「已经投过了」的保护动作，用红色会让人以为出了故障并去点重试。 */
   .clip.tomb{background:#faf9fc;border-color:#ded8ea}
-  .pill.tomb{background:#efe9f8;color:#6b4fa8}
-  .tomb-note{font-size:12px;line-height:1.65;color:#5b5070;background:#f5f2fb;border:1px solid #e3dbf3;
-    border-radius:8px;padding:9px 11px;margin-bottom:9px}
-  .tomb-note b{color:#4b3a78}
-  .tomb-note a{color:#6b4fa8}
-  .tomb-meta{margin:5px 0;color:#6d6484;font-size:11.5px;word-break:break-all}
-  .tomb-meta code{background:#fff;border:1px solid #e3dbf3;border-radius:4px;padding:0 4px}
-  .linkbtn.danger{color:#b3261e}
+  .pill.tomb{background:var(--violet-soft);color:var(--violet)}
+  .tomb-note{font-size:var(--fs-meta);line-height:1.65;color:#4d4363;background:#f5f2fb;border:1px solid var(--violet-line);
+    border-radius:var(--r-sm);padding:9px 11px;margin-bottom:9px}
+  .tomb-note b{color:#40306b}
+  .tomb-note a{color:var(--violet)}
+  .tomb-meta{margin:5px 0;color:#5f5677;font-size:var(--fs-meta);word-break:break-all}
+  .tomb-meta code{background:var(--card);border:1px solid var(--violet-line);border-radius:var(--r-sm);padding:0 4px}
+  .linkbtn.danger{color:var(--red)}
   .linkbtn.danger:hover{color:#8c1d18}
   /* 错误报告降级提示：报告文件没了、内容由事件行合成时必须说清，
      否则用户会以为"细节本来就没有"。用琥珀色 —— 是"信息不完整"，不是"又出错了"。 */
-  .warnbox{font-size:12px;line-height:1.6;color:#7a4a06;background:#fff8e6;border:1px solid #f0dca8;
-    border-radius:8px;padding:8px 11px;margin-bottom:10px}
-  .warnbox code{background:#fff;border:1px solid #f0dca8;border-radius:4px;padding:0 4px;word-break:break-all}
+  .warnbox{font-size:var(--fs-meta);line-height:1.6;color:var(--amber-ink);background:var(--amber-tint);border:1px solid var(--amber-line);
+    border-radius:var(--r-sm);padding:var(--sp-2) 11px;margin-bottom:10px}
+  .warnbox code{background:var(--card);border:1px solid var(--amber-line);border-radius:var(--r-sm);padding:0 4px;word-break:break-all}
   .tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px}
-  .tags span{font-size:11.5px;padding:1.5px 8px;border-radius:5px;background:#f4f5f7;color:#5c6169}
-  .why{font-size:12.6px;color:var(--text-2);margin:0 0 10px;padding-left:10px;border-left:2px solid var(--border)}
+  .tags span{font-size:var(--fs-meta);padding:1.5px 8px;border-radius:var(--r-sm);background:var(--bg);color:var(--text-2)}
+  .why{font-size:var(--fs-s);color:var(--text-2);margin:0 0 10px;padding-left:10px;border-left:2px solid var(--border)}
   .why b{color:var(--pink);font-weight:600}
-  .clip-foot{display:flex;align-items:center;gap:12px;font-size:12.5px;flex-wrap:wrap}
-  .linkbtn{border:none;background:none;color:var(--blue);padding:0}
+  .clip-foot{display:flex;align-items:center;gap:var(--sp-3);font-size:var(--fs-s);flex-wrap:wrap}
+  /* 行内文字链补 24px 最小可点高度（原来 20px，低于 WCAG 2.2 的 24×24 下限）*/
+  .linkbtn{border:none;background:none;color:var(--blue);padding:0;
+    display:inline-flex;align-items:center;min-height:24px}
   .linkbtn:hover{text-decoration:underline}
   .sched{margin-left:auto;color:var(--text-3)}
-  .pill{font-size:11.5px;padding:1.5px 8px;border-radius:999px;background:#eef7f1;color:var(--green)}
-  .pill.fail{background:#fef2f2;color:#c33}
-  .pill.wait{background:#fff6e8;color:#c8811a}
+  .pill{font-size:var(--fs-meta);padding:1.5px 8px;border-radius:var(--r-pill);background:var(--green-soft);color:var(--green)}
+  .pill.fail{background:var(--red-soft);color:var(--red)}
+  .pill.wait{background:var(--amber-soft);color:var(--amber)}
 
   .sched-group{margin-bottom:20px}
   .sched-title{display:flex;align-items:center;justify-content:space-between;
-    font-size:12px;color:var(--text-3);margin-bottom:9px}
-  .sched-title b{color:var(--text);font-size:12.5px;font-weight:600}
-  .slot{display:flex;gap:10px;padding:9px 0;border-bottom:1px dashed var(--border)}
+    font-size:var(--fs-meta);color:var(--text-3);margin-bottom:9px}
+  .sched-title b{color:var(--text);font-size:var(--fs-s);font-weight:600}
+  .slot{display:flex;gap:var(--sp-2);padding:9px 0;border-bottom:1px dashed var(--border)}
   .slot:last-child{border-bottom:none}
-  .slot .t{font-variant-numeric:tabular-nums;font-size:12px;color:var(--pink);font-weight:600;
+  /* "待定"是"还没排期"这种**未设置**状态，不是操作也不是强调 —— 改用中性灰，
+     把强调色让给真正需要跳出来的东西（改版前 14 行全是同一个粉色，强调色被稀释光了）*/
+  .slot .t{font-variant-numeric:tabular-nums;font-size:var(--fs-meta);color:var(--text-3);font-weight:600;
     min-width:52px;font-family:ui-monospace,Consolas,monospace}
+  .slot .t.tbd{font-weight:400}
+  /* 「预计发布时间」两行式（2026-10-16 用户要求）：
+     单独投稿 + 定时发布时，每个切片按「首片 + 序号 × 间隔」排出预计时间。
+     不用「待定」二字一笔带过 —— 14 行全是同一个词等于没排期。
+     行高收到 1.35、字号 11px：这一列只是索引，主角还是右边的标题。 */
+  .slot .t.tbd{display:flex;flex-direction:column;gap:1px;min-width:64px;
+    font-size:var(--fs-micro);line-height:1.35;font-family:inherit}
+  .slot .t .eta{color:var(--text-4);font-size:10px;letter-spacing:.04em;font-style:normal}
+  .slot .t .eta-t{color:var(--text-2);font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
   .slot .b{min-width:0;flex:1}
-.slot .b .acts{margin-top:4px;display:flex;gap:10px;flex-wrap:wrap}
-.slot .b .acts .linkbtn{font-size:11.5px}
-  .slot .b .n{font-size:12.5px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;
+.slot .b .acts{margin-top:4px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.slot .b .acts .linkbtn{font-size:var(--fs-meta)}
+  /* 排期行内的「⋯」菜单（2026-10-16 评审 IA-4）：
+     把「改发布时间 / 删除」这两个低频动作从常驻文字链收进菜单，
+     14 行从 42 个微型目标降到 14 个，同时把「编辑」这个真正常用的入口让出来。 */
+  .slot-more{position:relative;display:inline-flex}
+  .slot-more-btn{padding:0 6px;letter-spacing:1px;font-weight:700;color:var(--text-3)}
+  .slot-more-btn:hover{color:var(--blue)}
+  .slot-more-btn[aria-expanded="true"]{color:var(--blue)}
+  .slot-menu{position:absolute;top:calc(100% + 4px);left:0;z-index:40;min-width:126px;
+    background:var(--card);border:1px solid var(--border);border-radius:var(--r-md);
+    box-shadow:var(--sh-3);padding:4px}
+  .slot-menu[hidden]{display:none}
+  .slot-menu button{display:block;width:100%;text-align:left;border:none;background:none;
+    padding:7px 10px;border-radius:var(--r-sm);color:var(--text);font-size:var(--fs-s);min-height:var(--h-sm);white-space:nowrap}
+  .slot-menu button:hover{background:var(--bg)}
+  .slot-menu button.danger{color:var(--red)}
+  .slot-menu button.danger:hover{background:var(--red-soft)}
+  .slot .b .n{font-size:var(--fs-s);line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;
     -webkit-box-orient:vertical;overflow:hidden}
-  .slot .b .s{font-size:11.5px;color:var(--text-3);margin-top:2px}
+  .slot .b .s{font-size:var(--fs-meta);color:var(--text-3);margin-top:2px}
   .published .n{color:var(--text-2)}
 
-  .actionbar{margin-top:20px;display:flex;align-items:center;gap:12px;background:var(--card);
-    border:1px solid var(--border);border-radius:var(--radius);padding:12px 16px;flex-wrap:wrap;
-    position:sticky;bottom:12px;box-shadow:0 -4px 20px rgba(0,0,0,.05)}
-  .actionbar .info{font-size:13px;color:var(--text-2)}
+  /* 页脚里的操作栏：不再是浮层，所以去掉 sticky / 阴影 / 外边框 ——
+     它是中栏的正常页脚，靠上边框与内容区隔开就够了。 */
+  .actionbar{margin:0;display:flex;align-items:center;gap:var(--sp-3);background:var(--card);
+    border:none;border-radius:0;padding:var(--sp-3) 22px;flex-wrap:wrap}
+  .actionbar .info{font-size:var(--fs-s);color:var(--text-2)}
   .actionbar .info b{color:var(--text)}
-  .primary{margin-left:auto;background:var(--pink);color:#fff;border:none;border-radius:8px;
-    padding:9px 20px;font-size:13.5px;font-weight:600;box-shadow:0 2px 8px rgba(251,114,153,.3)}
-  .primary:hover{background:#f96389}
-  .primary:disabled{background:#e3e5e8;color:#a9adb3;box-shadow:none;cursor:not-allowed}
-  .danger{border:1px solid #f0c8c8;background:#fff;color:#c33;border-radius:8px;padding:8px 16px;font-size:13px}
+  /* 主按钮：白字压在 #c73f6c 上 4.82:1（改版前 #fb7299 只有 2.64:1）*/
+  .primary{margin-left:auto;background:var(--pink);color:var(--on-accent);border:none;border-radius:var(--r-sm);
+    padding:9px 20px;font-size:var(--fs-s);font-weight:600;box-shadow:0 2px 8px rgba(199,63,108,.28);
+    min-height:var(--h-lg)}
+  .primary:hover{background:var(--pink-hover)}
+  .primary:disabled{background:var(--surface-3);color:var(--text-3);box-shadow:none;cursor:not-allowed}
+  .danger{border:1px solid var(--red-line);background:var(--card);color:var(--red);border-radius:var(--r-sm);padding:8px 16px;
+    font-size:var(--fs-s);min-height:var(--h-md)}
 
+  /* ---- 弹窗 ---- */
   .mask{position:fixed;inset:0;background:rgba(20,22,26,.45);display:none;z-index:50;
-    align-items:center;justify-content:center;padding:24px}
+    align-items:center;justify-content:center;padding:var(--sp-6)}
   .mask.show{display:flex}
-  .modal{background:var(--card);border-radius:14px;width:min(820px,100%);max-height:86vh;
+  .modal{background:var(--card);border-radius:var(--r-md);width:min(860px,100%);max-height:86vh;
     display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(0,0,0,.28)}
   .modal.wide{width:min(1000px,100%)}
+  /* 设置弹窗加宽到 1000px：两列字段够宽，长值（JSON / 路径）不再被裁掉 */
+  .modal.setting{width:min(1000px,100%)}
   .modal-head{display:flex;align-items:center;justify-content:space-between;
-    padding:15px 22px;border-bottom:1px solid var(--border);gap:12px}
-  .modal-head h2{margin:0;font-size:15.5px;font-weight:600}
-  .modal-head .x{border:none;background:none;font-size:17px;line-height:1;color:var(--text-3);
-    padding:3px 7px;border-radius:6px}
-  .modal-head .x:hover{background:#f2f3f5;color:var(--text)}
+    padding:15px 22px;border-bottom:1px solid var(--border);gap:var(--sp-3)}
+  .modal-head h2{margin:0;font-size:var(--fs-title);font-weight:600}
+  .modal-head .x{border:none;background:none;font-size:var(--fs-h2);line-height:1;color:var(--text-3);
+    padding:3px 7px;border-radius:var(--r-sm);min-width:var(--h-sm);min-height:var(--h-sm)}
+  .modal-head .x:hover{background:var(--surface-3);color:var(--text)}
   .modal-body{overflow-y:auto;padding:4px 22px}
   .modal-body::-webkit-scrollbar{width:8px}
-  .modal-body::-webkit-scrollbar-thumb{background:#dcdfe3;border-radius:4px}
+  .modal-body::-webkit-scrollbar-thumb{background:var(--scroll);border-radius:var(--r-sm)}
   .modal-foot{display:flex;align-items:center;gap:10px;padding:13px 22px;
-    border-top:1px solid var(--border);background:#fcfcfd;border-radius:0 0 14px 14px;flex-wrap:wrap}
-  .modal-foot .tip{font-size:12px;color:var(--text-3)}
-  .btn-plain{border:1px solid var(--border);background:#fff;color:var(--text-2);
-    padding:8px 18px;border-radius:8px;font-size:13.5px}
-  .btn-plain:hover{border-color:#cfd3d8;color:var(--text)}
-  .btn-sm{border:1px solid var(--border);background:#fff;color:var(--blue);
-    padding:7px 12px;border-radius:8px;font-size:12.5px;white-space:nowrap}
-  .btn-sm:hover{border-color:#b9dcf0;background:#f7fcff}
+    border-top:1px solid var(--border);background:var(--surface-2);border-radius:0 0 var(--r-md) var(--r-md);flex-wrap:wrap}
+  .modal-foot .tip{font-size:var(--fs-meta);color:var(--text-3)}
+  .btn-plain{border:1px solid var(--border);background:var(--card);color:var(--text-2);
+    padding:8px 18px;border-radius:var(--r-sm);font-size:var(--fs-s);min-height:var(--h-md)}
+  .btn-plain:hover{border-color:var(--border-strong);color:var(--text)}
+  .btn-sm{border:1px solid var(--border);background:var(--card);color:var(--blue);
+    padding:5px 12px;border-radius:var(--r-sm);font-size:var(--fs-meta);white-space:nowrap;min-height:var(--h-sm)}
+  .btn-sm:hover{border-color:var(--blue-line);background:var(--blue-tint)}
   .btn-sm:disabled{color:var(--text-3);cursor:default}
   .group{padding:15px 0 4px;border-bottom:1px solid var(--border-2)}
   .group:last-child{border-bottom:none;padding-bottom:18px}
-  .group > h3{margin:0 0 3px;font-size:13px;font-weight:600}
-  .group > .gdesc{font-size:12px;color:var(--text-3);margin:0 0 12px}
+  .group > h3{margin:0 0 3px;font-size:var(--fs-s);font-weight:600}
+  .group > .gdesc{font-size:var(--fs-meta);color:var(--text-3);margin:0 0 var(--sp-3)}
+  /* 分组头上的"字段数 / 改动数"：不展开也能判断这里有没有要找的东西 */
+  .group > h3 .gcount{font-size:var(--fs-micro);font-weight:500;color:var(--text-3);
+    background:var(--surface-3);border-radius:var(--r-pill);padding:1px 8px;margin-left:var(--sp-2);vertical-align:2px}
+  .group > h3 .gcount.changed{background:var(--amber-soft);color:var(--amber)}
   .fields{display:grid;grid-template-columns:1fr 1fr;gap:13px 18px}
   .fields .full{grid-column:1/-1}
-  .field label{display:block;font-size:12.5px;color:var(--text-2);margin-bottom:5px}
-  .field .ctl{display:flex;gap:8px;align-items:center}
-  .inp{width:100%;border:1px solid var(--border);border-radius:8px;padding:8px 11px;
-    font-size:13.2px;color:var(--text);background:#fff}
-  .inp:focus{outline:none;border-color:#cfe6f7;box-shadow:0 0 0 3px rgba(0,174,236,.1)}
-  .inp[readonly]{background:#f7f8f9;color:var(--text-2);cursor:default}
+  .field label{display:block;font-size:var(--fs-meta);color:var(--text-2);margin-bottom:5px}
+  .field .ctl{display:flex;gap:var(--sp-2);align-items:center}
+  /* 「＋ 添加直播」多房间：每行一个房间号，附加行才有「移除」按钮（第一行是主直播间） */
+  .roomlist{display:flex;flex-direction:column;gap:6px}
+  .roomrow{display:flex;gap:var(--sp-2);align-items:center}
+  .roomrow .inp{flex:1;min-width:0}
+  .roomrow .roomtag{flex:0 0 auto;width:1.2em;text-align:center;font-size:var(--fs-meta);color:var(--text-3);padding:0}
+  .inp{width:100%;border:1px solid var(--border);border-radius:var(--r-sm);padding:var(--sp-2) 11px;
+    font-size:var(--fs-s);color:var(--text);background:var(--card);min-height:var(--h-md)}
+  .inp:focus{outline:none;border-color:var(--blue-line);box-shadow:0 0 0 3px rgba(11,110,168,.12)}
+  .inp[readonly]{background:var(--surface-2);color:var(--text-2);cursor:default}
   .inp.num{width:98px}
   textarea.inp{min-height:70px;resize:vertical;font-family:inherit}
-  .hintline{font-size:11.5px;color:var(--text-3);margin-top:5px}
-  .hintline.warn{color:#d94a4a}
+  /* 字段说明从 11.5px/#9499a0（2.87:1）提到 12px/--text-3（4.98:1）——
+     这是最需要读懂的一类文字，不该是最读不清的一类。 */
+  .hintline{font-size:var(--fs-meta);color:var(--text-3);margin-top:5px;line-height:1.6}
+  .hintline.warn{color:var(--red)}
   .hintline.ok{color:var(--green)}
-  .testres{font-size:11.5px;margin-top:5px;white-space:pre-wrap}
+  /* 长说明收进折叠：默认只露结论，细节按需展开 */
+  .hintline details{margin-top:4px}
+  .hintline details summary{cursor:pointer;color:var(--blue);list-style:none;
+    display:inline-flex;align-items:center;gap:4px}
+  .hintline details summary::-webkit-details-marker{display:none}
+  .hintline details summary::before{content:"▸"}
+  .hintline details[open] summary::before{content:"▾"}
+  .hintline details .more-hint{margin-top:6px;padding:var(--sp-2) 10px;background:var(--surface-2);
+    border-radius:var(--r-sm);border-left:2px solid var(--border);color:var(--text-2);line-height:1.7}
+  /* 超长说明折两行 + 「展开」（2026-10-16 评审 IA-5）。用 line-clamp 而不是切字符串 ——
+     说明里带 <b> / <span class="mono-sm">，按字数切会把标签切断。 */
+  .hintline.hint-clamped{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .hint-toggle{border:none;background:none;color:var(--blue);font-size:var(--fs-meta);
+    cursor:pointer;padding:0;margin-left:4px;vertical-align:baseline}
+  .hint-toggle:hover{text-decoration:underline}
+  .testres{font-size:var(--fs-meta);margin-top:5px;white-space:pre-wrap}
   .testres.ok{color:var(--green)}
-  .testres.err{color:#d94a4a}
-  .inline-switch{display:flex;align-items:center;gap:9px;font-size:13px;color:var(--text-2);padding-top:4px}
+  .testres.err{color:var(--red)}
+  .inline-switch{display:flex;align-items:center;gap:9px;font-size:var(--fs-s);color:var(--text-2);padding-top:4px}
   .chips{display:flex;gap:7px;flex-wrap:wrap}
-  .chip{font-size:12.5px;padding:5px 12px;border-radius:999px;border:1px solid var(--border);
-    background:#fff;color:var(--text-2)}
-  .chip.on{border-color:var(--pink);background:var(--pink-soft);color:#d94d7a;font-weight:500}
+  .chip{font-size:var(--fs-s);padding:5px 12px;border-radius:var(--r-pill);border:1px solid var(--border);
+    background:var(--card);color:var(--text-2);min-height:var(--h-sm)}
+  .chip.on{border-color:var(--pink);background:var(--pink-soft);color:var(--pink);font-weight:500}
 
+  /* ---- 全局提示条 ---- */
   #toast{position:fixed;left:50%;bottom:34px;transform:translate(-50%,20px);opacity:0;
-    background:#1f2329;color:#fff;padding:10px 18px;border-radius:9px;font-size:13px;
+    background:var(--inverse-bg);color:var(--on-accent);padding:10px 18px;border-radius:var(--r-md);font-size:var(--fs-s);
     transition:.25s;pointer-events:none;z-index:99;box-shadow:0 6px 24px rgba(0,0,0,.25);max-width:80vw}
   #toast.show{opacity:1;transform:translate(-50%,0)}
 
-  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
-  .kpi{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
-  .kpi .k{font-size:11.5px;color:var(--text-3);margin-bottom:4px}
-  .kpi .v{font-size:19px;font-weight:600;font-variant-numeric:tabular-nums}
-  .kpi .v.sm{font-size:14px;font-weight:500}
-  .kpi .n{font-size:11.5px;color:var(--text-3);margin-top:3px}
-  .kpi.ok{border-color:#d9ece2} .kpi.ok .v{color:var(--green)}
-  .kpi.bad{border-color:#f8d7d7} .kpi.bad .v{color:var(--red)}
-  .kpi.warn{border-color:#f2dfa8} .kpi.warn .v{color:#c8811a}
-  table.tbl{width:100%;border-collapse:collapse;font-size:12.8px}
-  table.tbl th,table.tbl td{padding:7px 9px;text-align:left;border-bottom:1px solid var(--border-2)}
-  table.tbl th{color:var(--text-3);font-weight:500;font-size:11.5px;white-space:nowrap}
+  /* ---- KPI ---- */
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:var(--sp-3);margin-bottom:var(--sp-4)}
+  .kpi{background:var(--card);border:1px solid var(--border);border-radius:var(--r-md);box-shadow:var(--sh-1);padding:var(--sp-3) 14px}
+  .kpi .k{font-size:var(--fs-meta);color:var(--text-3);margin-bottom:4px}
+  /* KPI 数值统一字号：改版前"已连接"用小字、"3.22.1"用 19px，一行三个大小无法横向比较 */
+  .kpi .v{font-size:var(--fs-num);font-weight:700;font-variant-numeric:tabular-nums;line-height:1.25;letter-spacing:-.3px}
+  .kpi .v.sm{font-size:var(--fs-body);font-weight:600;line-height:1.6}
+  .kpi .n{font-size:var(--fs-meta);color:var(--text-3);margin-top:3px;line-height:1.55}
+  .kpi.ok{border-color:var(--green-line)} .kpi.ok .v{color:var(--green)}
+  .kpi.bad{border-color:var(--red-line)} .kpi.bad .v{color:var(--red)}
+  .kpi.warn{border-color:var(--amber-line)} .kpi.warn .v{color:var(--amber)}
+  table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-s)}
+  table.tbl th,table.tbl td{padding:8px 9px;text-align:left;border-bottom:1px solid var(--border-2)}
+  table.tbl th{color:var(--text-3);font-weight:500;font-size:var(--fs-meta);white-space:nowrap}
   table.tbl td.num{text-align:right;font-variant-numeric:tabular-nums}
-  .mono-sm{font-family:ui-monospace,Consolas,monospace;font-size:12px}
-  .empty{color:var(--text-3);font-size:13px;padding:14px 4px}
-  .timeline{font-size:12.8px;line-height:1.7}
+  /* 「与上一行相同」的占位符（2026-10-16 评审 IA-6）：让重复值不再逐行复读，
+     但保留"这一列有值"的视觉连续性 —— 悬停可看原值。 */
+  .rep-same{color:var(--text-4);cursor:help}
+  .mono-sm{font-family:ui-monospace,Consolas,monospace;font-size:var(--fs-meta)}
+  .empty{color:var(--text-3);font-size:var(--fs-s);padding:14px 4px}
+  /* 空态压缩条：把"没有内容"从整张卡片收成一行，首屏让给真正有数据的东西 ——
+     运行观测页原来 3 张空卡片白占约 350px，真正有用的"最近几场"被挤出首屏。 */
+  .empty-strip{display:flex;align-items:center;gap:var(--sp-2);padding:var(--sp-2) var(--sp-4);
+    margin-bottom:10px;border:1px dashed var(--border);border-radius:var(--r-md);
+    background:transparent;font-size:var(--fs-s);color:var(--text-3);min-height:var(--h-lg)}
+  .empty-strip b{color:var(--text-2);font-weight:600}
+  .empty-strip .tail{margin-left:auto;font-size:var(--fs-meta);color:var(--text-4)}
+  .timeline{font-size:var(--fs-s);line-height:1.7}
   .timeline .row{display:flex;gap:10px;padding:6px 0;border-bottom:1px dashed var(--border-2)}
-  .timeline .row .t{color:var(--text-3);min-width:78px;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+  .timeline .row .t{color:var(--text-3);min-width:78px;font-family:ui-monospace,Consolas,monospace;font-size:var(--fs-meta)}
   .timeline .row .s{flex:1;min-width:0}
-  .timeline .row.bad .s{color:#c33}
+  .timeline .row.bad .s{color:var(--red)}
   /* 录制清单的分组折叠。为什么要有：录播目录动辄几十上百场，平铺的清单会把
      **真正在录的那几条**淹掉；而「已录制完成」和「已导入过」属于回顾性内容，
      需要时才展开。所以只有「正在录制」常显，另外两组默认收起。 */
-  .impgroup{display:flex;align-items:center;gap:8px;padding:6px 8px;margin:6px 0 2px;
-    border-radius:8px;background:#f5f7fa;color:var(--text-2);font-size:12.5px;user-select:none}
+  .impgroup{display:flex;align-items:center;gap:var(--sp-2);padding:6px var(--sp-2);margin:6px 0 2px;
+    border-radius:var(--r-sm);background:var(--surface-2);color:var(--text-2);font-size:var(--fs-s);user-select:none}
   .impgroup[data-g]{cursor:pointer}
-  .impgroup[data-g]:hover{background:#eef1f5}
+  .impgroup[data-g]:hover{background:var(--surface-3)}
   .impgroup .caret{width:10px;color:var(--text-3);display:inline-block;transition:transform .15s}
   .impgroup.open .caret{transform:rotate(90deg)}
   .impgroup .cnt{margin-left:auto;color:var(--text-3)}
-  .impgroup.live{background:#fff6e8;color:#a96a00}
+  .impgroup.live{background:var(--amber-soft);color:var(--amber-ink)}
   .impgroup.none{background:transparent;padding-left:2px;color:var(--text-3)}
-  pre.raw{background:#fafbfc;border:1px solid var(--border);border-radius:8px;padding:11px;
-    font-size:12px;overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-all}
-  .kv{display:grid;grid-template-columns:110px 1fr;gap:4px 10px;font-size:12.6px}
+  pre.raw{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-sm);padding:11px;
+    font-size:var(--fs-meta);overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-all}
+  .kv{display:grid;grid-template-columns:110px 1fr;gap:4px 10px;font-size:var(--fs-s)}
   .kv .k{color:var(--text-3)}
   .filelist{display:flex;flex-wrap:wrap;gap:6px}
-  .filelist button{font-size:11.5px;padding:3px 9px;border-radius:6px;border:1px solid var(--border);
-    background:#fafbfc;color:var(--text-2)}
-  .filelist button:hover{border-color:#cfe6f7;color:#1a86c7}
-  .tag-mini{display:inline-block;font-size:11px;padding:0 6px;border-radius:4px;background:#f2f3f5;color:var(--text-2);margin-right:4px}
+  .filelist button{font-size:var(--fs-meta);padding:3px 9px;border-radius:var(--r-sm);border:1px solid var(--border);
+    background:var(--surface-2);color:var(--text-2)}
+  .filelist button:hover{border-color:var(--blue-line);color:var(--blue)}
+  .tag-mini{display:inline-block;font-size:var(--fs-micro);padding:0 6px;border-radius:var(--r-sm);background:var(--surface-3);color:var(--text-2);margin-right:4px}
+
+  /* ============================================================================
+   * 响应式断点（2026-10-16 新增）
+   *
+   * 为什么要有：改版前三栏写死 280px | 1fr | 300px 且**一条媒体查询都没有**，
+   * 1280 笔记本上中栏只剩 700px —— 工具条换行、成本条折两行，
+   * 粘性底栏还压住了 3 条本场要点。这里按"先收窄、再折叠"两档处理。
+   * ========================================================================== */
+  /* 只在窄屏出现的控件（宽屏时排期栏本来就常驻）。
+     ⚠️ 必须写在下面的媒体查询**之前** —— 同权重下后写的规则会赢。 */
+  .only-narrow{display:none}
+
+  @media (max-width:1500px){
+    .app{grid-template-columns:248px minmax(0,1fr) 272px}
+    .brand .sub{max-width:230px}
+  }
+  /* 排期栏改成可收起的抽屉：宽度还给中栏，需要时从右侧滑出 */
+  @media (max-width:1320px){
+    .app{grid-template-columns:236px minmax(0,1fr)}
+    .col-right{position:fixed;right:0;top:98px;bottom:0;width:300px;height:auto;z-index:30;
+      transform:translateX(100%);transition:transform .22s ease;box-shadow:-8px 0 24px rgba(0,0,0,.12)}
+    .col-right.open{transform:none}
+    /* 抽屉打开时压一层浅遮罩：让"这是一层浮在上面的面板"一眼可辨，
+       也提示点旁边空白处就能收起。
+       ★ 2026-10-17 修复「展开后无法收回」：遮罩改 top:98px 避开顶栏+页签，且 pointer-events 恒为 none。
+         之前 inset:0 全屏 + .open 时 pointer-events:auto，遮罩（z-index:30 层）会盖在
+         顶栏（z-index:20）之上拦掉「排期」按钮的点击 —— 点按钮其实点到的是遮罩，自然收不回来。 */
+    .col-right::before{content:"";position:fixed;top:98px;left:0;right:0;bottom:0;background:rgba(20,22,26,.28);
+      opacity:0;transition:opacity .22s;pointer-events:none;z-index:-1}
+    .col-right.open::before{opacity:1}
+    /* 排期栏收成抽屉后，顶栏出现「排期」按钮来开关它 */
+    .only-narrow{display:inline-block}
+  }
+  @media (max-width:1180px){
+    .app{grid-template-columns:220px minmax(0,1fr)}
+    .fields{grid-template-columns:1fr}
+    .fields .full{grid-column:auto}
+  }
 </style>
+
 </head>
 <body>
 <!--__BOOT__-->
@@ -373,67 +710,91 @@
     <div class="logo">切</div>
     <h1>直播切片助手</h1>
     <span class="sub" id="brandSub"><span class="live-dot" id="healthDot"></span><span id="brandText">加载中…</span></span>
+    <!-- ★ 2026-10-25（用户要求）：构建徽章。
+         痛点：修复落了盘、测试也绿，但进程没重启 ⇒ 界面还是旧行为，只能靠翻进程启动时间猜。
+         这里显示**正在运行的代码指纹**；磁盘代码更新后会自动转红提示"需重启"。 -->
+    <span class="build-tag" id="buildTag" title="构建指纹：用来判断修复有没有重启生效">v—</span>
   </div>
   <div class="top-right">
-    <div class="mode">
+    <div class="mode" id="modeBox">
       <span id="modeText">半自动 · 需确认后发布</span>
-      <button class="switch" id="modeSwitch" title="切换全自动 / 半自动"></button>
+      <button class="switch" id="modeSwitch" role="switch" aria-checked="false" aria-label="全自动发布（免确认）" title="切换全自动 / 半自动。开启后切片不再等你确认，直接按排期发布。"></button>
     </div>
     <div class="mode" id="subMode" title="切片是否把转写烧成字幕。字幕准不准取决于转写引擎：本地 Fun-ASR 有字级时间戳（实测偏差 ±0.2 秒）；云端 ASR 的句级时间窗不可靠（实测 15 个字的句子占了 0→30.9 秒），烧出来会与声音错位。">
       <span id="subText">字幕：加载中…</span>
-      <button class="switch" id="subSwitch" title="开启 / 关闭字幕烧录（下一次切片生效）"></button>
+      <button class="switch" id="subSwitch" role="switch" aria-checked="false" aria-label="烧录字幕" title="开启 / 关闭字幕烧录（下一次切片生效）"></button>
     </div>
     <button class="ghost" id="btnRepairStuck" title="进程被强杀后任务会停在「切片中」这类状态，点这里修回可操作状态">修复卡住</button>
     <button class="ghost" id="btnCheckNow">立即检查</button>
     <button class="ghost" id="btnImport">导入录播</button>
+    <!-- ★ 2026-10-16：主题切换。深夜看直播切片的多，深色比浅色省眼。
+         选择存在 localStorage（键 liveauto.theme），并且**在页面脚本执行前**就已经
+         按它设好 data-theme —— 见 00-shell-head.html 里的那行内联脚本，
+         否则每次刷新都会先闪一下白底。 -->
+    <button class="ghost icon-btn" id="btnTheme" aria-pressed="false" title="切换深色 / 浅色主题">
+      <span id="themeIcon" aria-hidden="true">◐</span><span id="themeText">深色</span>
+    </button>
+    <!-- ★ 2026-10-16（UI 评审 L-3）：只在窄屏（<1320px）出现 —— 那时排期栏收成了右侧抽屉 -->
+    <button class="ghost only-narrow" id="btnSchedule" aria-expanded="false" aria-controls="colRight" title="展开 / 收起发布排期栏">排期</button>
     <button class="ghost" id="btnSetting">设置</button>
   </div>
 </div>
 
-<div class="tabs" id="tabs">
+<div class="tabs" id="tabs" role="tablist" aria-label="主视图切换">
   <!-- P1-7（2026-10-13）：页签**分组**（分隔线 + 悬停说明）+ 每个页签一句"什么时候来这儿"。
        为什么用 title 而不是加一行说明文字：不动布局、不占高度，且鼠标一停就能看到。
-       三个分组：干活（任务/实时监控）｜运维（健康面板/待删回收站）｜资产（稿件表现/切片库/Prompt）。 -->
-  <button class="tab on" data-view="tasks" title="日常入口：看场次列表、审核切片、改标题、发布">任务</button>
-  <button class="tab" data-view="monitor" title="正在跑什么、在等什么、为什么没动（默认 5 秒自动刷新）">实时监控</button>
-  <button class="tab" data-view="observe" title="边录边转的进度、压制/上传队列与 ETA、我们进程的显存与内存（默认 5 秒自动刷新）">运行观测</button>
-  <span class="tabsep" style="width:1px;height:16px;background:var(--border);margin:0 8px;display:inline-block;vertical-align:middle"></span>
-  <button class="tab" data-view="health" title="现在有没有需要你处理的事（待办）/ 错误 / 磁盘 / 自检">健康面板</button>
+       三个分组：干活（任务/实时监控）｜运维（健康面板/待删回收站）｜资产（稿件表现/切片库/Prompt）。
+
+       ★ 2026-10-16（UI 评审 A-1）：补 role=tablist / role=tab / aria-selected / aria-controls。
+       为什么：这 9 个页签是全站最主要的导航，之前读屏念出来只是 9 个"按钮"，
+       既不知道这是一组互斥选项，也不知道当前在哪一个。aria-selected 由 switchView() 同步。 -->
+  <button class="tab on" data-view="tasks" role="tab" aria-selected="true" aria-controls="viewTasks" title="日常入口：看场次列表、审核切片、改标题、发布">任务</button>
+  <button class="tab" data-view="monitor" role="tab" aria-selected="false" aria-controls="viewOther" title="正在跑什么、在等什么、为什么没动（默认 5 秒自动刷新）">实时监控</button>
+  <button class="tab" data-view="observe" role="tab" aria-selected="false" aria-controls="viewOther" title="边录边转的进度、压制/上传队列与 ETA、我们进程的显存与内存（默认 5 秒自动刷新）">运行观测</button>
+  <span class="tabsep" aria-hidden="true" style="width:1px;height:16px;background:var(--border);margin:0 8px;display:inline-block;vertical-align:middle"></span>
+  <button class="tab" data-view="health" role="tab" aria-selected="false" aria-controls="viewOther" title="现在有没有需要你处理的事（待办）/ 错误 / 磁盘 / 自检">健康面板</button>
   <!-- 「跑完自动关机」独立页签（2026-10-14 用户：「独立页面放在健康界面后面」）：
        里面是 iframe 加载 /api/shutdown/page —— 它有自己的文档与刷新节奏，
        运行观测那页每 5 秒整块重渲染**影响不到它**（这就是不抖的原因）。 -->
-  <button class="tab" data-view="autoshutdown" title="跑完自动关机：开关、允许时段、冷静期倒计时与取消（独立页面，不受其它页刷新影响）">自动关机</button>
+  <button class="tab" data-view="autoshutdown" role="tab" aria-selected="false" aria-controls="viewOther" title="跑完自动关机：开关、允许时段、冷静期倒计时与取消（独立页面，不受其它页刷新影响）">自动关机</button>
   <!-- ★ 2026-10-11 用户要求：「将这两个（查看回收站 / 查看待删清单）放到成本的位置，然后将成本放到稿件表现里」；
        随后又要求「待删清单和回收站放一起」—— 两者本来就是同一条生命周期上的两段（待删 → 已删可恢复），
        合并成一页两段，顺带去掉重复了两遍的"最近已删除"列表。 -->
-  <button class="tab" data-view="trash" title="用完即删的宽限期内可反悔 / 已删除的可恢复（按天折叠）">待删 / 回收站<span id="pendingTabBadge"></span></button>
-  <span class="tabsep" style="width:1px;height:16px;background:var(--border);margin:0 8px;display:inline-block;vertical-align:middle"></span>
-  <button class="tab" data-view="perf" title="长期资产视角：已发布稿件的播放/点赞/评分，以及月度成本">稿件表现</button>
-  <button class="tab" data-view="clips" title="跨场次找切片：按标题/状态/评分检索，可试看、可跳到那一场">切片库</button>
-  <button class="tab" data-view="prompts" title="选片与标题的提示词（改这里会影响后续场次的挑选质量）">Prompt</button>
+  <button class="tab" data-view="trash" role="tab" aria-selected="false" aria-controls="viewOther" title="用完即删的宽限期内可反悔 / 已删除的可恢复（按天折叠）">待删 / 回收站<span id="pendingTabBadge"></span></button>
+  <span class="tabsep" aria-hidden="true" style="width:1px;height:16px;background:var(--border);margin:0 8px;display:inline-block;vertical-align:middle"></span>
+  <button class="tab" data-view="perf" role="tab" aria-selected="false" aria-controls="viewOther" title="长期资产视角：已发布稿件的播放/点赞/评分，以及月度成本">稿件表现</button>
+  <button class="tab" data-view="clips" role="tab" aria-selected="false" aria-controls="viewOther" title="跨场次找切片：按标题/状态/评分检索，可试看、可跳到那一场">切片库</button>
+  <button class="tab" data-view="prompts" role="tab" aria-selected="false" aria-controls="viewOther" title="选片与标题的提示词（改这里会影响后续场次的挑选质量）">Prompt</button>
 </div>
 
 <div id="viewTasks">
   <div class="app">
-    <aside class="col col-left">
+    <aside class="col col-left" aria-label="场次列表">
       <div class="searchbar">
-        <input id="searchInput" placeholder="搜索标题 / 日期 / 任务 ID">
-        <div class="filters" id="statusFilters">
-          <button data-status="" class="on">全部</button>
-          <button data-status="processing">处理中</button>
-          <button data-status="review">待审核</button>
-          <button data-status="published">已发布</button>
-          <button data-status="failed">失败</button>
+        <input id="searchInput" placeholder="搜索标题 / 日期 / 任务 ID" aria-label="搜索场次">
+        <div class="filters" id="statusFilters" role="group" aria-label="按状态筛选">
+          <button data-status="" class="on" aria-pressed="true">全部</button>
+          <button data-status="processing" aria-pressed="false">处理中</button>
+          <button data-status="review" aria-pressed="false">待审核</button>
+          <button data-status="published" aria-pressed="false">已发布</button>
+          <button data-status="failed" aria-pressed="false">失败</button>
         </div>
-        <button class="ghost" id="btnMulti" title="多选：批量删除任务（一次清理一批已发布的场次）">多选</button>
+        <button class="ghost" id="btnMulti" aria-pressed="false" title="多选：批量删除任务（一次清理一批已发布的场次）">多选</button>
       </div>
       <!-- 测试夹具开关（默认隐藏；由 renderTaskList 按实际条数填充，没有夹具时这里是空的） -->
       <div id="fixtureToggleBar" style="padding:0 12px 6px"></div>
       <div id="multiBar" style="display:none"></div>
-      <div id="taskList"></div>
+      <div id="taskList" role="list"></div>
     </aside>
-    <main class="col col-mid"><div id="detail"><div class="empty">正在加载…</div></div></main>
-    <aside class="col col-right">
+    <main class="col col-mid" aria-label="本场详情">
+      <div id="detail"><div class="empty">正在加载…</div></div>
+      <!-- ★ 2026-10-16（用户实拍）：底部操作栏的停靠位。renderDetail 会把
+           .actionbar 从 #detail 里搬到这里 —— 它不再随内容滚动，因此永远不会盖住内容。 -->
+      <div id="detailFoot" class="detail-foot"></div>
+    </main>
+    <!-- ★ 2026-10-16（UI 评审 L-3）：宽度 <1320px 时排期栏收成右侧抽屉，
+         由顶栏的「排期」按钮（#btnSchedule）开关。之前三栏写死、小屏上中栏被挤到 700px。 -->
+    <aside class="col col-right" id="colRight" aria-label="发布排期">
       <div class="col-label">发布排期</div>
       <div id="schedule"></div>
     </aside>
@@ -443,8 +804,8 @@
 <div id="viewOther" style="display:none"><div class="fullpage" id="otherPage"></div></div>
 
 <!-- ============ 设置弹窗 ============ -->
-<div class="mask" id="cfgMask"><div class="modal">
-  <div class="modal-head"><h2>设置</h2><button class="x" onclick="closeCfg()">✕</button></div>
+<div class="mask" id="cfgMask"><div class="modal setting" role="dialog" aria-modal="true" aria-labelledby="cfgTitle">
+  <div class="modal-head"><h2 id="cfgTitle">设置</h2><button class="x" onclick="closeCfg()" aria-label="关闭设置">✕</button></div>
   <div class="modal-body" id="cfgBody"></div>
   <div class="modal-foot">
     <span class="tip">保存后热加载，对新步骤立即生效；已在排期的切片不受影响</span>
@@ -455,11 +816,11 @@
 </div></div>
 
 <!-- ============ 通用弹窗 ============ -->
-<div class="mask" id="infoMask"><div class="modal wide">
+<div class="mask" id="infoMask"><div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="infoTitle">
   <div class="modal-head"><h2 id="infoTitle">详情</h2>
     <div style="display:flex;gap:8px;align-items:center">
       <button class="btn-sm" id="infoCopy">一键复制</button>
-      <button class="x" onclick="closeInfo()">✕</button>
+      <button class="x" onclick="closeInfo()" aria-label="关闭详情">✕</button>
     </div>
   </div>
   <div class="modal-body" id="infoBody"></div>
@@ -467,7 +828,9 @@
     <button class="btn-plain" style="margin-left:auto" onclick="closeInfo()">关闭</button></div>
 </div></div>
 
-<div id="toast"></div>
+<!-- ★ 2026-10-16（UI 评审 A-1）：role=status + aria-live=polite。
+     之前所有操作结果（"已复制""保存失败"）都只走视觉，读屏用户完全收不到。 -->
+<div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <script>
 /* ============================================================================
@@ -476,10 +839,43 @@
 const BOOT = window.__BOOT__ || { csrf: '', version: '?', roomId: '', platform: '' };
 
 /** UI 构建标记：在浏览器控制台里能看到，用来确认页面是不是最新的（避免缓存导致以为功能没做） */
-const UI_BUILD = 'ui-2026-10-15-pretranscribe-truth';
+const UI_BUILD = 'ui-2026-10-16-standalone-5min';
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/**
+ * 配置里的「切片投稿方式」：`'append'`（追加切片投稿）/ `'standalone'`（单独投稿）。
+ *
+ * 与服务端 `resolveClipPublishMode()` **同一套口径**：显式值优先，没设时按 `multiPart` 反推。
+ * 前端只有"显示"需要判定（排期面板的提示、本场详情），绝不能凭 `multiPart` 单独猜 ——
+ * 手改 config.json 时两者可能不一致，那样界面会显示成另一个模式（用户按界面理解就错了）。
+ */
+function clipModeOf(publish) {
+  const p = publish || {};
+  if (p.clipPublishMode === 'standalone') return 'standalone';
+  if (p.clipPublishMode === 'append') return 'append';
+  return p.multiPart === true ? 'append' : 'standalone';
+}
+
+/**
+ * 当前**实际生效**的切片排期口径（服务端算好随 bootstrap 下发）。
+ *
+ * 为什么不在这里重算：规则是「单独投稿 ⇒ 固定定时投稿 + 设置里的相邻切片间隔 / 随机抖动
+ * （间隔 300 秒保底、抖动必须小于间隔）」（服务端 `resolveClipPublishSchedule()`）。
+ * 界面上「错峰 X」出现在本场详情、右栏排期、设置弹窗、排期预览四处 —— 若各自读
+ * `config.publish.clipGapSec`，界面就会写着一个值、实际排另一个值（用户填 100 被抬到 300、
+ * 填 900 被压到 470 时尤其明显）。同一口径两端各写一份，本仓库踩过。
+ *
+ * 兜底：bootstrap 里没有这个字段（旧服务端）时按 config 值显示。
+ */
+function publishSchedule() {
+  const b = (state.bootstrap || {});
+  const s = b.publishSchedule;
+  if (s && Number(s.gapSec) > 0) return { ...s, gapSec: Number(s.gapSec), scheduled: s.scheduled !== false, ignored: s.ignored || '' };
+  const pub = (b.config && b.config.publish) || {};
+  return { mode: clipModeOf(pub), gapSec: Number(pub.clipGapSec) || 300, scheduled: pub.immediatePublish !== true, ignored: '' };
+}
 
 const state = {
   view: 'tasks',
@@ -582,6 +978,15 @@ window.toast = toast;
 
 const toSec = (s) => { const p = String(s).split(':').map(Number); return p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p[0] * 60 + p[1]; };
 const toTime = (n) => { n = Math.max(0, Math.round(Number(n) || 0)); return [Math.floor(n / 3600), Math.floor(n % 3600 / 60), n % 60].map((x) => String(x).padStart(2, '0')).join(':'); };
+/* ★ 2026-10-16（UI 评审 3.4）：入点 / 时长这类**相对时长**用 mm:ss 表达，不足 1 小时不补小时位。
+   为什么单独加一个：原来排期那行写成「00:00:58 · 432 秒」，两个数字一个是 hh:mm:ss、
+   一个是裸秒数，紧挨着读极易混淆。统一成「入点 00:58 · 时长 07:12」后一眼能分清。 */
+const toMS = (n) => {
+  n = Math.max(0, Math.round(Number(n) || 0));
+  const h = Math.floor(n / 3600), m = Math.floor((n % 3600) / 60), s = n % 60;
+  const mm = String(m).padStart(2, '0'), ss = String(s).padStart(2, '0');
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+};
 const fmtGB = (b) => { if (!b) return '0 B'; const u = ['B', 'KB', 'MB', 'GB', 'TB']; const i = Math.min(4, Math.floor(Math.log(b) / Math.log(1024))); return (b / 1024 ** i).toFixed(i === 0 ? 0 : 1) + ' ' + u[i]; };
 
 /** 极简 Markdown 渲染（够用即可：标题、列表、粗体、行内代码、引用、段落） */
@@ -614,6 +1019,16 @@ function inline(s) {
 /* ============================================================================
  * 数据加载
  * ========================================================================== */
+/* ★ 2026-10-16（UI 评审 A-1）：开关的状态必须同时反映到 class 和 aria-checked。
+   之前只切 .on，读屏念出来永远是"开关"，不报开还是关。 */
+function syncSwitch(sel, on) {
+  const el = typeof sel === 'string' ? $(sel) : sel;
+  if (!el) return null;
+  el.classList.toggle('on', !!on);
+  el.setAttribute('aria-checked', on ? 'true' : 'false');
+  return el;
+}
+
 /* 顶栏的「字幕」开关（默认关，随时能切）。
    为什么单独给它一个按钮、而不是只留在设置里：字幕曾经被**整体关掉**，原因是云端 ASR 的
    句级时间窗不可靠 —— 实测「15 个字的句子占了 0→30.9 秒」，烧出来与声音整体错位。
@@ -625,8 +1040,7 @@ function renderSubtitleSwitch() {
   const on = !!(cfg.clip && cfg.clip.burnSubtitles);
   const provider = String((cfg.asr && cfg.asr.provider) || '');
   const local = provider === 'local-funasr' || provider === 'whisper-cpp';
-  const sw = $('#subSwitch');
-  if (sw) sw.classList.toggle('on', on);
+  syncSwitch('#subSwitch', on);
   const box = $('#subMode');
   if (box) {
     box.classList.toggle('ok', on && local);
@@ -636,11 +1050,55 @@ function renderSubtitleSwitch() {
   if (t) t.textContent = !on ? '字幕：关' : (local ? '字幕：开 · 本地 ASR' : '字幕：开 · 云端 ASR 可能错位');
 }
 
+/* 顶栏的「全自动 · 免确认发布」开关。
+   ★ 2026-10-16（UI 评审 3.1）：这个开关开启时**单独走琥珀色**，不再和普通开关共用品牌粉。
+   为什么：它是全站唯一"点一下就会自动对外发文、且不再问你"的设置，
+   之前和"字幕开关"长得一模一样 —— 高风险设置必须有区别于普通开关的视觉语言。
+   另外给它加了第一次开启的显式确认（见 45- 的 onclick）。 */
+function renderModeSwitch(autoPublish) {
+  const sw = syncSwitch('#modeSwitch', autoPublish);
+  const box = $('#modeBox');
+  if (box) {
+    box.classList.toggle('risk', !!autoPublish);
+    sw && sw.classList.toggle('risk', !!autoPublish);
+  }
+  $('#modeText').textContent = autoPublish ? '全自动 · 免确认发布' : '半自动 · 需确认后发布';
+}
+
+/**
+ * 构建徽章（2026-10-25）：把"进程跑的代码指纹"和"磁盘上的代码指纹"的差异直接摆到顶栏。
+ *
+ * 为什么值得占一个位置：配额限流那次修复已经落盘、测试全绿，但服务没重启，
+ * 用户点重投依旧被旧逻辑撞死，只能靠人翻进程启动时间才能发现。
+ * 现在只要徽章转红写着「需重启」，一眼就知道"修复还没生效"。
+ */
+function renderBuildTag(build) {
+  const el = document.getElementById('buildTag');
+  if (!el) return;
+  const ver = (state.bootstrap && state.bootstrap.version) || '';
+  const id = (build && build.id) || '--------';
+  const stale = !!(build && build.stale);
+  el.classList.toggle('stale', stale);
+  el.textContent = stale ? '⚠ 代码已更新 · 需重启' : `v${ver} · ${id}`;
+  const lines = [
+    stale
+      ? `磁盘代码已更新（${build.diskId || '?'}），但当前进程仍在跑 ${id}`
+      : `已是最新代码（${id}）`,
+    stale ? '重启服务后新修复才会生效' : '与磁盘上的 src/ 与 web/src/ 完全一致',
+  ];
+  if (build && build.at) {
+    const d = new Date(build.at);
+    lines.push(`代码最后修改：${d.toLocaleString('zh-CN')}`);
+  }
+  if (build && build.note) lines.push(build.note);
+  el.title = lines.join('\n');
+}
+
 async function loadBootstrap() {
   state.bootstrap = await api('/api/bootstrap');
   const b = state.bootstrap;
-  $('#modeSwitch').classList.toggle('on', b.mode.autoPublish);
-  $('#modeText').textContent = b.mode.autoPublish ? '全自动 · 免确认发布' : '半自动 · 需确认后发布';
+  renderBuildTag(b.build);
+  renderModeSwitch(b.mode.autoPublish);
   renderSubtitleSwitch();
   /* 房间号只有一个（它只用于"开播触发"这条次要路径），而**导入走目录轮询**、
      覆盖录制根目录下的全部主播 ⇒ 把覆盖数一并显示，免得看起来像"只处理一个直播间"
@@ -679,6 +1137,9 @@ async function loadSchedule() {
   /* 自动导入的状态也一起取：用户看不到"它在等什么"时，会以为轮询没生效，
      然后自己去手动导入（于是任务标成「手动导入」，更困惑）。 */
   try { state.watch = await api('/api/watch'); } catch { state.watch = null; }
+  /* 账号受限闸门（2026-10-22）：24h 内 2 次配额拒绝 ⇒ 暂停投稿。
+     不取它的话，用户点「重跑发布阶段」会没反应又不知道为什么。 */
+  try { state.quotaGuard = await api('/api/publish/quota-guard'); } catch { state.quotaGuard = null; }
   renderSchedule();
 }
 
@@ -786,6 +1247,8 @@ function pendingRowActions(e, opts = {}) {
 function closeTaskMenu() {
   const m = document.getElementById('taskMenu');
   if (m) m.remove();
+  /* 2026-10-16（UI 评审 L-2）：菜单收起后把「⋯」的常显状态也撤掉 */
+  $$('#taskList .task.menu-open').forEach((el) => el.classList.remove('menu-open'));
 }
 
 /** 复制文本到剪贴板（clipboard API 在非安全上下文不可用，留 execCommand 兜底） */
@@ -845,6 +1308,11 @@ function openTaskMenu(taskId, anchorEl) {
     <div class="sep"></div>
     <button data-op="delete" class="danger">删除任务…</button>`;
   document.body.appendChild(menu);
+  /* 2026-10-16（UI 评审 L-2）：「⋯」默认是 opacity:0（悬停才出现）。
+     菜单开着时把它保持在可见状态 —— 否则鼠标移到菜单上，触发它的按钮就消失了，
+     看起来像菜单凭空冒出来，也失去了"这个菜单属于哪一行"的空间关系。 */
+  const row = document.querySelector(`#taskList .task[data-id="${CSS.escape(taskId)}"]`);
+  if (row) row.classList.add('menu-open');
   const r = anchorEl.getBoundingClientRect();
   const mw = 200;
   const mh = menu.offsetHeight || 230;
@@ -889,7 +1357,7 @@ async function handleTaskOp(op, taskId) {
       toast(r.from + ' → ' + r.to + '：' + r.reason, 6000);
       setTimeout(() => refreshAll(true), 700);
     } else if (op === 'retry') {
-      openInfo('从某阶段重跑', '<p style="font-size:13px;color:var(--text-2)">转写结果与切片产物都会复用，重跑不会重复产生 ASR 费用。</p><div class="chips" id="retryStages">' +
+      openInfo('从某阶段重跑', '<p style="font-size:13px;color:var(--text-2)">转写结果与切片产物都会复用，重跑不会重复产生 ASR 费用。</p><p style="font-size:13px;color:var(--text-2)"><b>重新切片与投稿</b>：先把切片状态重置，再逐片同步 —— 已投过的片通过指纹/反查自动核对回来（不会重复投稿），只有 B站 上确实没有的片才会补投（产物在直接投、缺产物先重切）。</p><div class="chips" id="retryStages">' +
         [['ANALYZED','重新分析（重跑 LLM 选片）'],['TRANSCRIBED','重新转写（复用缓存）'],['RECORDED','从源素材重来'],['CLIPPED','重新切片与投稿']]
           .map(([v, label]) => '<button class="chip" data-stage="' + v + '">' + label + '</button>').join('') + '</div>');
       // ⚠️ 必须用 $$（querySelectorAll）：$ 是 querySelector，返回**单个元素**，
@@ -997,7 +1465,7 @@ function renderTaskList() {
     const picked = state.multi.sel.has(t.id);
     return `<div class="task ${t.id === state.activeId ? 'active' : ''}${picked ? ' picked' : ''}" data-id="${esc(t.id)}">
       ${multi ? `<input type="checkbox" class="pick" data-pick="${esc(t.id)}"${picked ? ' checked' : ''} title="选中这一场">` : ''}
-      <div class="when"><span>${esc(t.when)}</span><span>${toTime(t.durationSec)}</span></div>
+      <div class="when"><span>${esc(t.when)}</span><span>${toMS(t.durationSec)}</span></div>
       <div class="name">${esc(t.title)}</div>
       <div class="meta"><span class="badge ${badge[g] || 'b-idle'}">${esc(t.statusText)}</span>${extra.map((x) => `<span>${esc(x)}</span>`).join('')}</div>
       ${multi ? '' : `<button class="more" data-more="${esc(t.id)}" title="任务操作（右键同样可打开）">⋯</button>`}
@@ -1233,30 +1701,46 @@ function renderDetail() {
   if (!d) return;
   const box = $('#detail');
   // 在详情页顶部给一句指路：任务操作还能从左侧列表的「⋯」或右键打开
-  const opsTip = `<div style="font-size:11.5px;color:var(--text-3);margin:-6px 0 8px">
+  const opsTip = `<div style="font-size:var(--fs-meta);color:var(--text-3);margin:-6px 0 8px">
     提示：这些操作在左侧任务卡片的「⋯」按钮或右键菜单里同样可用
   </div>`;
 
   // 任务级操作栏：删除 / 停止 / 重跑 —— 这些以前只能改 json 才能做
   const publishedN = (d.clips || []).filter((c) => c.bvid).length;
-  const ops = `<div class="barstrip" style="gap:8px">
-    <span style="font-size:12.5px;color:var(--text-3)">任务操作</span>
-    ${['PUBLISHED','ARCHIVED'].includes(d.status) ? '<span class="tag-mini">已完成</span>' : ''}
-    ${['TRANSCRIBING','ANALYZING','CLIPPING','PUBLISHING','PENDING','RECORDED','TRANSCRIBED'].includes(d.status)
-      ? '<button class="btn-sm" data-act="stop-task">停止处理</button>' : ''}
-    <button class="btn-sm" data-act="retry-from">从某阶段重跑</button>
-    ${publishedN ? '<button class="btn-sm" data-act="copy-links">复制全部稿件链接</button>' : ''}
-    <button class="btn-sm" data-act="refresh-publish" title="立刻去 B站 反查一次这一场的投稿落地情况（不等后台每 5 分钟那一轮）；只读，不会重复投稿">刷新投稿状态</button>
-    <button class="btn-sm" data-act="publish-audit">投稿体检</button>
-    <button class="btn-sm" data-act="publish-batches" title="每次投稿本该产生哪几个分P、实际落地了哪几个">投稿批次</button>
-    <button class="btn-sm" data-act="recap" title="这一场的产出复盘：切片/评分/投稿/表现/待办，一页看完">复盘报告</button>
-    <button class="btn-sm" data-act="open-dir">打开产物目录</button>
-    <button class="btn-sm" data-act="delete-task" style="color:#c33;border-color:#f0c8c8">删除任务…</button>
-    <span style="margin-left:auto;font-size:11.5px;color:var(--text-3)" class="mono">${esc(d.id)}</span>
+  const running = ['TRANSCRIBING','ANALYZING','CLIPPING','PUBLISHING','PENDING','RECORDED','TRANSCRIBED'].includes(d.status);
+  /* ★ 2026-10-16（UI 评审 IA-1）：工具条分层。
+     改版前这里是 9 个半径/底色/字号完全一致的按钮 —— 日常下一步是哪个，看不出来。
+     现在分三层：**常用 3 个常显**（刷新投稿状态 / 复制链接 / 打开目录）、
+     **诊断类收进「更多 ▾」**（从某阶段重跑 / 投稿体检 / 投稿批次 / 复盘报告 / 停止处理）、
+     **删除独立在右端**并用红色区分。
+     ⚠️ 菜单里的按钮**仍然在 DOM 里**（只是视觉上收起），因为 36- 是渲染后用
+     $('[data-act="…"]') 逐个绑事件的 —— 从 DOM 里去掉会直接让那些功能失效。 */
+  const opsMoreItems = [
+    running ? '<button data-act="stop-task">停止处理</button>' : '',
+    '<button data-act="retry-from">从某阶段重跑</button>',
+    '<button data-act="publish-audit">投稿体检</button>',
+    '<button data-act="publish-batches" title="每次投稿本该产生哪几个分P、实际落地了哪几个">投稿批次</button>',
+    '<button data-act="recap" title="这一场的产出复盘：切片/评分/投稿/表现/待办，一页看完">复盘报告</button>',
+  ].filter(Boolean).join('');
+  const ops = `<div class="barstrip ops-bar">
+    <div class="ops-main">
+      <button class="btn-sm" data-act="refresh-publish" title="立刻去 B站 反查一次这一场的投稿落地情况（不等后台每 5 分钟那一轮）；只读，不会重复投稿">刷新投稿状态</button>
+      ${publishedN ? '<button class="btn-sm" data-act="copy-links">复制链接</button>' : ''}
+      <button class="btn-sm" data-act="open-dir">打开目录</button>
+      <div class="ops-more">
+        <button class="btn-sm ops-more-btn" id="opsMoreBtn" aria-expanded="false" aria-haspopup="true">更多 ▾</button>
+        <div class="ops-menu" id="opsMenu" role="menu" hidden>${opsMoreItems}</div>
+      </div>
+    </div>
+    <div class="ops-meta">
+      ${['PUBLISHED','ARCHIVED'].includes(d.status) ? '<span class="tag-mini">已完成</span>' : ''}
+      <span class="mono ops-id" title="任务 ID">${esc(d.id)}</span>
+      <button class="btn-sm danger-ghost" data-act="delete-task">删除任务</button>
+    </div>
   </div>`;
   // 已投稿的场次额外提醒一句：本地删除不撤回稿件
   const publishNote = publishedN
-    ? `<div style="font-size:11.5px;color:#c8811a;margin:-6px 0 8px">本场有 ${publishedN} 个切片已投稿到 B站 —— 删除本地记录<b>不会撤回投稿</b>，需下架请到 B站创作中心</div>`
+    ? `<div style="font-size:var(--fs-meta);color:#c8811a;margin:-6px 0 8px">本场有 ${publishedN} 个切片已投稿到 B站 —— 删除本地记录<b>不会撤回投稿</b>，需下架请到 B站创作中心</div>`
     : '';
 
   let html = opsTip + ops + publishNote + `<div class="stages">${d.stages.map((s, i) => {
@@ -1314,11 +1798,11 @@ function renderDetail() {
     <div class="field"><label>本场最多候选切片数</label><input class="inp num" id="ovMaxClips" value="${d.overrides && d.overrides.maxClips !== undefined ? d.overrides.maxClips : (state.bootstrap.config.clip.maxCandidates)}"></div>
     <div class="field"><label>本场不参与自动发布</label>
       <div class="inline-switch"><button class="switch sm ${d.overrides && d.overrides.skipAutoPublish ? 'on' : ''}" id="ovSkip"></button>
-      <span style="font-size:12.5px;color:var(--text-3)">开启后仅产出候选，需手动发布</span></div></div>
+      <span style="font-size:var(--fs-s);color:var(--text-3)">开启后仅产出候选，需手动发布</span></div></div>
     <div class="field full"><label>本场追加标签</label><input class="inp" id="ovTags" placeholder="例如：DLC开荒（逗号分隔，追加到全局标签之后）" value="${esc((d.overrides && d.overrides.extraTags || []).join(', '))}"></div>
     <div class="field"><label>完整版由切片助手投（例外）</label>
       <div class="inline-switch"><button class="switch sm ${d.overrides && d.overrides.fullVideoBy === 'assistant' ? 'on' : ''}" id="ovFullVideoBy"></button>
-      <span style="font-size:12.5px;color:var(--text-3)">默认关闭：完整版（弹幕版+纯享版）由 biliLive-tools 投，本服务只追加切片分P。
+      <span style="font-size:var(--fs-s);color:var(--text-3)">默认关闭：完整版（弹幕版+纯享版）由 biliLive-tools 投，本服务只追加切片分P。
         只有你**明确**需要本服务自己烧弹幕版 + remux 纯享版并新建 2+N 稿件时才打开这一场。</span></div></div>
     <div class="field full"><label>本场续传目标 aid（可选）</label>
       <input class="inp" id="ovResumeAid" value="${esc((d.overrides && d.overrides.resumeAid) || '')}" placeholder="例如 117321041512930（留空 = 按标题自动找）">
@@ -1343,7 +1827,9 @@ function renderDetail() {
     const publishable = d.clips.filter((c) => c.selected && !DONE.includes(c.status));
     const alreadyDone = d.clips.filter((c) => c.selected && ['PUBLISHED', 'SUBMITTED', 'SUBMITTING'].includes(c.status));
     html += `<div class="actionbar">
-      <span class="info">已选 <b id="cntSelected">${checked}</b> / ${d.clips.length} 个切片　·　定时发布间隔 ${fmtSpan(state.bootstrap.config.publish.clipGapSec)}${
+      <span class="info">已选 <b id="cntSelected">${checked}</b> / ${d.clips.length} 个切片　·　${
+        publishSchedule().scheduled ? `定时发布间隔 ${fmtSpan(publishSchedule().gapSec)}` : '立即发布（不排期）'
+      }${
         alreadyDone.length ? `　·　<span style="color:var(--text-3)">其中 ${alreadyDone.length} 个已投过，不会重复投</span>` : ''
       }</span>
       <span id="publishHint" style="font-size:12px;color:var(--text-3)"></span>
@@ -1370,7 +1856,7 @@ function renderDetail() {
       <div class="k">封面</div><div>来源 ${esc(d.cover.source)}${d.cover.cover ? ' · ' + esc(String(d.cover.cover).split(/[\\/]/).pop()) : ''}</div>
       ${d.seasonId ? `<div class="k">合集</div><div>seasonId=${d.seasonId}</div>` : '<div class="k">合集</div><div style="color:#c8811a">未配置 —— 切片不会归入同一合集</div>'}
     </div>
-    ${d.files && d.files.length ? `<div style="margin-top:12px"><div class="k" style="font-size:11.5px;color:var(--text-3);margin-bottom:6px">任务目录文件（点击预览）</div>
+    ${d.files && d.files.length ? `<div style="margin-top:12px"><div class="k" style="font-size:var(--fs-meta);color:var(--text-3);margin-bottom:6px">任务目录文件（点击预览）</div>
       <div class="filelist">${d.files.map((f) => `<button data-act="preview" data-file="${esc(f)}">${esc(f)}</button>`).join('')}</div></div>` : ''}
   </div>`;
 
@@ -1380,6 +1866,17 @@ function renderDetail() {
   }
 
   box.innerHTML = html;
+  /* ★ 2026-10-16（用户实拍反馈）：把底部操作栏**搬出滚动区**，停靠在中栏底部。
+     之前它留在滚动区里用 position:sticky 浮着 —— 滚到任意位置都会压在内容上，
+     实拍效果就是"已选 6/6…"横在切片卡片中间，把「理由 / 试看 / 看稿件」那几行盖住；
+     光加 padding-bottom 只能保证滚到底时不挡，挡不住滚动过程中的遮挡。
+     现在它是中栏的固定页脚，滚动区高度自动让出它的位置 ⇒ 任何滚动位置都不重叠。 */
+  const foot = $('#detailFoot');
+  const ab = box.querySelector('.actionbar');
+  if (foot) {
+    foot.innerHTML = '';
+    if (ab) foot.appendChild(ab);
+  }
   bindDetail();
 }
 
@@ -1525,6 +2022,7 @@ function bindDetail() {
   if (retryFromBtn) retryFromBtn.onclick = () => {
     openInfo('从某阶段重跑', `
       <p style="font-size:13px;color:var(--text-2)">转写结果与切片产物都会复用，重跑不会重复产生 ASR 费用。</p>
+      <p style="font-size:13px;color:var(--text-2)"><b>重新切片与投稿</b>：先把切片状态重置，再逐片同步 —— 已投过的片通过指纹/反查自动核对回来（不会重复投稿），只有 B站 上确实没有的片才会补投（产物在直接投、缺产物先重切）。</p>
       <div class="fields" style="grid-template-columns:1fr">
         <div class="field"><label>从哪个阶段开始</label>
           <div class="chips" id="retryStages">
@@ -1694,6 +2192,32 @@ function bindDetail() {
       await copyText(lines.join('\n'), ` ${lines.length} 条稿件链接（可粘到创作中心核对）`);
     } catch (e) { toast('获取稿件链接失败：' + e.message, 5000); }
   };
+
+  /* ★ 2026-10-16（UI 评审 IA-1）：工具条「更多 ▾」菜单的开合。
+     菜单里的按钮仍由下面各自的 $('[data-act=…]') 绑事件 —— 这里只管显隐。 */
+  const opsBtn = $('#opsMoreBtn');
+  const opsMenu = $('#opsMenu');
+  if (opsBtn && opsMenu) {
+    opsBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      const open = opsMenu.hidden;
+      opsMenu.hidden = !open;
+      opsBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    };
+    /* 点外面 / 按 Esc 收起。用捕获阶段，避免被别处的 stopPropagation 拦掉。 */
+    document.addEventListener('click', () => {
+      if (!opsMenu.hidden) { opsMenu.hidden = true; opsBtn.setAttribute('aria-expanded', 'false'); }
+    }, true);
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && !opsMenu.hidden) {
+        opsMenu.hidden = true; opsBtn.setAttribute('aria-expanded', 'false'); opsBtn.focus();
+      }
+    });
+    /* 菜单里点完任何一项就收起，省得用户还要再点一次外面 */
+    opsMenu.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+      opsMenu.hidden = true; opsBtn.setAttribute('aria-expanded', 'false');
+    }));
+  }
 
   const delBtn = $('[data-act="delete-task"]');
   if (delBtn) delBtn.onclick = async () => {
@@ -1925,7 +2449,7 @@ function bindDetail() {
         ? `<p>已为该任务生成项目文件：<code>${esc(llc)}</code></p>
            <p>在 biliLive-tools 的「切片」页面用「打开项目」选择它（位于任务目录）：</p>
            <pre class="raw">${esc(d.source.fullVideoPath || (d.source.segments[0] && d.source.segments[0].name) || '')}</pre>
-           <p style="color:var(--text-3);font-size:12.5px">任务目录：data/tasks/${esc(d.id)}/</p>`
+           <p style="color:var(--text-3);font-size:var(--fs-s)">任务目录：data/tasks/${esc(d.id)}/</p>`
         : '<p>尚未生成 .llc 项目文件（分析完成后会生成；若失败请看日志）。</p>');
     };
     /* 单片投稿：与下面批量按钮走**同一个** approve 接口，只是 indices 只有一个。
@@ -2027,7 +2551,12 @@ function bindDetail() {
     try {
       const r = await api(`/api/task/${encodeURIComponent(state.activeId)}/approve`, { method: 'POST', body: { indices } });
       const mode = state.bootstrap.mode.isOnlySelf ? '（仅自己可见）' : '';
-      toast(`已提交 ${r.count ?? indices.length} 个切片${mode}，按 ${fmtSpan(state.bootstrap.config.publish.clipGapSec)}间隔加入排期`, 5000);
+      const sched = publishSchedule();
+      toast(
+        `已提交 ${r.count ?? indices.length} 个切片${mode}，` +
+          (sched.scheduled ? `按 ${fmtSpan(sched.gapSec)}间隔加入排期` : '**立即发布**（不排期，过审即公开）'),
+        5000,
+      );
       setTimeout(() => refreshAll(true), 1500);
     } catch (e) {
       const problems = e.payload && e.payload.problems;
@@ -2078,23 +2607,99 @@ async function patchClip(taskId, idx, patch) {
 /* ============================================================================
  * 右栏：发布排期
  * ========================================================================== */
+/* ★ 2026-10-16（用户要求）：「单独投稿 + 定时发布」时，把**每个切片预计几点投出去**直接排出来。
+ *
+ * 之前未投稿的切片时间列一律写「待定」—— 14 行全是同一个词，用户看不出这一片大概什么时候上，
+ * 得自己跑去设置里看首片/末片再心算，等于排期规则没有落到列表上。
+ *
+ * 口径与「设置 → 首片发布时间」下面那条排期预览完全一致（首片 + 序号 × 间隔），
+ * 不在这里另写一套：真正的时间由服务端在**投稿那一刻**按「提交时刻 + 1200 秒余量」定下来，
+ * 所以这里算出来的是**预计**，已投出去的（有真实 dtime）优先显示真实值。
+ */
+function plannedDtimeList(pending, gapSec) {
+  const plan = (state.bootstrap && state.bootstrap.dtimePlan) || {};
+  /* 立即发布模式下不带 dtime，排不排都一样 —— 直接不显示预计值，免得误导 */
+  if (plan.scheduled === false) return new Map();
+  /* ⚠️ dtimePlan.first 是 **Unix 秒**（服务端一路用秒，dtime 也是秒），
+     而 new Date() / Date 运算要毫秒 —— 忘了 ×1000 会得到 1970-01-22，
+     而且 i*gap 只剩 300 毫秒差、14 行全挤在同一分钟里显示成同一个时间。 */
+  const baseMs = (Number(plan.first) || 0) * 1000;
+  if (!baseMs) return new Map();
+  const gapMs = Math.max(60, Number(gapSec) || 300) * 1000;
+  const out = new Map();
+  let i = 0;
+  for (const c of pending) {
+    if (!c.dtime) {                       // 有真实 dtime 的不动，只有还没投的才排
+      out.set(`${c.taskId}#${c.index}`, baseMs + i * gapMs);
+      i++;
+    }
+  }
+  return out;
+}
+
+/** 年月日时分 → 「今天 04:12」「10-17 04:12」这种一眼能读的短格式 */
+function shortWhen(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  const hm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  const today = new Date();
+  if (d.toDateString() === today.toDateString()) return `今天 ${hm}`;
+  const tmr = new Date(today.getTime() + 86400000);
+  if (d.toDateString() === tmr.toDateString()) return `明天 ${hm}`;
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${hm}`;
+}
+
 function renderSchedule() {
   const s = state.schedule || { pending: [], published: [], retention: [] };
   const onlySelf = state.bootstrap && state.bootstrap.mode.isOnlySelf;
-  const multiPart = !!(state.bootstrap && state.bootstrap.config.publish.multiPart);
-  let html = `<div class="sched-group"><div class="sched-title"><b>待发布 ${s.pending.length}</b>
-    <span>错峰 ${fmtSpan(state.bootstrap.config.publish.clipGapSec)}</span></div>
-    ${multiPart && s.pending.length ? '<div class="hintline" style="margin:2px 0 6px">多分P 模式：整个稿件只有一个发布时间，逐片排期不生效</div>' : ''}
-    ${s.pending.length ? s.pending.map((c) => `<div class="slot">
-      <span class="t">${c.dtimeText ? esc(c.dtimeText.slice(5, 16)) : '待定'}</span>
+  const sched = publishSchedule();
+  const appendMode = sched.mode === 'append';
+  const planned = plannedDtimeList(s.pending, sched.gapSec);
+  const plannedN = planned.size;
+  /* ★ 2026-10-22：账号受限横幅。
+     为什么必须在这里：闸门命中时 `publishClips` 是**一次提交都不发**的，
+     界面上若不说明，用户只会觉得"点了重跑没反应"，然后反复点（每次都在给账号扣分）。 */
+  const guard = state.quotaGuard;
+  const guardBanner = guard && guard.blocked
+    ? `<div class="sched-group" style="border:1px solid #e5484d;background:rgba(229,72,77,.08);padding:10px 12px;margin-bottom:10px">
+        <div class="sched-title" style="margin-bottom:4px"><b style="color:#e5484d">账号受限：B站 连续拒绝投稿</b>
+          <span>已暂停</span></div>
+        <div class="hintline" style="margin:0 0 8px">${esc(guard.note || '')}</div>
+        <div class="hintline" style="margin:0 0 8px">期间点「重跑发布阶段」不会发起任何提交，切片原样留在待投；确认 B站 恢复后可手动解除。</div>
+        <button class="linkbtn" id="quotaGuardClear">我已确认恢复，解除限制</button>
+      </div>`
+    : '';
+  let html = guardBanner + `<div class="sched-group"><div class="sched-title"><b>待发布 ${s.pending.length}</b>
+    <span>${sched.scheduled ? `错峰 ${fmtSpan(sched.gapSec)}` : '立即发布'}</span></div>
+    ${s.pending.length ? `<div class="hintline" style="margin:2px 0 6px">${appendMode ? '切片投稿方式：追加切片投稿 —— 整个稿件只有一个发布时间，逐片排期不生效' : `切片投稿方式：单独投稿 —— 每个切片各自一个稿件，固定定时发布、每片相隔 ${fmtSpan(sched.gapSec)}`}${plannedN ? `<br>下面带「预计」的 ${plannedN} 片是<b>按此规则排出来的时间</b>，投稿那一刻才最终确定（本项目要求晚于提交时刻 1200 秒）` : ''}</div>` : ''}
+    ${/* ★ 2026-10-16（UI 评审 IA-4）：每行从 3 个文字链收成 1 个 + 「⋯」菜单。
+          14 行 × 3 = 42 个 24px 高的目标，降到 14 个；"改发布时间/删除"是低频动作，
+          常驻只会把「编辑」这个真正常用的入口淹没。
+          时间格式也统一了：原来是「00:00:58 · 432 秒」（hh:mm:ss 与裸秒混排），
+          现在两个都用 mm:ss 并加标签前缀。 */ ''}${s.pending.length ? s.pending.map((c) => {
+      const pms = planned.get(`${c.taskId}#${c.index}`);
+      const timeCell = c.dtimeText
+        ? `<span class="t">${esc(c.dtimeText.slice(5, 16))}</span>`
+        : pms
+          ? `<span class="t tbd" title="按「首片 + 序号 × 间隔」推算出来的预计时间；投稿那一刻才最终确定（本项目要求晚于提交时刻 1200 秒）"><i class="eta">预计</i><b class="eta-t">${esc(shortWhen(pms))}</b></span>`
+          : '<span class="t tbd">待定</span>';
+      return `<div class="slot">
+      ${timeCell}
       <div class="b"><div class="n">${esc(c.title)}</div>
-      <div class="s">${toTime(c.start)} · ${Math.round(c.durationSec)} 秒 · ${esc(clipStatusText(c.status))}${c.degraded ? ' · 降级' : ''}</div>
+      <div class="s">入点 ${toMS(c.start)} · 时长 ${toMS(c.durationSec)} · ${esc(clipStatusText(c.status))}${c.degraded ? ' · 降级' : ''}</div>
       <div class="acts">
         <button class="linkbtn" data-sched-act="edit" data-task="${esc(c.taskId)}" data-idx="${c.index}">编辑</button>
-        <button class="linkbtn" data-sched-act="time" data-task="${esc(c.taskId)}" data-idx="${c.index}">改发布时间</button>
-        <button class="linkbtn" data-sched-act="del" data-task="${esc(c.taskId)}" data-idx="${c.index}" style="color:#c0392b">删除</button>
+        <div class="slot-more">
+          <button class="linkbtn slot-more-btn" data-slot-more aria-expanded="false" aria-haspopup="true"
+            aria-label="更多操作（改发布时间 / 删除）">⋯</button>
+          <div class="slot-menu" hidden role="menu">
+            <button data-sched-act="time" data-task="${esc(c.taskId)}" data-idx="${c.index}">改发布时间</button>
+            <button data-sched-act="del" data-task="${esc(c.taskId)}" data-idx="${c.index}" class="danger">删除</button>
+          </div>
+        </div>
       </div></div>
-    </div>`).join('') : '<div class="empty" style="padding:6px 0">暂无排期</div>'}</div>`;
+    </div>`;
+    }).join('') : '<div class="empty" style="padding:6px 0">暂无排期</div>'}</div>`;
 
   html += `<div class="sched-group published"><div class="sched-title"><b>已发布 ${s.published.length}</b>
     ${onlySelf ? '<span style="color:#c8811a">仅自己可见</span>' : ''}</div>
@@ -2127,6 +2732,22 @@ function renderSchedule() {
   }
   $('#schedule').innerHTML = html;
   bindScheduleActions();
+  /* 解除账号受限：确认后才放行（保留 24h 拒绝计数作参考，闸门不会立刻又关上） */
+  const clearBtn = document.getElementById('quotaGuardClear');
+  if (clearBtn) {
+    clearBtn.onclick = async () => {
+      if (!confirm('确认 B站 已经可以正常投稿了吗？\n（建议先到创作中心手动投一个验证；解除后仍会记录本次限制）')) return;
+      clearBtn.disabled = true;
+      try {
+        await api('/api/publish/quota-guard/clear', { method: 'POST', body: { reason: 'ui' } });
+        toast('已解除账号受限，可以重跑发布阶段了', 5000);
+        await loadSchedule();
+      } catch (e) {
+        toast('解除失败：' + e.message, 6000);
+        clearBtn.disabled = false;
+      }
+    };
+  }
 }
 
 /* ============================================================================
@@ -2136,6 +2757,33 @@ function renderSchedule() {
  * 发现某一片不想要、或时间不合适时，就在原地处理，不必先去左侧切到那一场。
  * ========================================================================== */
 function bindScheduleActions() {
+  /* ★ 2026-10-16（UI 评审 IA-4）：行内「⋯」菜单的开合。
+     菜单里的按钮仍带 data-sched-act，由下面那段统一绑事件 —— 这里只管显隐。 */
+  const closeAllMenus = () => {
+    $$('#schedule .slot-menu').forEach((m) => { m.hidden = true; });
+    $$('#schedule [data-slot-more]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
+  };
+  $$('#schedule [data-slot-more]').forEach((btn) => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      const menu = btn.parentElement.querySelector('.slot-menu');
+      const willOpen = menu.hidden;
+      closeAllMenus();
+      if (willOpen) { menu.hidden = false; btn.setAttribute('aria-expanded', 'true'); }
+    };
+  });
+  /* 点外面 / 按 Esc 收起。挂在 document 上，每次渲染会重复注册 ——
+     所以先移除上一次的（用具名函数引用存在窗口上，避免监听器越堆越多）。 */
+  if (window.__schedMenuOff) window.__schedMenuOff();
+  const onDocClick = () => closeAllMenus();
+  const onEsc = (ev) => { if (ev.key === 'Escape') closeAllMenus(); };
+  document.addEventListener('click', onDocClick, true);
+  document.addEventListener('keydown', onEsc);
+  window.__schedMenuOff = () => {
+    document.removeEventListener('click', onDocClick, true);
+    document.removeEventListener('keydown', onEsc);
+  };
+
   $$('#schedule [data-sched-act]').forEach((btn) => {
     btn.onclick = async (ev) => {
       ev.stopPropagation();
@@ -2150,6 +2798,7 @@ function bindScheduleActions() {
         toast('已切到该场，可在右侧切片卡片里编辑');
         return;
       }
+      closeAllMenus();
       if (act === 'time') return openDtimeEditor(taskId, idx);
       if (act === 'del') return deleteClipFromSchedule(taskId, idx);
     };
@@ -2228,10 +2877,18 @@ function clipStatusText(s) {
  * ========================================================================== */
 function switchView(v) {
   state.view = v;
-  $$('#tabs .tab').forEach((t) => t.classList.toggle('on', t.dataset.view === v));
+  /* ★ 2026-10-16（UI 评审 A-1）：class 与 aria-selected 必须同步。
+     只听视觉的 :class 的话，读屏用户切了页签也不知道自己在哪一页。 */
+  $$('#tabs .tab').forEach((t) => {
+    const on = t.dataset.view === v;
+    t.classList.toggle('on', on);
+    t.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
   const isTasks = v === 'tasks';
   $('#viewTasks').style.display = isTasks ? '' : 'none';
   $('#viewOther').style.display = isTasks ? 'none' : '';
+  /* 排期抽屉只在窄屏是抽屉；宽屏是常驻栏，这里顺手关掉残留的 open 状态 */
+  if (!isTasks) closeScheduleDrawer();
   /* 监控页签自己带定时器：切走就停（没人看的时候不必每 5 秒问一次服务端） */
   if (v === 'monitor') {
     startMonitor();
@@ -2271,7 +2928,23 @@ async function renderOther(v) {
         box.innerHTML =
           '<div class="hintline" style="margin:0 0 10px">下面是独立页面（自己的刷新节奏，不受本页影响）。' +
           '也可以直接在浏览器里打开：<a href="/api/shutdown/page" target="_blank" class="mono-sm">/api/shutdown/page</a></div>' +
-          '<iframe id="sdFrame" src="/api/shutdown/page" style="width:100%;height:620px;border:0;background:#f6f7f9;border-radius:8px"></iframe>';
+          /* 高度不再写死：内页量完自己的高度会 postMessage 过来，这里跟着设。
+             写死 620px 时内容实测 792px —— 底部"时段/冷静期/倒计时/保存"整行被切掉。 */
+          '<iframe id="sdFrame" src="/api/shutdown/page" title="跑完自动关机（独立页面）"' +
+          ' style="width:100%;height:560px;border:0;background:transparent;border-radius:8px"></iframe>';
+        /* 只收同源、且带固定标识的消息，避免被别处 postMessage 改高度 */
+        if (!globalThis.__sdFrameMsgBound) {
+          globalThis.__sdFrameMsgBound = true;
+          globalThis.addEventListener('message', (e) => {
+            if (e.origin !== location.origin) return;
+            const d = e.data;
+            if (!d || d.source !== 'shutdown-page' || d.type !== 'height') return;
+            const f = document.querySelector('#sdFrame');
+            if (!f) return;
+            const h = Math.max(320, Math.min(Number(d.h) || 0, 2400));
+            if (Math.abs(parseFloat(f.style.height) - h) > 2) f.style.height = h + 'px';
+          });
+        }
       }
       return;
     }
@@ -2286,7 +2959,7 @@ async function renderOther(v) {
 }
 
 async function renderHealth(box) {
-  const { health, errors } = await api('/api/health');
+  const { health, errors, hot } = await api('/api/health');
   /* 墓碑清单单独取（失败不阻塞健康面板的其它部分 —— 它只是个附加视图） */
   let tombstones = [];
   try { tombstones = (await api('/api/tombstones')).tombstones || []; } catch (e) { tombstones = []; }
@@ -2321,6 +2994,22 @@ async function renderHealth(box) {
           .join('')}</div>`
       : `<p class="hintline" style="color:var(--green)">✅ ${esc(todos.note || '现在没有需要你处理的事。')}</p>`}
     </div>`;
+  /* ---- 代码热更新状态（2026-10-24 用户需求：「改完代码不用手动关掉重启」）----
+     只有服务由监督进程 `src/hot-watch.ts` 拉起时 `/api/health` 才带 `hot`；直启服务时是 null。
+     这里按"用户最需要知道的一句话"排序：出错（改动没生效）> 等待空闲（改动静默排队）> 正常。
+     为什么不用弹窗报警：类型检查失败时服务**照旧在跑旧代码**，属于"提醒一下就好"，不该打断操作。 */
+  const hotKpi = (() => {
+    if (!hot) return kpi('热更新', '未启用', '用 launcher.ps1 启动即开启（-NoWatch 可关闭）');
+    /* alive 由服务端按心跳判定（监督进程被强杀时来不及写 enabled=false） */
+    if (!hot.alive) return kpi('热更新', '已关闭', '监督进程已退出，改动不会自动生效；重开 launcher 即可恢复', 'warn');
+    if (hot.lastTypecheckError) return kpi('热更新', '已开启 · 类型检查未通过', '没有重启，服务仍跑旧代码；错误见 data/logs/hot-watch.log', 'warn');
+    if (hot.lastUiBuildError) return kpi('热更新', '已开启 · 前端构建失败', '服务未受影响，但刷新仍是旧界面', 'warn');
+    if (hot.pendingSince) return kpi('热更新', '已开启 · 等待空闲', `有任务在跑，空闲后自动重载（自 ${fmtTime(Date.parse(hot.pendingSince))} 起排队）`, 'warn');
+    const last = hot.lastReloadAt
+      ? `最近一次：${fmtTime(Date.parse(hot.lastReloadAt))} · ${String(hot.lastReloadReason || '').slice(0, 48)}`
+      : '等待第一次改动';
+    return kpi('热更新', '已开启', last, 'ok');
+  })();
   html += `<div class="kpis">
     ${kpi('biliLive-tools', health.bililive.ok ? '已连接' : '未连接', health.bililive.message, health.bililive.ok ? (health.bililive.drift ? 'warn' : 'ok') : 'bad')}
     ${kpi('版本', esc(health.bililive.version || '?'), `核实版本 ${health.bililive.expected}${health.bililive.drift ? '（差异较大，接口可能已变动）' : ''}`, health.bililive.drift ? 'warn' : '')}
@@ -2331,6 +3020,7 @@ async function renderHealth(box) {
     ${kpi('墓碑', String(health.tombstones || 0), (health.tombstones || 0) > 0 ? '已投稿内容被保护性拦下' : '无（没删过已投稿的任务）', (health.tombstones || 0) > 0 ? 'warn' : 'ok')}
     ${kpi('队列', health.queue.busy ? '处理中' : '空闲', `排队 ${health.queue.length}${health.queue.paused ? ' · 磁盘守卫已暂停' : ''}`, health.queue.paused ? 'bad' : '')}
     ${kpi('运行时长', (health.uptimeSec / 3600).toFixed(1) + ' h', `服务版本 ${health.version}`, '')}
+    ${hotKpi}
   </div>`;
 
   html += `<div class="card"><h2>模式与配置</h2><div class="kv">
@@ -2364,7 +3054,7 @@ async function renderHealth(box) {
  */
 function tombstoneDetails(tombstones) {
   return `<details>
-    <summary style="cursor:pointer;font-size:12.5px;color:var(--text-2)">逐条明细（${tombstones.length} 条，可单条解除）</summary>
+    <summary style="cursor:pointer;font-size:var(--fs-s);color:var(--text-2)">逐条明细（${tombstones.length} 条，可单条解除）</summary>
     <table class="tbl" style="margin-top:8px"><thead><tr><th>立碑时间</th><th>原任务</th><th>切片</th><th>标题</th><th>旧稿件</th><th>原因</th><th></th></tr></thead><tbody>
     ${tombstones.map((t) => `<tr>
       <td class="mono-sm">${esc(String(t.retiredAt || '').slice(0, 19).replace('T', ' '))}</td>
@@ -2381,14 +3071,14 @@ function tombstoneDetails(tombstones) {
 
   html += `<div class="card"><h2>墓碑（已删除任务的、曾经投出去过的指纹）</h2>
     ${tombstones.length === 0
-      ? `<div style="font-size:12.5px;color:var(--text-3);line-height:1.7">
+      ? `<div style="font-size:var(--fs-s);color:var(--text-3);line-height:1.7">
            没有墓碑。墓碑只在一种情况下产生：<b>你删掉了一个已经投稿到 B站 的任务</b>。
            那一刻本地的幂等指纹不能跟着丢 —— 否则同一份素材被重新导入、重新分析出同一区间后，
            会在 B站 上投出第二个内容完全相同的稿件（B站 没有删除稿件的开放接口）。
            所以那类指纹会退役成墓碑继续拦着，并出现在这里。它<b>不影响</b>没投出去过的切片：
            删掉不满意的候选后重跑，照常可以投。
          </div>`
-      : `<div style="font-size:12.5px;color:#5b5070;margin-bottom:9px;line-height:1.7">
+      : `<div style="font-size:var(--fs-s);color:#5b5070;margin-bottom:9px;line-height:1.7">
            共 <b>${tombstones.length}</b> 条在生效。它们代表「这段内容以前投过 B站，而当时的任务已被删除」，
            重新投稿时会被自动跳过（切片卡片上会显示「🪦 墓碑拦截」）。
            <b>每天会自动核对一遍：旧稿件查不到的（含已锁定读不到的）自动解除</b>，
@@ -3434,7 +4124,7 @@ async function renderClipLibrary(box) {
   };
   const rows = d.rows || [];
   box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">切片库
-    <span class="ai-tag">共 ${d.total} 条${d.truncated ? ` · 只显示前 ${d.limit} 条` : ''} · 已发布 ${d.counts.published} / 待确认 ${d.counts.submitted} / 候选 ${d.counts.candidate} / 失败 ${d.counts.failed}</span></h2>
+    <span class="ai-tag">共 ${d.total} 条${d.truncated ? ` · 只显示前 ${d.limit} 条` : ''} · 已发布 ${d.counts.published} / 待确认 ${d.counts.submitted} / 候选 ${d.counts.candidate} / 失败 ${d.counts.failed}${d.counts.gone ? ` · 稿件已不存在 ${d.counts.gone}` : ''}</span></h2>
     <p class="hintline">这一页回答：<b>跨场次</b>找一条切片 —— 按标题/状态/评分检索，可试看、可跳到那一场、可导出 CSV。（只看这一场请用「任务」，只看某个稿件请点行内的「看稿件」。）</p>
     <div class="card">
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
@@ -3449,13 +4139,15 @@ async function renderClipLibrary(box) {
         </select>
         <button class="btn-sm" id="libDir">${clipLib.asc ? '↑ 升序' : '↓ 降序'}</button>
         <button class="btn-sm" id="libExport">导出 CSV</button>
+        <button class="btn-sm" id="libRefresh" title="去 B站 按切片库全部稿件逐个对账：确认「已提交待确认」的切片、核对稿件是否还在、拉取最新播放/点赞。只读 B站，不触发投稿；不受当前筛选影响">🔄 去 B站 对账</button>
         <span class="hintline">${esc(d.note || '')}</span>
       </div>
+      <p class="hintline" id="libFreshNote" style="min-height:18px;margin:0 0 8px"></p>
       ${rows.length ? `<table class="tbl"><thead><tr>
         <th>标题</th><th>场次</th><th>评分</th><th>时长</th><th>状态</th><th>播放</th><th>点赞</th><th>稿件</th><th>操作</th>
       </tr></thead><tbody>
       ${rows.map((r) => `<tr>
-        <td>${esc(r.title)}${r.fixture ? ' <span class="tag-mini">🔧 夹具</span>' : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${r.tombstone ? ' <span class="tag-mini">🪦 墓碑</span>' : ''}</td>
+        <td>${esc(r.title)}${r.fixture ? ' <span class="tag-mini">🔧 夹具</span>' : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${r.tombstone ? ' <span class="tag-mini">🪦 墓碑</span>' : ''}${r.gone ? ' <span class="tag-mini" style="background:#fdecea;color:#c33" title="该稿件在 B站 上已不存在 —— 对账时已自动清除该片的稿件记录并回退为待投（幂等指纹一并清除），可直接重投">稿件已不存在</span>' : ''}</td>
         <td class="mono-sm" title="${esc(r.taskId)}">${esc(String(r.taskWhen).slice(5, 16))} · ${esc(String(r.taskTitle).slice(0, 14))}</td>
         <td class="num">${Number(r.score ?? 0).toFixed(1)}</td>
         <td class="num">${r.durationSec}s</td>
@@ -3506,6 +4198,49 @@ async function renderClipLibrary(box) {
     URL.revokeObjectURL(a.href);
     toast(`已导出 ${rows.length} 行 CSV`, 4000);
   };
+  /* ★ 2026-10-17 用户要求：「切片库 增加一个刷新按钮 刷新时去B站 按当前的切片库的稿件去对账 然后刷新状态」。
+     口径与后端 reconcileClipLibrary 一一对应：① 确认「已提交待确认」的切片（SUBMITTED → PUBLISHED）；
+     ② 按切片库全部 bvid 逐个核对稿件还在不在（gone 只认强证据 + 稿件列表取全后的比对）；
+     ③ 拉最新播放/点赞。全部只读 B站，不触发投稿。
+     结果必须写在页面上（2026-10-14 的教训：只在 toast 里闪一下，用户以为"什么都没发生"）。 */
+  const libNote = (msg, kind) => {
+    const el = box.querySelector('#libFreshNote');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.color = kind === 'bad' ? '#c33' : kind === 'ok' ? '#2a7' : '';
+  };
+  const libSummary = (r) => {
+    const parts = [`核对 ${r.checked} 个稿件`];
+    if (r.confirmed) parts.push(`新确认落地 ${r.confirmed} 个切片`);
+    parts.push(`更新统计 ${r.statsUpdated} 个稿件`);
+    if (r.gone && r.gone.length) parts.push(`${r.gone.length} 个稿件已不在 B站`);
+    if (r.cleared) parts.push(`已清除回退待投 ${r.cleared} 个切片（可重投）`);
+    if (r.unavailable && r.unavailable.length) parts.push(`${r.unavailable.length} 个稿件锁定/审核中、统计取不到`);
+    if (r.failed && r.failed.length) parts.push(`${r.failed.length} 个没查清`);
+    return parts.join(' · ');
+  };
+  const libDoRefresh = async () => {
+    const btn = box.querySelector('#libRefresh');
+    if (btn) btn.disabled = true;
+    libNote('正在去 B站 对账（按稿件逐个查，稿件多时要点时间）…');
+    try {
+      const r = await api('/api/clips/library/refresh', { method: 'POST', body: {} });
+      const at = new Date().toLocaleTimeString('zh-CN');
+      const kind = r.failed && r.failed.length ? 'bad' : 'ok';
+      libNote(`对账完成（${at}）：${libSummary(r)}`, kind);
+      toast(`对账完成：${libSummary(r)}`, 5000);
+      await renderClipLibrary(box);
+      /* 重画会把提示行连内容一起清掉，按同样口径补写回去（与稿件表现页 perfDoRefresh 同一套做法） */
+      libNote(`对账完成（${at}）：${libSummary(r)}`, kind);
+    } catch (e) {
+      libNote('对账失败：' + e.message, 'bad');
+      toast('对账失败：' + e.message, 6000);
+    }
+    const b = document.getElementById('libRefresh');
+    if (b) b.disabled = false;
+  };
+  const rf = box.querySelector('#libRefresh');
+  if (rf) rf.onclick = () => libDoRefresh();
   box.querySelectorAll('[data-lib-preview]').forEach((b) => (b.onclick = async () => {
     const [taskId, index] = String(b.dataset.libPreview).split('|');
     b.disabled = true;
@@ -3582,6 +4317,10 @@ const clipLib = { q: '', status: '', sort: 'score', asc: false, limit: 200 };
 let perfLastRefresh = null;
 /* 「稿件已不存在」的行默认不显示；用户想核对时可以展开（见 renderPerf 里的说明） */
 let perfShowGone = false;
+/* ★ 2026-10-17 用户要求：稿件表默认只显示 20 条，多余的折叠 —— 39 行的表要滚很久，
+   按当前排序的前 20 条才是最想看的。模块级变量：点开「展开」后同页切排序/刷新不收回，
+   整页刷新回到默认 20（与 perfShowGone 同一套页面内状态模式）。 */
+let perfShowAll = false;
 /* ★ 2026-10-08 用户要求：「这里的排序 可以改成可选的吗 比如稿件时间 播放 点赞 等」。
    字段与方向都记进 localStorage，刷新后保持（取不到就当默认"播放降序"，绝不因为存储异常而白屏）。 */
 const PERF_SORTS = [
@@ -3668,7 +4407,17 @@ async function renderPerf(box) {
   const live = p.rows.filter((r) => !r.gone);
   const goneRows = p.rows.filter((r) => r.gone);
   const shown = sortPerfRows(perfShowGone ? p.rows : live);
-  const livePartTotal = live.reduce((a, r) => a + (Number(r.partCount) || 1), 0);
+  /* 表格默认只渲染前 20 条（用户 2026-10-17 要求），其余折叠成一键展开 */
+  const PERF_PAGE = 20;
+  /* ★ 2026-10-24（用户报「为什么只能获取 2 个」）：头部计数改用**接口给的全量口径**
+     （liveTotal / livePartTotal），不再对"前端拿到的行"求和。
+     为什么：接口旧实现按播放截断 100 条，而这里一求和，271 个在库稿件就被显示成 100 个
+     —— 计数与真实稿件库不一致，用户看到的就是自相矛盾。
+     服务端没给这两个字段（老版本）时退回本地求和，行为不会崩。 */
+  const liveTotal = Number.isFinite(Number(p.liveTotal)) ? Number(p.liveTotal) : live.length;
+  const livePartTotal = Number.isFinite(Number(p.livePartTotal))
+    ? Number(p.livePartTotal)
+    : live.reduce((a, r) => a + (Number(r.partCount) || 1), 0);
   box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">稿件表现统计（近 30 天）</h2>
     <p class="hintline">这一页回答：<b>长期资产</b>表现如何 —— 每个稿件的播放/点赞/评分、评分档与播放的相关性，以及月度成本（ASR 估算 + LLM 实际）。数据来自周期性回流。</p>
     <div class="card"><h2>LLM 评分 vs 实际播放（相关性，非因果）</h2>      ${corrTotal ? `<table class="tbl"><thead><tr><th>评分档</th><th>稿件数</th><th>平均播放</th></tr></thead><tbody>
@@ -3676,23 +4425,32 @@ async function renderPerf(box) {
       </tbody></table>` : `<div class="empty">这一档还统计不了：需要「既有 LLM 评分、又拉到了播放数据」的稿件。
         ${Number(p.pulledTotal || 0) > 0 ? `现在有 ${p.pulledTotal} 个稿件有播放数据，但它们的分P 任务是早期投的（评分没有落进表现数据）；新投的稿件会自动带上评分。` : '先让一场直播跑完投稿，再回来刷新。'}</div>`}
       <p class="hintline">${esc(p.note)}</p></div>
-    <div class="card"><h2>已发布稿件表现（按${perfSortLabel()}${perfSortAsc ? '升序' : '降序'}）<span class="ai-tag">${live.length} 个在库稿件 · ${livePartTotal} 个分P · 已拉到数据 ${p.pulledTotal ?? 0} 个${goneRows.length ? ` · ${perfShowGone ? `含 ${goneRows.length} 个已删除` : `已隐藏 ${goneRows.length} 个已删除`}` : ''}</span>
-      <span style="margin-left:auto;font-weight:400;font-size:12.5px;color:var(--text-2);display:inline-flex;align-items:center;gap:6px">排序
+    <div class="card"><h2>已发布稿件表现（按${perfSortLabel()}${perfSortAsc ? '升序' : '降序'}）<span class="ai-tag">${liveTotal} 个在库稿件 · ${livePartTotal} 个分P · 已拉到数据 ${p.pulledTotal ?? 0} 个${goneRows.length ? ` · ${perfShowGone ? `含 ${goneRows.length} 个已删除` : `已隐藏 ${goneRows.length} 个已删除`}` : ''}${p.truncated ? ` · 仅显示最新 ${p.rows.length} 个（共 ${liveTotal} 个，按发布时间保留）` : ''}</span>
+      <span style="margin-left:auto;font-weight:400;font-size:var(--fs-s);color:var(--text-2);display:inline-flex;align-items:center;gap:6px">排序
         <button class="btn-sm" id="perfRefreshNow" title="在页面上重查一遍（不动 B站，看的是已落库的最新数据）">🔄 刷新</button>
         <button class="btn-sm" id="perfForceRefresh" title="去 B站 强制拉一次最新统计（忽略每日一次的限制）">⬇️ 强制重拉</button>
-        <select id="perfSortKey" class="inp" style="width:auto;padding:3px 8px;font-size:12.5px">
+        <select id="perfSortKey" class="inp" style="width:auto;padding:3px 8px;font-size:var(--fs-s)">
           ${PERF_SORTS.map((s) => `<option value="${s.key}"${s.key === perfSort ? ' selected' : ''}>${esc(s.label)}</option>`).join('')}
         </select>
         <button class="btn-sm" id="perfSortDir" title="切换升序/降序">${perfSortAsc ? '↑ 升序' : '↓ 降序'}</button>
       </span></h2>
       <p class="hintline" id="perfFreshNote" style="min-height:18px"></p>
-      ${shown.length ? `<table class="tbl"><thead><tr><th>标题</th><th>评分</th><th>播放</th><th>点赞</th><th>投币</th><th>收藏</th><th>弹幕</th><th title="这个稿件最近一次投出切片的时间（同稿件多分P 取最近）">发布时间</th><th>数据日期</th></tr></thead><tbody>
-      ${shown.map((r) => `<tr><td><a href="${esc(r.url)}" target="_blank" rel="noreferrer">${esc(r.title)}</a>${r.gone ? ' <span class="tag-mini">稿件已不存在</span>' : ''}${r.unavailable ? ` <span class="tag-mini">${esc(r.unavailable)}</span>` : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${Number(r.partCount) > 1 ? ` <span class="ai-tag">同一稿件 ${r.partCount} 个分P</span>` : ''}</td>
+      ${shown.length ? `<table class="tbl"><thead><tr><th>标题</th><th>评分</th><th>播放</th><th>点赞</th><th>投币</th><th>收藏</th><th>弹幕</th><th title="这个稿件最近一次投出切片的时间（同稿件多分P 取最近）">发布时间</th><th title="这一行统计数对应的日期（每天回流一次）">数据日期</th></tr></thead><tbody>
+      ${/* ★ 2026-10-16（UI 评审 IA-6）：同一列的重复值不再逐行复读。
+            这一列 10 行有 10 行都是同一天 —— 它是"截止到"时间，属于表头信息。
+            现在只在**值发生变化**时显示，其余留空（悬停仍能看到）。
+            列本身保留是因为排序下拉（PERF_SORTS）里有"数据日期"这一项。 */ ''
+      }${(() => { let prevStat = null; const rowsToShow = perfShowAll ? shown : shown.slice(0, PERF_PAGE); return rowsToShow.map((r) => {
+        const stat = r.statDate || (r.gone ? '已删除' : r.unavailable ? '取不到' : '未拉取');
+        const same = stat === prevStat; prevStat = stat;
+        return `<tr><td><a href="${esc(r.url)}" target="_blank" rel="noreferrer">${esc(r.title)}</a>${r.gone ? ' <span class="tag-mini">稿件已不存在</span>' : ''}${r.unavailable ? ` <span class="tag-mini">${esc(r.unavailable)}</span>` : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${Number(r.partCount) > 1 ? ` <span class="ai-tag">同一稿件 ${r.partCount} 个分P</span>` : ''}</td>
         <td class="num">${r.llmScore === undefined ? '—' : Number(r.llmScore).toFixed(1)}</td><td class="num">${r.view ?? '—'}</td><td class="num">${r.like ?? '—'}</td>
         <td class="num">${r.coin ?? '—'}</td><td class="num">${r.favorite ?? '—'}</td><td class="num">${r.danmaku ?? '—'}</td>
         <td class="mono-sm">${esc(r.publishedAt || '—')}</td>
-        <td class="mono-sm">${esc(r.statDate || (r.gone ? '已删除' : r.unavailable ? '取不到' : '未拉取'))}</td></tr>`).join('')}
+        <td class="mono-sm">${same ? `<span class="rep-same" title="${esc(stat)}">〃</span>` : esc(stat)}</td></tr>`;
+      }).join(''); })()}
       </tbody></table>
+      ${shown.length > PERF_PAGE ? `<p class="hintline" style="margin-top:8px">已显示前 ${PERF_PAGE} / ${shown.length} 条（按当前排序）：<button class="linkbtn" id="perfShowAllToggle">${perfShowAll ? '收起，只看前 ' + PERF_PAGE + ' 条' : '展开其余 ' + (shown.length - PERF_PAGE) + ' 条'}</button></p>` : ''}
       <p class="hintline">多分P 模式下同一稿件的各分P 共享稿件总播放，所以按稿件（bvid）列一行；「同一稿件 N 个分P」标出它的规模。播放数为 0 以前是「接口没取到」，现在只有真取到才写数字，取不到会标出原因。</p>` : `<div class="empty">还没有可统计的稿件。${goneRows.length && !live.length
         ? `现存的稿件一个都没有 —— 已隐藏 ${goneRows.length} 个在 B站 上已不存在的（点下面的「显示它们」可核对）。`
         : Number(p.archiveTotal || 0) > 0
@@ -3714,6 +4472,8 @@ async function renderPerf(box) {
      排序改完**整页重画**：只是重新排一遍，API 数据没变（多一次本地 GET，可忽略）。 */
   const goneToggle = box.querySelector('#perfGoneToggle');
   if (goneToggle) goneToggle.addEventListener('click', () => { perfShowGone = !perfShowGone; renderPerf(box); });
+  const showAllToggle = box.querySelector('#perfShowAllToggle');
+  if (showAllToggle) showAllToggle.addEventListener('click', () => { perfShowAll = !perfShowAll; renderPerf(box); });
   /* ★ 2026-10-14：这一页自己的刷新入口 + **结果反馈**。
      用户实测反馈"刷新不及时"：其实刷新按钮原来只在健康面板上，而且候选为空时接口只回一句 notes、
      界面不显示 ⇒ 点了像没反应。现在：按钮在本页、结果写在这行提示里（含"今天已拉过"这种正常情况）。 */
@@ -3798,7 +4558,7 @@ const CFG_PINNED = [
   ['c_baseUrl', 'biliLive-tools 地址'],
   ['c_roomId', '直播间'],
   ['c_autoPublish', '自动发布'],
-  ['c_multiPart', '多分P'],
+  ['c_clipPublishMode', '切片投稿方式'],
   ['c_immediatePublish', '立即发布'],
   ['c_trashDays', '回收站保留天数'],
   ['c_dailyLimit', '每日投稿上限'],
@@ -3974,6 +4734,12 @@ async function openCfg() {
     ...(b.glossary || {}),
   };
   const tags = (c.publish.tidWhitelist ? Object.keys(c.publish.tidWhitelist) : []);
+  /* 排期口径按**实际生效值**渲染（口径由服务端 resolveClipPublishSchedule 给出，随 bootstrap 下发）。
+     设置面板里那句公式必须写真正会被用的数，否则用户会照着 config 里的原始值去理解排期。
+     ★ 2026-10-17 口径更正：单独投稿下「相邻切片间隔 / 随机抖动」**是生效的**
+     （间隔 300 秒保底、抖动受「必须小于间隔」夹取），所以公式里两个数都要按生效值写，
+     被抬/被夹时还要在下面说清原因 —— 这条文案由 `scheduleFormula()` 统一生成。 */
+  const effFormula = scheduleFormula(c.publish, clipModeOf(c.publish));
   $('#cfgBody').innerHTML = `
   <div class="group"><h3>连接</h3>
     <p class="gdesc">录制、压制、切割、上传、ASR 全部由 biliLive-tools 执行，这里只填它的地址与鉴权。</p>
@@ -3991,13 +4757,31 @@ async function openCfg() {
   <div class="group"><h3>直播间与录制</h3>
     <p class="gdesc">检查间隔越短，录制结束后越快被感知。轮询在任何情况下都保留 —— 它是可靠兜底。</p>
     <div class="fields">
-      <div class="field"><label>B站直播间房间号</label>
-        <div class="ctl">
-          <input class="inp" id="c_roomId" value="${esc(c.room.roomId)}">
+      <div class="field"><label>B站直播间房间号（可多个）</label>
+        <div class="roomlist" id="roomList">
+          <div class="roomrow">
+            <input class="inp" id="c_roomId" value="${esc(c.room.roomId)}" placeholder="主直播间，例如 23456789">
+            <span class="roomtag">主</span>
+            <button class="btn-sm" data-room-del title="移除这个直播间" style="visibility:hidden">移除</button>
+          </div>
+          ${(Array.isArray(c.room.roomIds) ? c.room.roomIds : [])
+            .filter((x) => String(x ?? '').trim())
+            .map(
+              (id) => `
+          <div class="roomrow">
+            <input class="inp" data-room-extra value="${esc(id)}" placeholder="附加直播间，例如 12345678">
+            <span class="roomtag"></span>
+            <button class="btn-sm" data-room-del title="移除这个直播间">移除</button>
+          </div>`,
+            )
+            .join('')}
+        </div>
+        <div class="ctl" style="margin-top:8px">
+          <button class="btn-sm" id="btnAddRoom" title="再加一个直播间：开播触发与补漏对账都会一起覆盖它">＋ 添加直播</button>
           <button class="btn-sm" id="btnFetchRooms" title="从 biliLive-tools 的录制配置（webhook.rooms）里读房间号，不用手打">从 biliLive-tools 读取</button>
         </div>
-        <div class="hintline" id="roomPickHint">点右边按钮可以直接列出 biliLive-tools 里配好的直播间（含备注），选中即填入上面的输入框 —— 仍要你点「保存」才会生效。</div>
-        <div class="hintline">这个房间号只用于<b>开播触发</b>（次要路径，按它去查 B站 的 recent-clips）。<b>录像导入走的是目录轮询</b>：它扫描 biliLive-tools 的录制根目录，<b>包含全部主播子目录</b> ⇒ 多个直播间的录像都会被处理，<b>不需要</b>在这里逐个填。触发那条路要覆盖多个房间，需要把房间号扩成列表（目前没做）。</div>
+        <div class="hintline" id="roomPickHint">点「从 biliLive-tools 读取」可以直接列出它配好的直播间（含备注），选中即填入<b>最后聚焦的那个输入框</b> —— 仍要你点「保存」才会生效。</div>
+        <div class="hintline">这些房间号只用于<b>开播触发</b>与<b>补漏对账</b>（按它们去查 B站 的 recent-clips / record-history）。<b>录像导入走的是目录轮询</b>：扫描 biliLive-tools 的录制根目录，<b>包含全部主播子目录</b> ⇒ 这里不填也能处理录像。第一行是主直播间，后面「添加直播」加的每个都会一起轮询。</div>
       </div>
       <div class="field"><label>platform（必须首字母大写）</label><input class="inp" id="c_platform" value="${esc(c.room.platform)}" readonly>
         <div class="hintline">写成 bilibili 会<b>静默返回空数组</b>，触发永不生效（陷阱 #1）</div></div>
@@ -4178,12 +4962,14 @@ async function openCfg() {
         </div>
         <div class="hintline" id="hintPlan"></div>
       </div>
-      <div class="field"><label>首片提交余量（秒，必须 &gt;7200）</label><input class="inp num" id="c_submitGapSec" value="${c.publish.submitGapSec}">
-        <div class="hintline ok" id="hintGap">公式：dtime = 提交时刻 + ${c.publish.submitGapSec} + (N-1)×${c.publish.clipGapSec} + random(0,${c.publish.jitterSec})</div>
+      <div class="field"><label>首片提交余量（秒，必须 ≥1200）</label><input class="inp num" id="c_submitGapSec" value="${c.publish.submitGapSec}">
+        <div class="hintline ${effFormula.warn ? 'warn' : 'ok'}" id="hintGap">${esc(effFormula.text)}</div>
         <div class="hintline">指定了「首片发布时间」后，这一项只作为<b>兜底下限</b>（指定时间更早时会被推迟到它）</div></div>
-      <div class="field"><label>相邻切片间隔（秒）</label><input class="inp num" id="c_clipGapSec" value="${c.publish.clipGapSec}">
-        <div class="hintline">B站硬限制是「相对<b>各稿件自身提交时刻</b> &gt;7200 秒」，相邻间隔不受额外限制；7500 仅为保守余量</div></div>
-      <div class="field"><label>随机抖动上限（秒）</label><input class="inp num" id="c_jitterSec" value="${c.publish.jitterSec}"></div>
+      <div class="field"><label>相邻切片间隔（秒，300 = 每片 5 分钟）</label><input class="inp num" id="c_clipGapSec" value="${c.publish.clipGapSec}">
+        <div class="hintline">这是我们自己的<b>错峰值、不是平台规则</b>：B站只要求每片的 dtime 晚于<b>它自己</b>的提交时刻 300 秒（投稿页口径「≥5 分钟」），与上一片无关，改大改小都合法（但低于 300 会被抬到 300 —— 那是平台底线）。</div>
+        <div class="hintline" id="hintClipGapUse">生效前提：① 关闭「立即发布」（立即发布不传 dtime，没有发布时间可排）；② 切片投稿方式选「单独投稿」（多分P 稿件只有一个发布时间，片子之间排不开）。</div></div>
+      <div class="field"><label>随机抖动上限（秒，0 = 严格等距）</label><input class="inp num" id="c_jitterSec" value="${c.publish.jitterSec}">
+        <div class="hintline">只影响<b>发布时间</b>的随机扰动（防「太像机器排的」，填 60–120 即可）；必须小于片间隔，超了会被自动压到「片间隔 − 30」。投稿<b>提交</b>的间隔抖动是下面的「minSubmitIntervalSec」，两者无关。</div></div>
       <div class="field"><label>每日投稿上限</label><input class="inp num" id="c_dailyLimit" value="${c.publish.dailyLimit}"></div>
       <div class="field"><label>仅自己可见（试跑期建议开启）</label><div class="inline-switch">
         <button class="switch sm ${c.publish.isOnlySelf === 1 ? 'on' : ''}" id="c_isOnlySelf"></button>
@@ -4196,28 +4982,32 @@ async function openCfg() {
         <button class="switch sm ${c.publish.immediatePublish ? 'on' : ''}" id="c_immediatePublish"></button>
         <span>${c.publish.immediatePublish ? '开启 —— 稿件过审后直接公开' : '关闭 —— 按公式定时发布'}</span></div>
         <div class="hintline" id="hintImmediate"></div></div>
-      <div class="field"><label>多分P投稿（完整版+纯享版+切片合成一个稿件）</label><div class="inline-switch">
-        <button class="switch sm ${c.publish.multiPart ? 'on' : ''}" id="c_multiPart"></button>
-        <span>${c.publish.multiPart ? '开启 —— 省额度，但各分P同一时刻发布' : '关闭 —— 每片一稿，可错峰但费额度'}</span></div>
-        <div class="hintline" id="hintMultiPart"></div></div>
+      <div class="field"><label>切片投稿方式</label>
+        <div class="chips" id="c_clipPublishMode">
+          <div class="chip ${clipModeOf(c.publish) === 'append' ? 'on' : ''}" data-mode="append">追加切片投稿</div>
+          <div class="chip ${clipModeOf(c.publish) === 'standalone' ? 'on' : ''}" data-mode="standalone">单独投稿</div>
+        </div>
+        <div class="hintline" id="hintClipMode">${esc(clipModeHint(clipModeOf(c.publish), c.publish))}</div></div>
       <div class="field"><label>完整版（弹幕版 + 纯享版）由谁投稿</label>
         <select class="inp" id="c_fullVideoBy">
           <option value="bililive-tools" ${c.publish.fullVideoBy !== 'assistant' ? 'selected' : ''}>biliLive-tools 投（默认）—— 它压制并投出完整版，本服务只把切片追加进同一个稿件</select>
           <option value="assistant" ${c.publish.fullVideoBy === 'assistant' ? 'selected' : ''}>切片助手投（例外）—— 本服务自己烧弹幕版 + remux 纯享版，新建 2+N 稿件</option>
         </select>
         <div class="hintline">规则：<b>除非你明确在这里（或该任务的 overrides.fullVideoBy）说明由切片助手投，否则完整版一律由 biliLive-tools 投</b>。
-          默认路径下，如果它还没投出来，本场会停在「已切片」<b>等待</b>（最多 ${c.publish.resumeWaitMin} 分钟，可在 config.json 调 publish.resumeWaitMin），
-          不会自己投完整版、也不会把切片投成独立稿件。</div></div>
+          「追加切片投稿」模式下，如果它还没投出来，本场会停在「已切片」<b>等待</b>（最多 ${c.publish.resumeWaitMin} 分钟，可在 config.json 调 publish.resumeWaitMin），
+          不会自己投完整版、也不会把切片投成独立稿件；选「单独投稿」时切片<b>不等它</b>，各自直接投（完整版照样归它投）。</div></div>
       <div class="field"><label>等待完整版稿件的上限（分钟）</label><input class="inp" id="c_resumeWaitMin" type="number" min="1" max="1440" value="${c.publish.resumeWaitMin}">
         <div class="hintline">biliLive-tools 的压制 + 上传是异步的（实测录制结束后 13–15 分钟才出弹幕版）。超时后本场仍停在「已切片」并告警，交人工确认。</div></div>
       <div class="field"><label>合集 ID（seasonId，留空则无法归入合集）</label><input class="inp" id="c_seasonId" value="${c.publish.seasonId || ''}" placeholder="需在 B站创作中心手动创建后填写">
         <div class="hintline">⚠️ 没有任何接口能创建合集；留空时切片照常投稿但<b>不会归入同一合集</b></div></div>
       <div class="field"><label>分区（默认）</label>
         <select class="inp" id="c_defaultCategory">${tags.map((t) => `<option ${c.publish.defaultCategory === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></div>
+      <div class="field full"><label>必带标签（逗号分隔，投稿时永远排在最前）</label><input class="inp" id="c_identityTags" value="${esc((c.publish.identityTags || []).join(', '))}">
+        <div class="hintline" id="hintIdentityTags"></div></div>
       <div class="field full"><label>默认标签（逗号分隔）</label><input class="inp" id="c_defaultTags" value="${esc(c.publish.defaultTags.join(', '))}">
         <div class="hintline" id="hintTags"></div></div>
       <div class="field full"><label>简介模板</label><textarea class="inp" id="c_descTemplate">${esc(c.publish.descTemplate)}</textarea>
-        <div class="hintline">可用变量：{{date}} {{liveTitle}} {{roomUrl}} {{startText}} {{endText}} {{desc}}（上限 250 字符，超出自动截断）</div></div>
+        <div class="hintline">可用变量：{{anchorName}} 主播昵称、{{anchorUid}} 主播UID（按切片对应的主播自动填）、{{date}} {{liveTitle}} {{roomUrl}} {{startText}} {{endText}} {{desc}}（上限 250 字符，超出自动截断）</div></div>
       <div class="field full"><label>简介末尾的 AI 声明</label><textarea class="inp" id="c_aiNotice" rows="2" placeholder="留空 = 不写声明">${esc(c.publish.aiNotice || '')}</textarea>
         <div class="hintline">切片是 LLM 选段 + AI 生成标题/字幕后自动投稿的，观众与平台都该看得见。
           <b>声明最后拼、不参与 250 字符截断</b>，所以正文再长也不会把它挤掉；单切片、多分P 稿件、我们上传的完整版都会带上。
@@ -4290,8 +5080,58 @@ async function openCfg() {
   $('#presetNote').textContent = LLM_PRESETS[c.llm.preset] ? LLM_PRESETS[c.llm.preset].note : '';
   updateEscalationHint();
   updateTagHint();
+  updateIdentityTagHint();
   renderDtimePlanPreview();
   bindCfg();
+  /* ★ 2026-10-16（UI 评审 IA-5）：这两件事必须放在 bindCfg() **之后**。
+     原因：bindCfg() 里的 enhanceCfgPanel() 会把每个 .group 重新包成
+     <details class="cfggroup">，并把原来的 <h3> 移走、用它的文字做 <summary>。
+     在这之前挂计数，计数会被当成标题文字一起吞掉（实测显示成"连接2 项"）。 */
+  annotateCfgGroups();
+  collapseLongHints();
+}
+
+/* 分组标题右侧挂「N 项」计数。理由：9 个分组默认全收起，用户找一项得逐个点开；
+   有了计数，至少能先判断"这里像不像有我要的东西"再决定展开哪个。
+   ⚠️ 挂到 <summary>（增强层重建出来的），不是原来的 <h3>。 */
+function annotateCfgGroups() {
+  $$('#cfgBody details.cfggroup').forEach((d) => {
+    const sum = d.querySelector('summary');
+    if (!sum || sum.querySelector('.gcount')) return;
+    const n = d.querySelectorAll('.field').length;
+    if (!n) return;
+    const chip = document.createElement('span');
+    chip.className = 'gcount';
+    chip.textContent = `${n} 项`;
+    sum.appendChild(chip);
+  });
+}
+
+/* 超长说明折两行 + 「展开」按钮。
+   为什么用 CSS line-clamp 而不是把文字切两段：说明里带 <b> / <span class="mono-sm">
+   这类标签，按字数切会把标签切断。line-clamp 只影响显示、不动 DOM，最安全。
+   ⚠️ 动态更新的那几个说明（用 id 取的）要跳过 —— 它们的内容会被整体重写。 */
+const HINT_KEEP_IDS = ['roomPickHint', 'partTitlePreview', 'cfgSearchNote', 'presetNote', 'tagHint'];
+function collapseLongHints() {
+  $$('#cfgBody .hintline').forEach((el) => {
+    if (el.dataset.hintDone) return;
+    if (el.id && HINT_KEEP_IDS.includes(el.id)) return;
+    if (el.querySelector('details')) return;
+    el.dataset.hintDone = '1';
+    if (el.textContent.trim().length < 110) return;   // 短的照旧
+    el.classList.add('hint-clamped');
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'hint-toggle';
+    btn.textContent = '展开';
+    btn.setAttribute('aria-expanded', 'false');
+    btn.onclick = (ev) => {
+      ev.preventDefault();
+      el.classList.remove('hint-clamped');
+      btn.remove();
+    };
+    el.after(btn);
+  });
 }
 
 /**
@@ -4305,16 +5145,18 @@ function renderDtimePlanPreview() {
   const b = state.bootstrap || {};
   const plan = b.dtimePlan || {};
   if (!v) {
-    el.className = 'hintline';
-    el.textContent = `自动排期：首片约 ${plan.firstText || '—'}，末片约 ${plan.lastText || '—'}（间隔 ${fmtSpan((b.config && b.config.publish.clipGapSec) || 7500)}）`;
+    el.className = plan.scheduled === false ? 'hintline warn' : 'hintline';
+    el.textContent = plan.scheduled === false
+      ? '当前是「立即发布」：投稿不带 dtime，稿件过审即公开 —— 首片/末片时间不适用（要错峰发布就关掉「立即发布」）'
+      : `自动排期：首片约 ${plan.firstText || '—'}，末片约 ${plan.lastText || '—'}（间隔 ${fmtSpan(plan.gapSec || (b.config && b.config.publish.clipGapSec) || 300)}）${plan.note ? ` · ${plan.note}` : ''}`;
     return;
   }
   const ms = Date.parse(v.replace(' ', 'T'));
   if (!Number.isFinite(ms)) { el.className = 'hintline warn'; el.textContent = '无法解析这个时间'; return; }
   const earliestMs = (plan.earliestAllowed || 0) * 1000;
-  if (ms / 1000 < Math.floor(Date.now() / 1000) + 7200) {
+  if (ms / 1000 < Math.floor(Date.now() / 1000) + 1200) {
     el.className = 'hintline warn';
-    el.textContent = `⚠ 这个时间距现在不足 7200 秒（B站要求 dtime 晚于提交时刻 7200 秒）—— 实际会推迟到 ${plan.earliestAllowedText || '最早合法时间'} 发布`;
+    el.textContent = `⚠ 这个时间距现在不足 1200 秒（本项目硬约束 #4 的余量下限；B站平台底线是 300 秒）—— 实际会推迟到 ${plan.earliestAllowedText || '最早合法时间'} 发布`;
   } else {
     el.className = 'hintline ok';
     el.textContent = `✓ 首片 ${fmtTime(ms)} 发布，其余按间隔顺延`;
@@ -4339,7 +5181,22 @@ function updateTagHint() {
   if (!el) return;
   const n = $('#c_defaultTags').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean).length;
   el.className = n > 10 ? 'hintline warn' : 'hintline';
-  el.textContent = n > 10 ? `已填 ${n} 个，超出 B站上限 10 个` : `已填 ${n} 个（上限 10 个，与 LLM 生成的标签合并后仍会去重与截断）`;
+  el.textContent = n > 10 ? `已填 ${n} 个，超出 B站上限 10 个` : `已填 ${n} 个（上限 10 个；投稿时排在「必带标签」与 LLM 按内容生成的标签之后，只用来补足剩余名额，不会挤掉它们）`;
+}
+/* 必带标签：这些词永远在最前、优先占位，所以它们的个数直接决定 LLM 内容词还剩几个位置 */
+function updateIdentityTagHint() {
+  const el = $('#hintIdentityTags');
+  if (!el) return;
+  const list = $('#c_identityTags').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+  const n = list.length;
+  const hasHolder = list.some((s) => /\{(主播|主播名|主播昵称|昵称)\}/.test(s));
+  el.className = n > 10 ? 'hintline warn' : 'hintline';
+  el.textContent =
+    (n > 10 ? `已填 ${n} 个，超出 B站上限 10 个；` : `已填 ${n} 个（上限 10 个）：`) +
+    `这些词永远排在切片标签最前面、优先占位，剩下的名额给 LLM 按内容生成的标签，重复的自动去重。` +
+    (hasHolder
+      ? '其中 {主播} 会在投稿时替换成本场主播名（例如 乙主播）；该场没识别出主播名时这一条整条跳过，任务里会写明。'
+      : '提示：想让每个稿件都带上主播名，加一个 {主播}（等同 {主播名} / {昵称}）。');
 }
 
 function bindCfg() {
@@ -4383,6 +5240,7 @@ function bindCfg() {
   $('#c_llmModel').oninput = updateEscalationHint;
   $('#c_llmSelectModel').oninput = updateEscalationHint;
   $('#c_defaultTags').oninput = updateTagHint;
+  if ($('#c_identityTags')) $('#c_identityTags').oninput = updateIdentityTagHint;
 
   // 首片发布时间：快捷按钮 + 实时预览
   const firstAt = $('#c_firstPublishAt');
@@ -4415,8 +5273,8 @@ function bindCfg() {
       d.setHours(kind === 'tomorrow8' ? 8 : 20, 0, 0, 0);
       ms = d.getTime();
     }
-    // 不能早于 B站下限（提交后 7200 秒）；更早的话实际也会被推迟，这里直接给合法值更省事
-    const floor = now + 7800_000;
+    // 不能早于本项目余量下限（提交后 1200 秒）；更早的话实际也会被推迟，这里直接给合法值更省事
+    const floor = now + 1200_000;
     if (ms < floor) ms = floor;
     firstAt.value = toLocalInput(ms);
     renderDtimePlanPreview();
@@ -4432,14 +5290,58 @@ function bindCfg() {
   /* 解码器精度开关：关 = 不发这个字段（fp32 默认）。文案跟着状态变，顺带把实测数字写在脸上 ——
      "省 1.1 GB 显存、推理慢 10%"是这个开关唯一的取舍，用户不需要去翻文档。 */
   tgl('#c_funasrBf16', (on, el) => el.nextElementSibling.textContent = on ? '开启（显存 −33%，推理 +10%）' : '关闭（fp32 默认，显存多占约 1.1 GB）');
-  /* 「从 biliLive-tools 读取房间号」（2026-10-13 用户要求：不要手打）。
-     只读取、只填输入框 —— 不自动保存（配置的写入仍由「保存」按钮走同一条路，行为可预期）。 */
+  /* 多直播间：第 1 行是主房间（**id 保持 `c_roomId`** ——「常用」快跳、配置覆盖检查、
+     读取按钮都按这个 id 找它，换 id 会连累三处），「＋ 添加直播」加的行在保存时收进 `room.roomIds`。
+     「从 biliLive-tools 读取」（2026-10-13 用户要求：不要手打）只填输入框、不自动保存 ——
+     配置写入仍由「保存」按钮走同一条路，行为可预期。 */
   {
+    const list = $('#roomList');
+    const rowsOf = () => (list ? Array.from(list.querySelectorAll('.roomrow')) : []);
+    /** 第一行不允许删（主直播间必填）；其余行显示「移除」。
+        主行用 visibility 而不是 display 隐藏：按钮仍然占位，几行输入框才对得齐（实测差 46px）。 */
+    const syncRows = () => {
+      rowsOf().forEach((row, i) => {
+        const tag = row.querySelector('.roomtag');
+        if (tag) tag.textContent = i === 0 ? '主' : '';
+        const del = row.querySelector('[data-room-del]');
+        if (del) del.style.visibility = i === 0 ? 'hidden' : '';
+      });
+    };
+    const bindDel = (row) => {
+      const del = row.querySelector('[data-room-del]');
+      if (del) del.onclick = () => { row.remove(); syncRows(); };
+    };
+    rowsOf().forEach(bindDel);
+    /* 记住最后聚焦的房间输入框：点「读取」按钮后焦点已经不在输入框上了，
+       所以必须在点击的那一刻就锁定目标，否则永远只会填到第一行。 */
+    let focusedInput = null;
+    if (list) {
+      list.addEventListener('focusin', (e) => {
+        const t = e.target;
+        if (t && t.tagName === 'INPUT') focusedInput = t;
+      });
+    }
+    const addRoomRow = (value) => {
+      if (!list) return null;
+      const row = document.createElement('div');
+      row.className = 'roomrow';
+      row.innerHTML = '<input class="inp" data-room-extra placeholder="附加直播间，例如 12345678"><span class="roomtag"></span><button class="btn-sm" data-room-del title="移除这个直播间">移除</button>';
+      const input = row.querySelector('input');
+      if (input) input.value = value || '';
+      list.appendChild(row);
+      bindDel(row);
+      syncRows();
+      return input;
+    };
+    const addBtn = $('#btnAddRoom');
+    if (addBtn) addBtn.onclick = () => { const el = addRoomRow(''); if (el) el.focus(); };
+    syncRows();
+
     const b = $('#btnFetchRooms');
     if (b) {
       b.onclick = async () => {
         const hint = $('#roomPickHint');
-        const box = $('#c_roomId');
+        const box = focusedInput && document.contains(focusedInput) ? focusedInput : $('#c_roomId');
         if (!hint || !box) return;
         hint.textContent = '读取中…';
         try {
@@ -4526,11 +5428,11 @@ function bindCfg() {
         ${cmd('cursor', 'Cursor（~/.cursor/mcp.json 里的片段）', r.commands.cursorJson)}
         ${cmd('curl', '动手验证（列出所有工具）', r.commands.curl)}
         <h4 style="margin-top:14px">安全边界</h4>
-        <ul style="font-size:12.5px;color:var(--text-2);padding-left:18px;line-height:1.7">
+        <ul style="font-size:var(--fs-s);color:var(--text-2);padding-left:18px;line-height:1.7">
           ${r.safety.map((s) => `<li>${esc(s)}</li>`).join('')}
         </ul>
         <h4 style="margin-top:14px">Agent 能做什么</h4>
-        <p style="font-size:12.5px;color:var(--text-2);line-height:1.7">
+        <p style="font-size:var(--fs-s);color:var(--text-2);line-height:1.7">
         可以直接对它说：「现在有什么任务在跑」「<span class="mono-sm">manual-xxx</span> 这场为什么没出片」「把这场从 ANALYZED 重跑」
         「我新录的那场怎么没导入」「取消删源录播」「这场跑一次投稿体检」。</p>`);
       $$('#infoBody [data-copy]').forEach((el) => (el.onclick = () => {
@@ -4549,26 +5451,35 @@ function bindCfg() {
   tgl('#c_autoPublish', (on, el) => el.nextElementSibling.textContent = on ? '全自动（分析完直接排期发布）' : '半自动（需确认后发布）');
   tgl('#c_immediatePublish', (on, el) => {
     el.nextElementSibling.textContent = on ? '开启 —— 稿件过审后直接公开' : '关闭 —— 按公式定时发布';
-    const hint = document.getElementById('hintImmediate');
-    if (hint) {
-      hint.className = on ? 'hintline warn' : 'hintline';
-      hint.textContent = on
-        ? '⚠️ 投稿不带 dtime，稿件过审即公开。这会绕过任务书硬约束 #4（dtime > 提交后 7200 秒）—— 该约束是防风控的自律措施，不是 B站规则。试跑期建议关闭。'
-        : 'B站只在「传了 dtime」时才要求它 ≥ 提交后 2 小时；本模式满足硬约束 #4。';
-    }
+    paintScheduleHints(clipModeFromForm());
   });
-  { const h = document.getElementById('hintImmediate'); if (h) h.textContent = 'B站只在「传了 dtime」时才要求它 ≥ 提交后 2 小时；本模式满足硬约束 #4。'; }
-  tgl('#c_multiPart', (on, el) => {
-    el.nextElementSibling.textContent = on ? '开启 —— 省额度，但各分P同一时刻发布' : '关闭 —— 每片一稿，可错峰但费额度';
-    const hint = document.getElementById('hintMultiPart');
-    if (hint) {
-      hint.className = 'hintline';
-      hint.textContent = on
-        ? '结构为 2+N 个分P（完整版/纯享版/各切片），一次投稿只占 1 个每日额度；代价是多P稿件只有一个 dtime，相邻错峰间隔不再生效。'
-        : '每个切片单独投一个稿件，可按 clipGapSec 错峰，但每片占 1 个每日额度。';
-    }
-  });
-  { const h = document.getElementById('hintMultiPart'); if (h) h.textContent = (state.bootstrap.config.publish.multiPart ? '结构为 2+N 个分P（完整版/纯享版/各切片），一次投稿只占 1 个每日额度；代价是多P稿件只有一个 dtime，相邻错峰间隔不再生效。' : '每个切片单独投一个稿件，可按 clipGapSec 错峰，但每片占 1 个每日额度。'); }
+  /* 切片投稿方式：两选一（追加切片投稿 / 单独投稿）。
+     chip 是多选语义，这里手动互斥 —— 点一个必须关掉另一个，否则界面上会出现"两个都亮"，
+     而保存时只能取一个（那种界面就是在骗人）。 */
+  {
+    const chips = $$('#c_clipPublishMode .chip');
+    const paint = (mode) => {
+      chips.forEach((el) => el.classList.toggle('on', el.dataset.mode === mode));
+      const h = document.getElementById('hintClipMode');
+      if (h) {
+        h.className = 'hintline';
+        h.textContent = clipModeHint(mode, state.bootstrap.config.publish);
+      }
+      /* multiPart 是这个开关的实现口径，界面上把它如实显示出来：
+         用户手改过 config.json 时两个值可能打架，先看见比保存后才发现好。 */
+      const mp = state.bootstrap.config.publish.multiPart;
+      if (h && ((mode === 'append') !== (mp === true))) {
+        h.className = 'hintline warn';
+        h.textContent += `（注意：config.json 里 publish.multiPart=${mp}，与这个选择不一致 —— 保存后二者会被同步成一致）`;
+      }
+      /* ★ 排期三处提示跟着**当前选中**的模式重画（还没保存也立刻反映）：
+         单独投稿是「固定定时投稿 + 设置里的间隔/抖动」，唯一真正不参与的旋钮是
+         publish.immediatePublish。 */
+      paintScheduleHints(mode);
+    };
+    chips.forEach((el) => (el.onclick = () => paint(el.dataset.mode === 'standalone' ? 'standalone' : 'append')));
+    paint(clipModeOf(state.bootstrap.config.publish));
+  }
   tgl('#c_deleteRaw', (on, el) => el.nextElementSibling.textContent = on ? '开启（省空间）' : '关闭');
   tgl('#c_keepOnFail', (on, el) => el.nextElementSibling.textContent = on ? '开启（便于重跑）' : '关闭');
   $$('#c_channels .chip').forEach((ch) => ch.onclick = () => ch.classList.toggle('on'));
@@ -4577,14 +5488,36 @@ function bindCfg() {
   gap.oninput = () => {
     const v = Number(gap.value);
     const el = $('#hintGap');
-    if (!(v > 7200)) {
+    if (!(v >= 1200)) {
       el.className = 'hintline warn';
-      el.textContent = `B站要求定时发布必须晚于该稿件提交时刻 7200 秒，${v} 秒会导致投稿被拒（陷阱 #12）`;
+      el.textContent = `本项目硬约束 #4 要求定时发布距该稿件提交时刻 ≥ 1200 秒，${v} 秒会被拦下（B站平台底线是 300 秒，多出来的是防风控的自律余量）`;
     } else {
       el.className = 'hintline ok';
-      el.textContent = `✓ 合规（> 7200 秒）`;
+      el.textContent = `✓ 合规（≥ 1200 秒）`;
     }
   };
+  /* 「相邻切片间隔 / 随机抖动」一改就立刻重算公式 —— 用户最需要当场看到的是
+     「我填的 100 会不会被抬到 300」「我填的 900 会不会被压」，而不是保存后才发现。
+     口径仍只由 `scheduleFormula()` 一份实现给出（与服务端同一套规则）。 */
+  const repaintFormulaFromForm = () => {
+    const pub = { ...((state.bootstrap && state.bootstrap.config && state.bootstrap.config.publish) || {}) };
+    for (const [sel, key] of [['#c_submitGapSec', 'submitGapSec'], ['#c_clipGapSec', 'clipGapSec'], ['#c_jitterSec', 'jitterSec']]) {
+      const el = $(sel);
+      if (!el) continue;
+      const v = Number(el.value);
+      if (Number.isFinite(v)) pub[key] = v;
+    }
+    const f = scheduleFormula(pub, clipModeFromForm());
+    const el = $('#hintGap');
+    if (el) {
+      el.className = f.warn ? 'hintline warn' : 'hintline ok';
+      el.textContent = f.text;
+    }
+  };
+  for (const sel of ['#c_clipGapSec', '#c_jitterSec']) {
+    const el = $(sel);
+    if (el) el.oninput = repaintFormulaFromForm;
+  }
 }
 
 /**
@@ -4648,11 +5581,18 @@ async function saveCfg(force) {
   btn.disabled = true; btn.textContent = '保存中…';
   const val = (id) => { const el = $(id); return el ? el.value : ''; };
   const num = (id) => Number(val(id));
+  /* 多直播间：第一行是主房间（写回 room.roomId），其余按顺序写进 room.roomIds。
+     这里先去重、去空、并剔除与主房间重复的 —— 校验层还会拦一次，但没必要把脏数据写进配置。 */
+  const primaryRoom = val('#c_roomId').trim();
+  const extraRooms = [...new Set($$('#roomList input[data-room-extra]').map((el) => String(el.value || '').trim()).filter(Boolean))].filter(
+    (id) => id !== primaryRoom,
+  );
   const on = (id) => $(id).classList.contains('on');
   const patch = {
     bililive: { baseUrl: val('#c_baseUrl'), ...(val('#c_passKey') ? { passKey: val('#c_passKey') } : {}) },
     room: {
-      roomId: val('#c_roomId'),
+      roomId: primaryRoom,
+      roomIds: extraRooms,
       pollIntervalSec: num('#c_pollIntervalSec'),
       offlineConfirmSec: num('#c_offlineConfirmSec'),
       reconcileIntervalMin: num('#c_reconcileIntervalMin'),
@@ -4716,12 +5656,17 @@ async function saveCfg(force) {
       isOnlySelf: on('#c_isOnlySelf') ? 1 : 0,
       autoPublish: on('#c_autoPublish'),
       immediatePublish: on('#c_immediatePublish'),
-      multiPart: on('#c_multiPart'),
+      clipPublishMode: clipModeFromForm(),
+      /* multiPart 是「切片投稿方式」的实现口径（append ⇔ true），保存时**由它派生**：
+         两个键必须一起写，否则会出现"界面上选了单独投稿、配置里 multiPart 还是 true"那种
+         自相矛盾（服务端会按 clipPublishMode 走，但人手翻 config.json 时看不出谁说了算）。 */
+      multiPart: clipModeFromForm() === 'append',
       fullVideoBy: val('#c_fullVideoBy') === 'assistant' ? 'assistant' : 'bililive-tools',
       resumeWaitMin: Math.max(1, Number(val('#c_resumeWaitMin')) || 90),
       seasonId: Number(val('#c_seasonId')) || 0,
       defaultCategory: val('#c_defaultCategory'),
       defaultTags: val('#c_defaultTags').split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+      identityTags: val('#c_identityTags').split(/[,，]/).map((s) => s.trim()).filter(Boolean),
       descTemplate: val('#c_descTemplate'),
       aiNotice: val('#c_aiNotice').trim(),
       coverSource: val('#c_coverSource'),
@@ -4826,6 +5771,143 @@ async function saveCfg(force) {
   btn.disabled = false; btn.textContent = '保存配置';
 }
 
+/**
+ * 读「切片投稿方式」这一组 chip 的当前选择（两选一，默认「追加切片投稿」）。
+ *
+ * 为什么单独成函数：渲染初值、点击切换、saveCfg 存盘三处都要用同一个口径 ——
+ * 各写一遍迟早会漂移（那种漂移的表现是"界面上选的是单独投稿、存下去是追加"，最难查）。
+ */
+function clipModeFromForm() {
+  const on = $$('#c_clipPublishMode .chip').find((el) => el.classList.contains('on'));
+  return on && on.dataset.mode === 'standalone' ? 'standalone' : 'append';
+}
+
+/**
+ * 相邻切片间隔的**平台底线**（秒）：B站 要求每片的 dtime 晚于**它自己**的提交时刻 300 秒。
+ *
+ * 与服务端 `STANDALONE_CLIP_GAP_SEC`（`src/config.ts`）是同一个数。这里重复一个常量是
+ * **故意的**：设置面板要在用户还没保存、只是切换「切片投稿方式」时就把生效值算出来给用户看，
+ * 而那时还没有服务端算好的口径可读。两边算法必须一致（间隔 = max(300, 用户值)、
+ * 抖动 = min(用户值, max(0, 间隔 - 30))），`tools/verify-clip-gap-ui.ts` 会拿生产函数对账。
+ */
+const CLIP_GAP_FLOOR_SEC = 300;
+
+/**
+ * 「公式」那一行的**唯一**生成处（首次渲染与切换模式/开关后刷新共用）。
+ *
+ * 为什么必须这么写：这句话是用户核对 dtime 的唯一凭据。曾经的错误形态有两种 ——
+ *   ① 单独投稿下写死 `random(0,0)`、`×300`，而用户明明在设置里填了 500/120（本次要修的）；
+ *   ② 抖动被夹取时静默显示成"没夹"，用户以为生效了，实际每片间隔比预期小。
+ * 所以这里两个数一律按**生效值**写，并且凡是被抬/被夹就在后面括号里说清原因。
+ *
+ * @returns `{ text, warn }` —— `warn` 为 true 时调用方把这一行染成警示色（有值没完全生效）。
+ */
+function scheduleFormula(publish, mode) {
+  const p = publish || {};
+  const standalone = mode === 'standalone';
+  const submitGap = Number(p.submitGapSec) || 1200;
+  /* 用户填的数（负数/NaN 一律当没填）：这一步只做"取值"，不做任何业务夹取 */
+  const wantGapRaw = Math.floor(Number(p.clipGapSec));
+  const wantGap = Number.isFinite(wantGapRaw) && wantGapRaw > 0 ? wantGapRaw : CLIP_GAP_FLOOR_SEC;
+  const wantJitterRaw = Math.floor(Number(p.jitterSec));
+  const wantJitter = Number.isFinite(wantJitterRaw) && wantJitterRaw > 0 ? wantJitterRaw : 0;
+  /* 生效值：与服务端 resolveClipPublishSchedule + effectiveJitterSec 完全同一套规则 */
+  const gap = standalone ? Math.max(CLIP_GAP_FLOOR_SEC, wantGap) : wantGap;
+  const cap = Math.min(wantJitter, Math.max(0, gap - 30));
+
+  const reasons = [];
+  if (standalone && wantGap < CLIP_GAP_FLOOR_SEC) {
+    reasons.push(`你填的间隔 ${wantGap} 秒低于 B站 平台底线 ${CLIP_GAP_FLOOR_SEC} 秒，实际按 ${gap} 秒排`);
+  }
+  if (wantJitter > cap) {
+    reasons.push(`你填的抖动 ${wantJitter} 秒已自动压到 ${cap} 秒（抖动必须小于片间隔，否则排期倒挂）`);
+  }
+
+  let text = `公式：dtime = 提交时刻 + ${submitGap} + (N-1)×${gap} + random(0,${cap})`;
+  if (standalone) text += '　（单独投稿：固定定时投稿，片间隔与抖动都按上面这两项生效）';
+  if (reasons.length) text += `　（${reasons.join('；')}）`;
+  return { text, warn: reasons.length > 0 };
+}
+
+/**
+ * 按**当前选中的模式**刷新与排期有关的三处提示（还没保存也立刻反映）。
+ *
+ * ★ 2026-10-17 口径更正（用户要求「这里改成对定时投稿也生效」）：
+ *   单独投稿下「相邻切片间隔 / 随机抖动」**对切片生效**，只有两条硬边界 ——
+ *   ① 间隔不得低于平台底线 300 秒；② 抖动必须小于间隔（防排期倒挂）。
+ *   唯一仍不参与的是「立即发布」（固定定时投稿，不传 dtime 就没有"按间隔发"）。
+ *   所以这里不再说"那两项不生效"，而是把**生效值**与**被抬/被夹的原因**一起写出来：
+ *   这类"改了配置没完全生效"比完全不生效更容易让人抓狂。
+ */
+function paintScheduleHints(mode) {
+  const publish = (state.bootstrap && state.bootstrap.config && state.bootstrap.config.publish) || {};
+  const standalone = mode === 'standalone';
+  const f = scheduleFormula(publish, mode);
+
+  /* ① 公式：写**生效值**，被抬/被夹要说明原因 */
+  const g = document.getElementById('hintGap');
+  if (g) {
+    g.className = f.warn ? 'hintline warn' : 'hintline ok';
+    g.textContent = f.text;
+  }
+
+  /* ② 「相邻切片间隔」下方的生效说明 */
+  const u = document.getElementById('hintClipGapUse');
+  if (u) {
+    u.className = 'hintline';
+    u.textContent = standalone
+      ? '当前是「单独投稿」：切片固定走定时投稿，片间隔就用上面这个数 —— 低于 300 秒会被抬到 300（B站 要求每片 dtime 晚于它自己的提交时刻 300 秒）；下面的「随机抖动」也生效，上限会被压到「片间隔 − 30」以内以保证不倒挂。'
+      : '生效前提：① 关闭「立即发布」（立即发布不传 dtime，没有发布时间可排）；② 切片投稿方式选「单独投稿」（多分P 稿件只有一个发布时间，片子之间排不开）。';
+  }
+
+  /* ③ 「立即发布」下方的说明：单独投稿下它对切片失效（但对完整版仍有效） */
+  const imm = document.getElementById('hintImmediate');
+  if (imm) {
+    const sw = $('#c_immediatePublish');
+    const isOn = Boolean(sw && sw.classList.contains('on'));
+    if (standalone) {
+      imm.className = 'hintline warn';
+      imm.textContent =
+        '当前是「单独投稿」：切片固定定时投稿（片间隔见上方「相邻切片间隔」，最低 300 秒），这个开关对切片不生效' +
+        '—— 但由本服务投完整版时仍按它走（开启则过审即公开）。';
+    } else {
+      imm.className = isOn ? 'hintline warn' : 'hintline';
+      imm.textContent = isOn
+        ? '⚠️ 投稿不带 dtime，稿件过审即公开。这会绕过本项目硬约束 #4（dtime ≥ 提交后 1200 秒）—— 该约束是防风控的自律措施，不是 B站规则。试跑期建议关闭。'
+        : 'B站只在「传了 dtime」时才要求它 ≥ 提交后 2 小时；本模式满足硬约束 #4。';
+    }
+  }
+}
+
+/**
+ * 「切片投稿方式」的说明文案（纯文本：渲染时过 esc()、切换时用 textContent，都不解析标签）。
+ *
+ * 必须写清楚差别 —— 光看「追加 / 单独」两个词猜不出实际后果：
+ * 等不等完整版稿件、占几个每日额度、还能不能错峰。
+ */
+function clipModeHint(mode, publish) {
+  const wait = Number(publish && publish.resumeWaitMin) || 90;
+  const wantGap = Number(publish && publish.clipGapSec) || 300;
+  if (mode === 'standalone') {
+    /* ★ 2026-10-17：间隔/抖动在这里**是生效的**（间隔 300 保底、抖动 < 间隔），
+       文案必须跟着改 —— 否则用户会因为这句「不参与切片排期」而不敢动那两个控件。 */
+    const gap = Math.max(CLIP_GAP_FLOOR_SEC, wantGap);
+    const jitter = Math.min(Math.max(0, Number(publish && publish.jitterSec) || 0), Math.max(0, gap - 30));
+    return (
+      `单独投稿：每个切片各自投一个稿件（标题/封面/标签各自独立），固定走定时投稿、每片相隔 ${gap} 秒` +
+      `（${gap % 60 === 0 ? `${gap / 60} 分钟` : `${Math.floor(gap / 60)} 分 ${gap % 60} 秒`}）` +
+      `${jitter > 0 ? `、每片再加 0~${jitter} 秒随机抖动` : '等距'}发布（间隔低于 300 秒会被抬到 300，抖动大于等于间隔会被压到「间隔 − 30」）。` +
+      `也不用等 biliLive-tools 的完整版稿件（「立即发布」在该模式下对切片不参与 —— 固定定时投稿才有发布时间可排）。` +
+      `代价是每片占 1 个每日额度。保存后对后续步骤生效（已投出的稿件不动）。`
+    );
+  }
+  return (
+    `追加切片投稿：切片作为「同一个稿件」的分P 追加进去（完整版归 biliLive-tools 时进它那个稿件，` +
+    `归本服务时与完整版/纯享版合成 2+N 稿件）。一次投稿只占 1 个每日额度；代价是整个稿件只有一个发布时间` +
+    `（相邻切片错峰不生效），且要等完整版稿件投出来（最多 ${wait} 分钟）。保存后对后续步骤生效。`
+  );
+}
+
 function closeCfg() { $('#cfgMask').classList.remove('show'); }
 window.closeCfg = closeCfg;
 
@@ -4863,6 +5945,80 @@ window.closeInfo = closeInfo;
 /* ============================================================================
  * 顶栏与事件绑定
  * ========================================================================== */
+
+/* ★ 2026-10-16（UI 评审 L-3）：窄屏（<1320px）的排期抽屉开关。
+   为什么要有：三栏原来写死 280|1fr|300，1280 笔记本上中栏只剩 700px，
+   工具条换行、底栏压住正文。现在窄屏把排期收成右侧抽屉，宽度还给中栏。 */
+function openScheduleDrawer() {
+  const el = $('#colRight'); if (!el) return;
+  el.classList.add('open');
+  const b = $('#btnSchedule'); if (b) b.setAttribute('aria-expanded', 'true');
+}
+function closeScheduleDrawer() {
+  const el = $('#colRight'); if (!el) return;
+  el.classList.remove('open');
+  const b = $('#btnSchedule'); if (b) b.setAttribute('aria-expanded', 'false');
+}
+(function bindScheduleDrawer() {
+  const b = $('#btnSchedule');
+  if (b) b.onclick = () => {
+    const el = $('#colRight');
+    if (el && el.classList.contains('open')) closeScheduleDrawer(); else openScheduleDrawer();
+  };
+  /* 点抽屉外面任意地方收起（只在抽屉确实打开时生效，避免抢别处的点击） */
+  document.addEventListener('click', (ev) => {
+    const el = $('#colRight');
+    if (!el || !el.classList.contains('open')) return;
+    if (el.contains(ev.target) || (b && b.contains(ev.target))) return;
+    closeScheduleDrawer();
+  }, true);
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') closeScheduleDrawer();
+  });
+})();
+
+/* ★ 2026-10-16：主题切换。
+   首屏的 data-theme 已经由 00-shell-head.html 里的内联脚本设好（避免闪白），
+   这里只负责"点一下换一个"和把按钮文案同步过去。
+   为什么不做成右上角的开关（switch）：它会和「全自动」「字幕」两个开关并排，
+   三个长得一样的开关放在一起，用户会以为都是"功能开关"而不是"外观设置"。 */
+(function bindThemeToggle() {
+  const btn = $('#btnTheme');
+  if (!btn) return;
+  const root = document.documentElement;
+  const isDark = () => root.getAttribute('data-theme') === 'dark';
+  const paint = () => {
+    const dark = isDark();
+    btn.setAttribute('aria-pressed', dark ? 'true' : 'false');
+    const t = $('#themeText'); if (t) t.textContent = dark ? '浅色' : '深色';
+    const i = $('#themeIcon'); if (i) i.textContent = dark ? '☀' : '◐';
+    btn.title = dark ? '切换到浅色主题' : '切换到深色主题';
+  };
+  btn.onclick = () => {
+    const next = isDark() ? 'light' : 'dark';
+    if (next === 'dark') root.setAttribute('data-theme', 'dark');
+    else root.removeAttribute('data-theme');
+    try { localStorage.setItem('liveauto.theme', next); } catch (e) { /* 隐私模式，忽略 */ }
+    paint();
+    /* 切主题会让 canvas / iframe 里的旧配色过时，提示一下但不强制刷新 */
+    toast(next === 'dark' ? '已切换到深色主题' : '已切换到浅色主题');
+  };
+  /* 没手动选过时，跟随系统：用户在系统里切了深色，这里要跟着变 */
+  if (window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onSys = (ev) => {
+      let saved = null;
+      try { saved = localStorage.getItem('liveauto.theme'); } catch (e) { /* 忽略 */ }
+      if (saved) return;                  // 手动选过就以手动为准
+      if (ev.matches) root.setAttribute('data-theme', 'dark'); else root.removeAttribute('data-theme');
+      paint();
+    };
+    if (mq.addEventListener) mq.addEventListener('change', onSys);
+    else if (mq.addListener) mq.addListener(onSys);
+  }
+  paint();
+})();
+
 $('#btnSetting').onclick = () => openCfg().catch((e) => toast(e.message));
 $('#btnCheckNow').onclick = async () => {
   toast('正在检查录制历史…');
@@ -4897,13 +6053,13 @@ $('#btnRepairStuck').onclick = async () => {
 $('#btnImport').onclick = () => {
   openInfo('导入录播文件', `
     <div class="barstrip" style="gap:8px">
-      <span style="font-size:12.5px;color:var(--text-3)">可导入的录播</span>
+      <span style="font-size:var(--fs-s);color:var(--text-3)">可导入的录播</span>
       <button class="btn-sm" id="impRefresh">刷新清单</button>
       <span id="impScanInfo" class="hintline" style="margin-left:auto"></span>
     </div>
 
     <details id="impDirsBox" style="margin:8px 0 12px">
-      <summary style="cursor:pointer;font-size:12.5px;color:var(--text-2)">扫描目录（录播没显示出来？在这里加）</summary>
+      <summary style="cursor:pointer;font-size:var(--fs-s);color:var(--text-2)">扫描目录（录播没显示出来？在这里加）</summary>
       <div id="impDirs" style="margin-top:8px"></div>
       <div class="ctl" style="margin-top:8px">
         <input class="inp" id="impDirAdd" placeholder="例如 D:\\录播  或  ~/Videos/bili（支持 ~）">
@@ -4941,7 +6097,7 @@ $('#btnImport').onclick = () => {
     for (const d of info.detectedDirs || []) {
       rows.push(`<div class="row"><span class="t" style="color:var(--text-3)">自动</span><span class="s">
         <span class="mono-sm" style="word-break:break-all">${esc(d)}</span>
-        <br><span style="color:var(--text-3);font-size:11.5px">来自 biliLive-tools 的保存目录</span></span></div>`);
+        <br><span style="color:var(--text-3);font-size:var(--fs-meta)">来自 biliLive-tools 的保存目录</span></span></div>`);
     }
     for (const d of info.configuredDirs || []) {
       rows.push(`<div class="row"><span class="t" style="color:var(--text-3)">手动</span><span class="s">
@@ -5109,7 +6265,7 @@ $('#btnImport').onclick = () => {
       ];
       box.innerHTML = `<div class="kv">${rows.map(([k, v]) => `<div class="k">${k}</div><div>${esc(String(v))}</div>`).join('')}</div>` +
         (p.variants.length > 1
-          ? `<div style="margin-top:10px"><div class="k" style="font-size:11.5px;color:var(--text-3);margin-bottom:6px">这一场的其它版本（点一下换用它）</div>
+          ? `<div style="margin-top:10px"><div class="k" style="font-size:var(--fs-meta);color:var(--text-3);margin-bottom:6px">这一场的其它版本（点一下换用它）</div>
              <div class="filelist">${p.variants.map((v, i) => `<button data-variant="${i}" ${v.videoPath === p.videoPath ? 'style="border-color:var(--blue,#00aeec)"' : ''}>${esc(v.fileName)}（${v.sizeMB} MB${v.hasDanmakuInPicture ? ' · 已烧弹幕' : ''}）</button>`).join('')}</div></div>`
           : '') +
         (p.importedBy ? `<div class="barstrip warn">这个文件已属于任务 <span class="mono-sm">${esc(p.importedBy.taskId)}</span>（${esc(p.importedBy.status)}）—— 再次导入会新建一场并重新花 ASR 费用</div>` : '') +
@@ -5183,11 +6339,18 @@ $('#btnImport').onclick = () => {
 };
 $('#modeSwitch').onclick = async () => {
   const on = !$('#modeSwitch').classList.contains('on');
-  if (on && !confirm('切换到全自动后，分析完成会直接按评分阈值选片、切片并排期发布，全程无人工。确定开启？')) return;
+  /* ★ 2026-10-16（UI 评审 3.1）：这是全站唯一"点一下就会自动对外发文、且不再问你"的开关，
+     所以确认文案把后果说全（会发文 / 不再询问 / 怎么退回），而不是只说"确定开启？"。 */
+  if (on && !confirm(
+    '开启「全自动 · 免确认发布」后：\n\n' +
+    '· 分析完成后直接按评分阈值选片、切片、排期发布\n' +
+    '· 全程不再询问你，稿件会直接投到 B 站\n' +
+    '· 顶栏这个开关会变成琥珀色，用来提醒你它正开着\n\n' +
+    '随时可以点回来切回半自动。确定开启？',
+  )) return;
   try {
     await api('/api/config', { method: 'POST', body: { patch: { publish: { autoPublish: on } } } });
-    $('#modeSwitch').classList.toggle('on', on);
-    $('#modeText').textContent = on ? '全自动 · 免确认发布' : '半自动 · 需确认后发布';
+    renderModeSwitch(on);
     toast(on ? '已切换为全自动：分析完成后直接排期发布' : '已切换为半自动：需你确认后才发布');
     await loadBootstrap();
   } catch (e) { toast('切换失败：' + e.message); }
@@ -5612,43 +6775,40 @@ function renderObserve(box) {
         : `<div class="hintline">biliLive-tools 录制器状态问不到（${esc(rec.error || '接口异常')}）—— 此时"录制中"退回按文件是否在写判断，不影响边录边转。</div>`}
     </div>
 
-    <div class="card">
-      <div class="card-head"><b>① 正在录制的文件</b><span class="badge ${recording.length ? 'b-run' : ''}">${recording.length} 个</span></div>
-      ${
-        recRows
-          ? `<table class="tbl obs-tbl"><thead><tr><th>文件</th><th>大小</th><th>速率</th><th>最后写入</th><th>状态</th></tr></thead><tbody>${recRows}</tbody></table>`
-          : '<div class="empty">当前没有在写的录制文件（每轮目录轮询的结论见「实时监控」页）</div>'
-      }
-    </div>
+    ${/* ★ 2026-10-16（UI 评审 IA-2）：空态不再占整张卡片。
+          改版前 ①②③ 三张空卡片合计占掉约 350px，把真正有数据的「④ 最近几场」挤出首屏。
+          现在没有内容时收成一行虚线摘要条，有内容才展开成完整卡片（含那条长说明）。 */ ''
+    }${recRows
+      ? `<div class="card">
+      <div class="card-head"><b>① 正在录制的文件</b><span class="badge b-run">${recording.length} 个</span></div>
+      <table class="tbl obs-tbl"><thead><tr><th>文件</th><th>大小</th><th>速率</th><th>最后写入</th><th>状态</th></tr></thead><tbody>${recRows}</tbody></table>
+    </div>`
+      : `<div class="empty-strip"><b>① 正在录制的文件</b><span class="badge b-idle">0 个</span>
+      <span class="tail">当前没有在写的录制文件 · 每轮目录轮询的结论见「实时监控」页</span></div>`}
 
-    <div class="card">
-      <div class="card-head"><b>② 边录边转（预转写）</b><span class="badge ${preActive.length ? 'b-done' : ''}">${preActive.length ? preActive.length + ' 场进行中' : '当前空闲'}${preActive.length && preHistory ? ` · 另有 ${preHistory} 条历史记录` : ''}</span></div>
-      ${
-        preRows
-          ? `<table class="tbl obs-tbl"><thead><tr><th>场次</th><th>已完成</th><th>路径</th><th>更新</th></tr></thead><tbody>${preRows}</tbody></table>`
-          : '<div class="empty">当前没有直播在录，也没有进行中的转写 —— 这里就该是空的。</div>'
-      }`
-      + `
-      <div class="hintline">粒度：biliLive-tools 会把一场直播切成多个分段文件（<span class="mono-sm">.ts</span> / <span class="mono-sm">-PART001.ts</span>…）。<b>正在写的那个分段不会转</b>（末次写入距今不到 2 分钟即视为"仍在写入"），写完之后的下一次检查就会转它 —— 所以一场 4 小时的直播，下播时通常只剩最后一个分段要转。
-      }
+    ${preRows
+      ? `<div class="card">
+      <div class="card-head"><b>② 边录边转（预转写）</b><span class="badge b-done">${preActive.length} 场进行中${preActive.length && preHistory ? ` · 另有 ${preHistory} 条历史记录` : ''}</span></div>
+      <table class="tbl obs-tbl"><thead><tr><th>场次</th><th>已完成</th><th>路径</th><th>更新</th></tr></thead><tbody>${preRows}</tbody></table>
+      <div class="hintline">粒度：biliLive-tools 会把一场直播切成多个分段文件（<span class="mono-sm">.ts</span> / <span class="mono-sm">-PART001.ts</span>…）。<b>正在写的那个分段不会转</b>（末次写入距今不到 2 分钟即视为"仍在写入"），写完之后的下一次检查就会转它 —— 所以一场 4 小时的直播，下播时通常只剩最后一个分段要转。</div>
       ${noteRows ? `<div class="obs-sub">最近判定（已滤掉"循环已启动"这类噪声）</div>${noteRows}` : ''}
-    </div>
+    </div>`
+      : `<div class="empty-strip"><b>② 边录边转（预转写）</b><span class="badge b-idle">当前空闲</span>
+      <span class="tail">当前没有直播在录，也没有进行中的转写</span></div>`}
 
     <!-- ★ 2026-10-14：原来这里的「④ 跑完自动关机」卡片**已迁出**为独立页签
          （顶栏「自动关机」，见 20-shell-body.html 的 data-view="autoshutdown" + 39-其它页签 的 iframe）。
          原因：这一页每 5 秒整块重渲染，卡片再怎么只改文本也会被带着抖 —— 用户连报两次"界面一直抖"，
          最终方案是让它有自己的文档（/api/shutdown/page）。此处不再保留重复入口。 -->
-    </div>
 
-    <div class="card">
-      <div class="card-head"><b>③ 压制 / 上传队列</b><span class="badge ${queue.length ? 'b-run' : ''}">${queue.length} 个进行中</span></div>
-      ${
-        qRows
-          ? `<table class="tbl obs-tbl"><thead><tr><th>类型</th><th>任务</th><th>状态</th><th>进度</th><th>已跑</th><th>预计还需</th><th>产物</th></tr></thead><tbody>${qRows}</tbody></table>`
-          : '<div class="empty">队列空闲</div>'
-      }
+    ${qRows
+      ? `<div class="card">
+      <div class="card-head"><b>③ 压制 / 上传队列</b><span class="badge b-run">${queue.length} 个进行中</span></div>
+      <table class="tbl obs-tbl"><thead><tr><th>类型</th><th>任务</th><th>状态</th><th>进度</th><th>已跑</th><th>预计还需</th><th>产物</th></tr></thead><tbody>${qRows}</tbody></table>
       <div class="hintline">完整版（弹幕版 + 纯享版）由 biliLive-tools 压制与上传；它投出去之后，等完整版的切片才会被追加成分P。</div>
-    </div>
+    </div>`
+      : `<div class="empty-strip"><b>③ 压制 / 上传队列</b><span class="badge b-idle">队列空闲</span>
+      <span class="tail">完整版压制与上传由 biliLive-tools 负责</span></div>`}
 
     <div class="card">
       <div class="card-head"><b>④ 最近几场</b></div>
@@ -5701,6 +6861,15 @@ function renderObserve(box) {
     $('#detail').innerHTML = `<div class="errbar"><div class="ico">!</div><div class="txt"><b>初始化失败</b><br>${esc(e.message)}<br>
       <span style="color:var(--text-3)">请确认服务已启动，并且你是通过 http://127.0.0.1:${state.bootstrap ? '' : ''}${location.port} 访问（不是通过其它主机名）。</span></div></div>`;
   }
+  /* 构建指纹巡检（2026-10-25）：页面开着的时候有人改了代码，这里能自己转红，
+     不用刷新页面才发现"咦怎么还是旧行为"。30 秒一次，只读一个很小的 JSON。 */
+  setInterval(async () => {
+    if (document.hidden) return;
+    try {
+      const b = await api('/api/build');
+      renderBuildTag({ id: b.running && b.running.id, diskId: b.disk && b.disk.id, stale: b.stale, at: b.running && b.running.latestMtimeMs, note: b.note });
+    } catch { /* 服务重启中会短暂失败，忽略 */ }
+  }, 30000);
   // 自动刷新：有任务在处理时 4 秒，否则 20 秒
   setInterval(async () => {
     if (document.hidden) return;

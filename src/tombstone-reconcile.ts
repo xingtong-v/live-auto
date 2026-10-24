@@ -14,28 +14,34 @@
  * | 情况 | 结论 |
  * |---|---|
  * | 有 bvid，且它还在**我的稿件列表**里 | **保留**（旧稿件还在，墓碑正当事） |
- * | 有 bvid，列表拿全了却没有它，且详情接口明确报「稿件不存在」 | **解除** |
- * | 有 bvid，列表没拿全 / 详情报的是别的错（限流、500、审核中） | **保留**（说不清，不用不完整的证据放行） |
+ * | 有 bvid，列表**按 count 取全了**却没有它，且详情接口报**强证据**错误（稿件不可见/已删除等） | **解除** |
+ * | 有 bvid，列表没取全 / 详情报的是弱证据错误（「啥都木有」= 上游没数据，审核中/仅自己可见/接口异常都会出现）或别的错（限流、500） | **保留**（说不清，不用不完整的证据放行） |
  * | 没有 bvid（当年只走到「已提交」），但按**切片标题**在某个稿件的**分P 标题**里找到了 | **保留**，并顺手补记 bvid |
- * | 没有 bvid，列表拿全、分P 也都扫完了，确实找不到 | **解除** |
- * | 没有 bvid，但列表没拿全 / 有稿件的详情拉失败 / 详情调用数超上限 | **保留**（算「没查全」） |
+ * | 没有 bvid，列表取全、分P 也都扫完了，确实找不到 | **解除** |
+ * | 没有 bvid，但列表没取全 / 有稿件的详情拉失败 / 详情调用数超上限 | **保留**（算「没查全」） |
  *
  * 两个刻意的设计：
- * 1. **不用「列表里没有」单独下结论** —— 稿件数超过一页时列表会截断，那会把第 101 个之后的稿件
- *    误判成「已删」（`refreshPerformance` 的注释里记过同类事故）。所以必须 `listComplete`
- *    （列表返回条数 < 页大小）才允许得出「查不到」的结论。
+ * 1. **不用「列表里没有」单独下结论** —— 必须先确认列表**按服务端 count 取全**。
+ *    2026-10-17 事故：单页请求被服务端静默降级（请求 100 实际回 10 条），旧判据
+ *    「返回条数 < 页大小」恒为真，61 个稿件只看见 10 个，18 条墓碑因此被误解除
+ *    （见 docs/待修问题-墓碑误解除与分页判据-2026-10-17.md）。现在用
+ *    `fetchAllArchivePages` 按 count 循环翻页，没取全就整轮只保留、不解除。
  * 2. **解除一定留痕**：`ledger.releaseTombstone()` 会往 `publish-log.jsonl` 追一条
  *    `tombstone-release`，「为什么当初又投了一遍」事后永远查得到。
  */
 
 import type { Logger } from './logger.ts';
 import type { Ledger, TombstoneEntry } from './ledger.ts';
-import { isArchiveGoneError } from './publish.ts';
+import { fetchAllArchivePages } from './api.ts';
+import type { ArchiveListPage } from './api.ts';
+import { isArchiveGoneError, isStrongArchiveGoneError } from './publish.ts';
 
 /** 只依赖用到的两个接口，测试里可以直接塞 mock（daemon 传真 client 就行） */
 export interface TombstoneReconcileClient {
   biliArchives(params: { page?: number; pageSize?: number }): Promise<Array<Record<string, unknown>>>;
-  biliArchiveDetail(bvid: string, opts?: { retry?: number }): Promise<Record<string, unknown>>;
+  /** 带服务端分页元信息的版本（可选：没实现的 mock 走 biliArchives + 短页判据兜底） */
+  biliArchivesPage?(params: { page?: number; pageSize?: number }): Promise<ArchiveListPage>;
+  biliArchiveDetail(bvid: string, opts?: { retry?: number; tag?: string }): Promise<Record<string, unknown>>;
 }
 
 export interface TombstoneVerdict {
@@ -54,6 +60,10 @@ export interface TombstoneReconcileResult {
   kept: number;
   /** 证据不足、保留待下次（列表没取全 / 详情失败 / 详情调用超上限） */
   unverified: number;
+  /** 本轮新登记进防重复表的标题数（最近 N 天的公开稿件） */
+  addedTitles?: number;
+  /** 本轮清除的过期墓碑数（立碑超过 N 天） */
+  prunedTombstones?: number;
   releasedList: TombstoneVerdict[];
   keptList: TombstoneVerdict[];
   notes: string[];
@@ -65,6 +75,10 @@ export interface TombstoneReconcileResult {
 export const TOMBSTONE_LIST_PAGE_SIZE = 100;
 /** 单轮最多拉多少个稿件详情（分P 标题核对用）。没扫完的墓碑算「证据不足」，保留待下次 */
 export const TOMBSTONE_DETAIL_CAP = 100;
+/** 核对时"最近 N 天的公开稿件"要自动登记进防重复表（2026-10-15 用户要求） */
+export const TOMBSTONE_RECENT_ADD_DAYS = 3;
+/** 立碑超过 N 天自动清除（2026-10-15 用户要求"清除 7 天前的"） */
+export const TOMBSTONE_KEEP_DAYS = 7;
 /** 相邻两次详情请求之间的间隔：一天一次的后台任务，宁可慢一点也别给 B站 接口上强度 */
 export const TOMBSTONE_PACE_MS = 150;
 
@@ -97,6 +111,8 @@ export async function reconcileTombstones(opts: {
       releasedList,
       keptList,
       notes: ['没有墓碑，无需核对'],
+      addedTitles: 0,
+      prunedTombstones: 0,
       dryRun,
     };
   }
@@ -106,25 +122,38 @@ export async function reconcileTombstones(opts: {
   let listOk = false;
   let listComplete = false;
   try {
-    const archives = await client.biliArchives({ page: 1, pageSize: TOMBSTONE_LIST_PAGE_SIZE });
-    listed = archives
+    /* ★ 2026-10-17 事故修复：按服务端 count 循环翻页取全，不再拿
+       「返回条数 < 请求页大小」当完整性判据（单页请求被服务端静默降级时该判据恒为真） */
+    const all = await fetchAllArchivePages({
+      fetchPage: async (page) => {
+        if (client.biliArchivesPage) return client.biliArchivesPage({ page, pageSize: TOMBSTONE_LIST_PAGE_SIZE });
+        return { items: await client.biliArchives({ page, pageSize: TOMBSTONE_LIST_PAGE_SIZE }) };
+      },
+      pageSize: TOMBSTONE_LIST_PAGE_SIZE,
+    });
+    listed = all.items
       .map((a) => ({
-        bvid: String(a['bvid'] ?? '').trim(),
-        ...(typeof a['title'] === 'string' ? { title: a['title'] } : {}),
-        ...(typeof a['ctime'] === 'number' ? { ctime: a['ctime'] } : {}),
-        ...(typeof a['state'] === 'number' ? { state: a['state'] } : {}),
+        bvid: String((a as Record<string, unknown>)['bvid'] ?? '').trim(),
+        ...(typeof a['title'] === 'string' ? { title: a['title'] as string } : {}),
+        ...(typeof a['ctime'] === 'number' ? { ctime: a['ctime'] as number } : {}),
+        ...(typeof a['state'] === 'number' ? { state: a['state'] as number } : {}),
       }))
       .filter((a) => a.bvid.length > 0)
       /* 新的排前面：详情调用触顶时，优先扫最近的稿件（旧墓碑多半也对应旧稿件） */
       .sort((a, b) => (b.ctime ?? 0) - (a.ctime ?? 0));
     listOk = true;
-    listComplete = archives.length < TOMBSTONE_LIST_PAGE_SIZE;
+    listComplete = all.complete;
+    for (const n of all.notes) notes.push(n);
   } catch (e) {
     notes.push(`读取我的稿件列表失败：${(e as Error).message.slice(0, 80)} —— 本轮只能核对 bvid 已在列表里的情况`);
   }
   const listedBvids = new Set(listed.map((a) => a.bvid));
 
-  /* ---- 稿件详情（分P 标题）带缓存：同一份稿件只拉一次，且全轮共用 ---- */
+  /* ---- 稿件详情（分P 标题）带缓存：同一份稿件只拉一次，且全轮共用 ----
+     （2026-10-17 Bug#2 修复：bvid 判定那条路原来直连 client.biliArchiveDetail，
+      绕过了这个缓存 —— 18 条墓碑共用一个 bvid 就发了 18 次请求，实测 4 秒 19 次。
+      现在统一走 partsOf()，同一 bvid 整轮只查一次；请求日志 tag 也改成 'tombstone'，
+      不再混进 [perf] 里。） */
   const detailCache = new Map<string, { ok: boolean; parts: string[]; err?: string; gone?: boolean }>();
   /** 拉失败的稿件详情（bvid → 错因）：这些会让「查不到」的结论不成立，必须报出来而不是静默保留 */
   const scanErrors = new Map<string, string>();
@@ -136,7 +165,7 @@ export async function reconcileTombstones(opts: {
     if (detailCalls > 0 && paceMs > 0) await new Promise((r) => setTimeout(r, paceMs));
     detailCalls++;
     try {
-      const detail = await client.biliArchiveDetail(bvid, { retry: 0 });
+      const detail = await client.biliArchiveDetail(bvid, { retry: 0, tag: 'tombstone' });
       const view = (detail['View'] ?? detail) as Record<string, unknown>;
       const pages = Array.isArray(view['pages']) ? (view['pages'] as Array<Record<string, unknown>>) : [];
       const parts = pages.map((p) => String(p['part'] ?? '').trim()).filter(Boolean);
@@ -175,14 +204,18 @@ export async function reconcileTombstones(opts: {
         unverified++;
         continue;
       }
+      /* ★ 2026-10-17 修复（Bug#1 判据 + Bug#2 缓存）：走 partsOf（同一 bvid 整轮只查一次），
+         且「已删除」只认**强证据**错误文案 —— 「啥都木有」是 biliLive-tools 的通用
+         「上游没数据」，未发布/仅自己可见/接口异常都会出现，不能单独作为已删除的证据
+         （事故里 18 条墓碑就是被它误解除的）。弱证据一律「unknown」保留待下次。 */
       let verdict: 'gone' | 'alive' | 'unknown' = 'unknown';
       let errMsg = '';
-      try {
-        await client.biliArchiveDetail(t.bvid, { retry: 0 });
+      const d = await partsOf(t.bvid);
+      if (d.ok) {
         verdict = 'alive';
-      } catch (e) {
-        errMsg = (e as Error).message.slice(0, 80);
-        verdict = isArchiveGoneError(errMsg) ? 'gone' : 'unknown';
+      } else {
+        errMsg = d.err ?? '';
+        verdict = isStrongArchiveGoneError(errMsg) ? 'gone' : 'unknown';
       }
       if (verdict === 'alive') {
         /* 列表缓存延迟（B站 侧分P/稿件列表有几分钟到几十分钟的滞后），详情能查到就算在 */
@@ -195,8 +228,8 @@ export async function reconcileTombstones(opts: {
         notes.push(`墓碑 ${label} 的旧稿件 ${t.bvid} 查不动（${errMsg}），保留待下次`);
         continue;
       }
-      const why = `旧稿件 ${t.bvid} 既不在我的稿件列表里，详情接口也明确报「不存在」（${errMsg}）`;
-      if (!dryRun) ledger.releaseTombstone(t.fingerprint, { note: `自动核对解除：${why}` });
+      const why = `旧稿件 ${t.bvid} 既不在取全的稿件列表里，详情接口也明确报「不存在」（${errMsg}）`;
+      if (!dryRun) ledger.releaseTombstone(t.fingerprint, { note: `自动核对解除：${why}`, via: 'auto' });
       released++;
       releasedList.push({ ...shown, why });
       continue;
@@ -242,11 +275,11 @@ export async function reconcileTombstones(opts: {
       }
       const d = await partsOf(a.bvid);
       if (!d.ok) {
-        /* ★ 「啥都木有」（HTTP 500）同时出现在两种情形：稿件真没了、以及稿件已锁定读不到。
-           `isArchiveGoneError` 认不出这个区别，所以这里以**列表里的 state 为准**：
-           列表说它已锁定（state≠0）就是"读不到"，不能当成"不存在"混过去
-           —— 否则解除依据会写成"扫遍都没有"，而事实是那份稿件压根没读到。 */
-        if (d.gone && !locked) continue; // 确实不存在 ⇒ 藏不了东西，不是拦路石
+        /* ★ 「稿件不可见」= 强证据（稿件真没了，藏不了东西）；「啥都木有」= 弱证据
+           （真没了 / 未发布 / 仅自己可见 / 接口异常都可能出现，2026-10-17 事故的教训）。
+           这里只有强证据且未锁定才敢当「不存在」跳过；弱证据按「这次没拉到」处理，
+           时间上相关就进 blockers（保留待下次），宁可多等一轮也不误解除。 */
+        if (isStrongArchiveGoneError(d.err) && !locked) continue; // 确实不存在 ⇒ 藏不了东西，不是拦路石
         if (relevantArchive(a.ctime)) blockers.push({ bvid: a.bvid, reason: d.err ?? '详情拉取失败', locked });
         continue;
       }
@@ -281,9 +314,43 @@ export async function reconcileTombstones(opts: {
       : '；所有可能与它相关的稿件都读到了，都没有这一段';
     const why = `没有 bvid，按切片标题把可能与它相关的稿件扫了一遍（读完 ${detailCache.size} 份详情）没找到${lockedNote}`;
     if (blockers.length) inaccessibleReleases++;
-    if (!dryRun) ledger.releaseTombstone(t.fingerprint, { note: `自动核对解除：${why}` });
+    if (!dryRun) ledger.releaseTombstone(t.fingerprint, { note: `自动核对解除：${why}`, via: 'auto' });
     released++;
     releasedList.push({ ...shown, why });
+  }
+
+  /* ★ 2026-10-15 用户要求的两条滚动窗口维护（都在核对这一轮里做，不额外请求 B站）：
+     ① **登记最近 3 天的公开稿件标题**进防重复表 —— 核对本来就要拉稿件列表，顺手把自己
+        最近投出去的标题记下来，投稿前的标题去重才有依据（宁可少投，也不在网络那头多出一份）；
+     ② **清除 7 天前的墓碑** —— 墓碑不会自动过期，实测堆到 161 条，大半是旧稿件早没了的历史，
+        留着只会让「这段还能不能投」越来越难判断。判据是立碑时间（retiredAt）。
+     两条都尊重 dryRun（预演不动台账），并把数字写进 notes。 */
+  let addedTitles = 0;
+  let publishedTitleTotal = 0;
+  let prunedTombstones = 0;
+  if (listOk) {
+    const recentPublic = listed.filter((a) => {
+      const when = Number(a.ctime ?? 0) * 1000;
+      if (!Number.isFinite(when) || when <= 0) return false;
+      if (Date.now() - when > TOMBSTONE_RECENT_ADD_DAYS * 86400_000) return false;
+      /* state === 0 = 公开；负数/非 0 是锁定、审核中、仅自己可见等 —— 那些不该当"已投出去过" */
+      return a.state === 0;
+    });
+    const titles = recentPublic.map((a) => String(a.title ?? '').trim()).filter(Boolean);
+    if (titles.length > 0 && !dryRun) {
+      const r = ledger.rememberPublishedTitles(titles);
+      addedTitles = r.added;
+      publishedTitleTotal = r.total;
+    }
+    notes.push(
+      `最近 ${TOMBSTONE_RECENT_ADD_DAYS} 天的公开稿件 ${recentPublic.length} 个：` +
+        (dryRun ? '（预演，不登记）' : `新登记标题 ${addedTitles} 条（防重复表共 ${publishedTitleTotal} 条）`),
+    );
+  }
+  const pruned = ledger.pruneTombstones({ olderThanDays: TOMBSTONE_KEEP_DAYS, dryRun, note: '墓碑核对顺带清理' });
+  prunedTombstones = pruned.pruned;
+  if (prunedTombstones > 0) {
+    notes.push(`清除立碑超过 ${TOMBSTONE_KEEP_DAYS} 天的墓碑 ${prunedTombstones} 条${dryRun ? '（预演）' : ''}`);
   }
 
   notes.unshift(
@@ -294,5 +361,5 @@ export async function reconcileTombstones(opts: {
       `；本轮拉了 ${detailCalls} 份稿件详情。`,
   );
   opts.logger?.info(notes[0]!, { mod: 'ledger', data: { released, inaccessibleReleases, kept, unverified, dryRun } });
-  return { checked: tombs.length, released, inaccessibleReleases, kept, unverified, releasedList, keptList, notes, dryRun };
+  return { checked: tombs.length, released, inaccessibleReleases, kept, unverified, releasedList, keptList, notes, dryRun, addedTitles, prunedTombstones };
 }

@@ -7,6 +7,8 @@
 function closeTaskMenu() {
   const m = document.getElementById('taskMenu');
   if (m) m.remove();
+  /* 2026-10-16（UI 评审 L-2）：菜单收起后把「⋯」的常显状态也撤掉 */
+  $$('#taskList .task.menu-open').forEach((el) => el.classList.remove('menu-open'));
 }
 
 /** 复制文本到剪贴板（clipboard API 在非安全上下文不可用，留 execCommand 兜底） */
@@ -66,6 +68,11 @@ function openTaskMenu(taskId, anchorEl) {
     <div class="sep"></div>
     <button data-op="delete" class="danger">删除任务…</button>`;
   document.body.appendChild(menu);
+  /* 2026-10-16（UI 评审 L-2）：「⋯」默认是 opacity:0（悬停才出现）。
+     菜单开着时把它保持在可见状态 —— 否则鼠标移到菜单上，触发它的按钮就消失了，
+     看起来像菜单凭空冒出来，也失去了"这个菜单属于哪一行"的空间关系。 */
+  const row = document.querySelector(`#taskList .task[data-id="${CSS.escape(taskId)}"]`);
+  if (row) row.classList.add('menu-open');
   const r = anchorEl.getBoundingClientRect();
   const mw = 200;
   const mh = menu.offsetHeight || 230;
@@ -110,7 +117,7 @@ async function handleTaskOp(op, taskId) {
       toast(r.from + ' → ' + r.to + '：' + r.reason, 6000);
       setTimeout(() => refreshAll(true), 700);
     } else if (op === 'retry') {
-      openInfo('从某阶段重跑', '<p style="font-size:13px;color:var(--text-2)">转写结果与切片产物都会复用，重跑不会重复产生 ASR 费用。</p><div class="chips" id="retryStages">' +
+      openInfo('从某阶段重跑', '<p style="font-size:13px;color:var(--text-2)">转写结果与切片产物都会复用，重跑不会重复产生 ASR 费用。</p><p style="font-size:13px;color:var(--text-2)"><b>重新切片与投稿</b>：先把切片状态重置，再逐片同步 —— 已投过的片通过指纹/反查自动核对回来（不会重复投稿），只有 B站 上确实没有的片才会补投（产物在直接投、缺产物先重切）。</p><div class="chips" id="retryStages">' +
         [['ANALYZED','重新分析（重跑 LLM 选片）'],['TRANSCRIBED','重新转写（复用缓存）'],['RECORDED','从源素材重来'],['CLIPPED','重新切片与投稿']]
           .map(([v, label]) => '<button class="chip" data-stage="' + v + '">' + label + '</button>').join('') + '</div>');
       // ⚠️ 必须用 $$（querySelectorAll）：$ 是 querySelector，返回**单个元素**，
@@ -218,7 +225,7 @@ function renderTaskList() {
     const picked = state.multi.sel.has(t.id);
     return `<div class="task ${t.id === state.activeId ? 'active' : ''}${picked ? ' picked' : ''}" data-id="${esc(t.id)}">
       ${multi ? `<input type="checkbox" class="pick" data-pick="${esc(t.id)}"${picked ? ' checked' : ''} title="选中这一场">` : ''}
-      <div class="when"><span>${esc(t.when)}</span><span>${toTime(t.durationSec)}</span></div>
+      <div class="when"><span>${esc(t.when)}</span><span>${toMS(t.durationSec)}</span></div>
       <div class="name">${esc(t.title)}</div>
       <div class="meta"><span class="badge ${badge[g] || 'b-idle'}">${esc(t.statusText)}</span>${extra.map((x) => `<span>${esc(x)}</span>`).join('')}</div>
       ${multi ? '' : `<button class="more" data-more="${esc(t.id)}" title="任务操作（右键同样可打开）">⋯</button>`}

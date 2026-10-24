@@ -12,13 +12,13 @@
  * | 情形 | 结论 |
  * |---|---|
  * | 有 bvid，且它还在我的稿件列表里 | 保留 |
- * | 有 bvid，列表拿全了却没有它，且详情明确报「不存在」 | **解除** |
- * | 有 bvid，列表没拿全 / 详情报的是别的错 | 保留（证据不足） |
+ * | 有 bvid，列表**按 count 取全**了却没有它，且详情报**强证据**「不存在」 | **解除** |
+ * | 有 bvid，列表没取全 / 详情报弱证据（「啥都木有」）或别的错 | 保留（证据不足） |
  * | 没有 bvid，但按分P 标题在某份稿件里找到了同一段内容 | 保留，并**补记 bvid** |
  * | 没有 bvid，可能相关的稿件都读到了、都没有这一段 | **解除** |
  * | 没有 bvid，可能相关的那份稿件 B站 侧已锁定/读不到 | **解除**，但单独计数、依据里写明是哪份稿件 |
  * | 没有 bvid，可能相关的**公开**稿件这次没拉到（限流/超时） | 保留（下次再试，不用残缺证据放行） |
- * | 稿件列表可能被截断（返回条数 == 一页） | 一律不解除 |
+ * | 服务端把 pageSize 静默降级 / 翻页异常 ⇒ 列表未取全 | 一律不解除（⑧ 事故复刻） |
  * | dryRun | 只报告，台账一条都不动 |
  *
  * 另外两条**必须**成立的安全性质：
@@ -71,12 +71,27 @@ type Archive = { bvid: string; title?: string; ctime?: number; state?: number };
 type DetailSpec = { parts?: string[]; error?: string };
 interface Mock extends Record<string, unknown> {
   biliArchives(params: { page?: number; pageSize?: number }): Promise<Archive[]>;
+  biliArchivesPage?(params: { page?: number; pageSize?: number }): Promise<{ items: Archive[]; page?: { pn?: number; ps?: number; count?: number } }>;
   biliArchiveDetail(bvid: string, opts?: { retry?: number }): Promise<Record<string, unknown>>;
 }
-/** 一份可控的假 client：稿件列表 + 每份稿件的详情（可以给 parts、也可以给错误） */
-function mockClient(archives: Archive[], details: Record<string, DetailSpec>): Mock {
-  return {
-    biliArchives: async (p) => archives.slice(0, p.pageSize ?? TOMBSTONE_LIST_PAGE_SIZE),
+/**
+ * 一份可控的假 client：稿件列表 + 每份稿件的详情（可以给 parts、也可以给错误）。
+ * opts.serverPs  = 模拟服务端**实际**页大小（把请求的 pageSize 压下来 —— 2026-10-17 事故的形状）；
+ * opts.withMeta  = 响应带 page={pn,ps,count} 分页元信息（真实 biliLive-tools 的形状）；
+ * opts.ignorePage = 服务端忽略 page 参数（永远回第 1 页 —— 事故里的异常形态）。
+ */
+function mockClient(
+  archives: Archive[],
+  details: Record<string, DetailSpec>,
+  opts: { serverPs?: number; withMeta?: boolean; ignorePage?: boolean } = {},
+): Mock {
+  const slicePage = (p: { page?: number; pageSize?: number }): Archive[] => {
+    const ps = Math.min(p.pageSize ?? TOMBSTONE_LIST_PAGE_SIZE, opts.serverPs ?? Number.POSITIVE_INFINITY);
+    const page = opts.ignorePage ? 1 : (p.page ?? 1);
+    return archives.slice((page - 1) * ps, page * ps);
+  };
+  const client: Mock = {
+    biliArchives: async (p) => slicePage(p),
     biliArchiveDetail: async (bvid) => {
       const d = details[bvid];
       if (!d) throw new Error('稿件不存在或已被删除');
@@ -84,6 +99,14 @@ function mockClient(archives: Archive[], details: Record<string, DetailSpec>): M
       return { View: { bvid, videos: (d.parts ?? []).length, pages: (d.parts ?? []).map((part) => ({ part, duration: 60 })) } };
     },
   };
+  if (opts.withMeta) {
+    client.biliArchivesPage = async (p) => {
+      const ps = Math.min(p.pageSize ?? TOMBSTONE_LIST_PAGE_SIZE, opts.serverPs ?? Number.POSITIVE_INFINITY);
+      const page = opts.ignorePage ? 1 : (p.page ?? 1);
+      return { items: archives.slice((page - 1) * ps, page * ps), page: { pn: page, ps, count: archives.length } };
+    };
+  }
+  return client;
 }
 
 function mkClip(index: number, over: Partial<ClipRecord> = {}): ClipRecord {
@@ -286,26 +309,50 @@ section('⑦ 与立碑时间无关的稿件读不到，不算拦路石（否则�
 }
 
 /* ========================================================================== */
-section('⑧ 稿件列表可能被截断（返回条数 == 一页）⇒ 一律不解除');
+section('⑧ 【2026-10-17 事故复刻】服务端把 pageSize 静默降级（100→10）且忽略翻页 ⇒ 列表未取全 ⇒ 一律不解除');
 {
-  const many: Archive[] = Array.from({ length: TOMBSTONE_LIST_PAGE_SIZE }, (_, i) => ({
+  /* 事故形状：请求 pageSize=100，服务端只回 10 条（page={pn:1,ps:10,count:61}），
+     旧判据「10 < 100」恒为真 → 误以为拿全 → bvid 在列表里却看不见 → 墓碑被误解除。
+     这里 count=61 说明还有 51 个稿件没取到 —— 没取全就整轮只保留。 */
+  const many: Archive[] = Array.from({ length: 61 }, (_, i) => ({
     bvid: `BV1PAGE${String(i).padStart(5, '0')}`,
     title: `第 ${i} 个稿件`,
     ctime: nowSec - 600,
     state: 0,
   }));
-  const i = tombLedger({ title: '列表可能被截断时的切片' });
+  const i = tombLedger({ title: '事故复刻用的切片', bvid: 'BV1PAGE00010' }); // bvid 在第 2 页（降级后看不见）
   const r = await reconcileTombstones({
     ledger: i.ledger,
-    client: mockClient(many, {}),
+    client: mockClient(many, {}, { serverPs: 10, withMeta: true, ignorePage: true }),
     logger: silentLog as never,
     paceMs: 0,
-    detailCap: 3, // 详情调用受限 ⇒ 更不可能扫全
+    detailCap: 3,
   });
   eq('一条都不解除', r.released, 0);
   eq('保留待下次', r.unverified + r.kept, 1);
   eq('台账里墓碑还在', i.ledger.tombstoneCount(), 1);
-  ok('说明里点出列表可能被截断', r.notes.some((n) => n.includes('列表可能被截断')), JSON.stringify(r.notes).slice(0, 200));
+  ok('说明里点出列表未取全', r.notes.some((n) => n.includes('列表未取全') || n.includes('没有新条目')), JSON.stringify(r.notes).slice(0, 300));
+}
+
+/* ========================================================================== */
+section('⑧b 服务端降级页大小但**翻页正常** ⇒ 按 count 取全，第 2 页里的 bvid 能被看见 ⇒ 保留');
+{
+  const many: Archive[] = Array.from({ length: 15 }, (_, i) => ({
+    bvid: `BV1FIX${String(i).padStart(5, '0')}`,
+    title: `第 ${i} 个稿件`,
+    ctime: nowSec - 600,
+    state: 0,
+  }));
+  const i = tombLedger({ title: '降级翻页修复验证', bvid: 'BV1FIX00010' }); // 在第 2 页（ps=10 时 10..14）
+  const r = await reconcileTombstones({
+    ledger: i.ledger,
+    client: mockClient(many, {}, { serverPs: 10, withMeta: true }),
+    logger: silentLog as never,
+    paceMs: 0,
+  });
+  eq('★ 翻页取全后 bvid 被找到 ⇒ 保留', r.kept, 1);
+  eq('没解除', r.released, 0);
+  ok('说明里写明列表已取全', r.notes.some((n) => n.includes('列表已取全')), JSON.stringify(r.notes).slice(0, 300));
 }
 
 /* ========================================================================== */
@@ -350,6 +397,44 @@ section('⑩ 没有墓碑：不做任何请求');
   });
   eq('核对 0 条', r.checked, 0);
   eq('一次接口都没打', calls, 0);
+}
+
+/* ========================================================================== */
+section('⑪ 【2026-10-17 事故回归】列表取全但没有 bvid + 详情报「啥都木有」（弱证据）⇒ 不解除');
+{
+  const k = tombLedger({ title: '弱证据不能放行的切片', bvid: 'BV1WEAK00001' });
+  const r = await reconcileTombstones({
+    ledger: k.ledger,
+    // 列表只有 1 条（< 一页，取全），没有 BV1WEAK00001；详情报「啥都木有」——
+    // 事故里它同时出现在「真删了 / 待审核 / 仅自己可见 / 接口异常」四种情形，不能单独定罪
+    client: mockClient([{ bvid: 'BV1OTHERWEAK', title: '别的稿件', ctime: nowSec - 600, state: 0 }], {
+      BV1OTHERWEAK: { parts: ['无关分P'] },
+      BV1WEAK00001: { error: 'biliLive-tools 内部错误（HTTP 500） —— 啥都木有' },
+    }),
+    logger: silentLog as never,
+    paceMs: 0,
+  });
+  eq('★ 弱证据 ⇒ 保留（证据不足）', r.unverified, 1);
+  eq('没解除', r.released, 0);
+  eq('台账里墓碑还在', k.ledger.tombstoneCount(), 1);
+}
+
+/* ========================================================================== */
+section('⑫ 列表取全但没有 bvid + 详情报「稿件不可见」（强证据）⇒ 解除');
+{
+  const k = tombLedger({ title: '强证据可以放行的切片', bvid: 'BV1STRONG001' });
+  const r = await reconcileTombstones({
+    ledger: k.ledger,
+    client: mockClient([{ bvid: 'BV1OTHERSTR1', title: '别的稿件', ctime: nowSec - 600, state: 0 }], {
+      BV1OTHERSTR1: { parts: ['无关分P'] },
+      BV1STRONG001: { error: '—— 稿件不可见' },
+    }),
+    logger: silentLog as never,
+    paceMs: 0,
+  });
+  eq('★ 强证据 ⇒ 解除', r.released, 1);
+  eq('不是"锁定读不到"那一类', r.inaccessibleReleases, 0);
+  eq('台账里墓碑没了', k.ledger.tombstoneCount(), 0);
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

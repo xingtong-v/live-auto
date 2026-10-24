@@ -29,7 +29,7 @@ async function renderClipLibrary(box) {
   };
   const rows = d.rows || [];
   box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">切片库
-    <span class="ai-tag">共 ${d.total} 条${d.truncated ? ` · 只显示前 ${d.limit} 条` : ''} · 已发布 ${d.counts.published} / 待确认 ${d.counts.submitted} / 候选 ${d.counts.candidate} / 失败 ${d.counts.failed}</span></h2>
+    <span class="ai-tag">共 ${d.total} 条${d.truncated ? ` · 只显示前 ${d.limit} 条` : ''} · 已发布 ${d.counts.published} / 待确认 ${d.counts.submitted} / 候选 ${d.counts.candidate} / 失败 ${d.counts.failed}${d.counts.gone ? ` · 稿件已不存在 ${d.counts.gone}` : ''}</span></h2>
     <p class="hintline">这一页回答：<b>跨场次</b>找一条切片 —— 按标题/状态/评分检索，可试看、可跳到那一场、可导出 CSV。（只看这一场请用「任务」，只看某个稿件请点行内的「看稿件」。）</p>
     <div class="card">
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
@@ -44,13 +44,15 @@ async function renderClipLibrary(box) {
         </select>
         <button class="btn-sm" id="libDir">${clipLib.asc ? '↑ 升序' : '↓ 降序'}</button>
         <button class="btn-sm" id="libExport">导出 CSV</button>
+        <button class="btn-sm" id="libRefresh" title="去 B站 按切片库全部稿件逐个对账：确认「已提交待确认」的切片、核对稿件是否还在、拉取最新播放/点赞。只读 B站，不触发投稿；不受当前筛选影响">🔄 去 B站 对账</button>
         <span class="hintline">${esc(d.note || '')}</span>
       </div>
+      <p class="hintline" id="libFreshNote" style="min-height:18px;margin:0 0 8px"></p>
       ${rows.length ? `<table class="tbl"><thead><tr>
         <th>标题</th><th>场次</th><th>评分</th><th>时长</th><th>状态</th><th>播放</th><th>点赞</th><th>稿件</th><th>操作</th>
       </tr></thead><tbody>
       ${rows.map((r) => `<tr>
-        <td>${esc(r.title)}${r.fixture ? ' <span class="tag-mini">🔧 夹具</span>' : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${r.tombstone ? ' <span class="tag-mini">🪦 墓碑</span>' : ''}</td>
+        <td>${esc(r.title)}${r.fixture ? ' <span class="tag-mini">🔧 夹具</span>' : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${r.tombstone ? ' <span class="tag-mini">🪦 墓碑</span>' : ''}${r.gone ? ' <span class="tag-mini" style="background:#fdecea;color:#c33" title="该稿件在 B站 上已不存在 —— 对账时已自动清除该片的稿件记录并回退为待投（幂等指纹一并清除），可直接重投">稿件已不存在</span>' : ''}</td>
         <td class="mono-sm" title="${esc(r.taskId)}">${esc(String(r.taskWhen).slice(5, 16))} · ${esc(String(r.taskTitle).slice(0, 14))}</td>
         <td class="num">${Number(r.score ?? 0).toFixed(1)}</td>
         <td class="num">${r.durationSec}s</td>
@@ -101,6 +103,49 @@ async function renderClipLibrary(box) {
     URL.revokeObjectURL(a.href);
     toast(`已导出 ${rows.length} 行 CSV`, 4000);
   };
+  /* ★ 2026-10-17 用户要求：「切片库 增加一个刷新按钮 刷新时去B站 按当前的切片库的稿件去对账 然后刷新状态」。
+     口径与后端 reconcileClipLibrary 一一对应：① 确认「已提交待确认」的切片（SUBMITTED → PUBLISHED）；
+     ② 按切片库全部 bvid 逐个核对稿件还在不在（gone 只认强证据 + 稿件列表取全后的比对）；
+     ③ 拉最新播放/点赞。全部只读 B站，不触发投稿。
+     结果必须写在页面上（2026-10-14 的教训：只在 toast 里闪一下，用户以为"什么都没发生"）。 */
+  const libNote = (msg, kind) => {
+    const el = box.querySelector('#libFreshNote');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.color = kind === 'bad' ? '#c33' : kind === 'ok' ? '#2a7' : '';
+  };
+  const libSummary = (r) => {
+    const parts = [`核对 ${r.checked} 个稿件`];
+    if (r.confirmed) parts.push(`新确认落地 ${r.confirmed} 个切片`);
+    parts.push(`更新统计 ${r.statsUpdated} 个稿件`);
+    if (r.gone && r.gone.length) parts.push(`${r.gone.length} 个稿件已不在 B站`);
+    if (r.cleared) parts.push(`已清除回退待投 ${r.cleared} 个切片（可重投）`);
+    if (r.unavailable && r.unavailable.length) parts.push(`${r.unavailable.length} 个稿件锁定/审核中、统计取不到`);
+    if (r.failed && r.failed.length) parts.push(`${r.failed.length} 个没查清`);
+    return parts.join(' · ');
+  };
+  const libDoRefresh = async () => {
+    const btn = box.querySelector('#libRefresh');
+    if (btn) btn.disabled = true;
+    libNote('正在去 B站 对账（按稿件逐个查，稿件多时要点时间）…');
+    try {
+      const r = await api('/api/clips/library/refresh', { method: 'POST', body: {} });
+      const at = new Date().toLocaleTimeString('zh-CN');
+      const kind = r.failed && r.failed.length ? 'bad' : 'ok';
+      libNote(`对账完成（${at}）：${libSummary(r)}`, kind);
+      toast(`对账完成：${libSummary(r)}`, 5000);
+      await renderClipLibrary(box);
+      /* 重画会把提示行连内容一起清掉，按同样口径补写回去（与稿件表现页 perfDoRefresh 同一套做法） */
+      libNote(`对账完成（${at}）：${libSummary(r)}`, kind);
+    } catch (e) {
+      libNote('对账失败：' + e.message, 'bad');
+      toast('对账失败：' + e.message, 6000);
+    }
+    const b = document.getElementById('libRefresh');
+    if (b) b.disabled = false;
+  };
+  const rf = box.querySelector('#libRefresh');
+  if (rf) rf.onclick = () => libDoRefresh();
   box.querySelectorAll('[data-lib-preview]').forEach((b) => (b.onclick = async () => {
     const [taskId, index] = String(b.dataset.libPreview).split('|');
     b.disabled = true;
@@ -177,6 +222,10 @@ const clipLib = { q: '', status: '', sort: 'score', asc: false, limit: 200 };
 let perfLastRefresh = null;
 /* 「稿件已不存在」的行默认不显示；用户想核对时可以展开（见 renderPerf 里的说明） */
 let perfShowGone = false;
+/* ★ 2026-10-17 用户要求：稿件表默认只显示 20 条，多余的折叠 —— 39 行的表要滚很久，
+   按当前排序的前 20 条才是最想看的。模块级变量：点开「展开」后同页切排序/刷新不收回，
+   整页刷新回到默认 20（与 perfShowGone 同一套页面内状态模式）。 */
+let perfShowAll = false;
 /* ★ 2026-10-08 用户要求：「这里的排序 可以改成可选的吗 比如稿件时间 播放 点赞 等」。
    字段与方向都记进 localStorage，刷新后保持（取不到就当默认"播放降序"，绝不因为存储异常而白屏）。 */
 const PERF_SORTS = [
@@ -263,7 +312,17 @@ async function renderPerf(box) {
   const live = p.rows.filter((r) => !r.gone);
   const goneRows = p.rows.filter((r) => r.gone);
   const shown = sortPerfRows(perfShowGone ? p.rows : live);
-  const livePartTotal = live.reduce((a, r) => a + (Number(r.partCount) || 1), 0);
+  /* 表格默认只渲染前 20 条（用户 2026-10-17 要求），其余折叠成一键展开 */
+  const PERF_PAGE = 20;
+  /* ★ 2026-10-24（用户报「为什么只能获取 2 个」）：头部计数改用**接口给的全量口径**
+     （liveTotal / livePartTotal），不再对"前端拿到的行"求和。
+     为什么：接口旧实现按播放截断 100 条，而这里一求和，271 个在库稿件就被显示成 100 个
+     —— 计数与真实稿件库不一致，用户看到的就是自相矛盾。
+     服务端没给这两个字段（老版本）时退回本地求和，行为不会崩。 */
+  const liveTotal = Number.isFinite(Number(p.liveTotal)) ? Number(p.liveTotal) : live.length;
+  const livePartTotal = Number.isFinite(Number(p.livePartTotal))
+    ? Number(p.livePartTotal)
+    : live.reduce((a, r) => a + (Number(r.partCount) || 1), 0);
   box.innerHTML = `<h2 style="font-size:16px;margin:0 0 14px">稿件表现统计（近 30 天）</h2>
     <p class="hintline">这一页回答：<b>长期资产</b>表现如何 —— 每个稿件的播放/点赞/评分、评分档与播放的相关性，以及月度成本（ASR 估算 + LLM 实际）。数据来自周期性回流。</p>
     <div class="card"><h2>LLM 评分 vs 实际播放（相关性，非因果）</h2>      ${corrTotal ? `<table class="tbl"><thead><tr><th>评分档</th><th>稿件数</th><th>平均播放</th></tr></thead><tbody>
@@ -271,23 +330,32 @@ async function renderPerf(box) {
       </tbody></table>` : `<div class="empty">这一档还统计不了：需要「既有 LLM 评分、又拉到了播放数据」的稿件。
         ${Number(p.pulledTotal || 0) > 0 ? `现在有 ${p.pulledTotal} 个稿件有播放数据，但它们的分P 任务是早期投的（评分没有落进表现数据）；新投的稿件会自动带上评分。` : '先让一场直播跑完投稿，再回来刷新。'}</div>`}
       <p class="hintline">${esc(p.note)}</p></div>
-    <div class="card"><h2>已发布稿件表现（按${perfSortLabel()}${perfSortAsc ? '升序' : '降序'}）<span class="ai-tag">${live.length} 个在库稿件 · ${livePartTotal} 个分P · 已拉到数据 ${p.pulledTotal ?? 0} 个${goneRows.length ? ` · ${perfShowGone ? `含 ${goneRows.length} 个已删除` : `已隐藏 ${goneRows.length} 个已删除`}` : ''}</span>
-      <span style="margin-left:auto;font-weight:400;font-size:12.5px;color:var(--text-2);display:inline-flex;align-items:center;gap:6px">排序
+    <div class="card"><h2>已发布稿件表现（按${perfSortLabel()}${perfSortAsc ? '升序' : '降序'}）<span class="ai-tag">${liveTotal} 个在库稿件 · ${livePartTotal} 个分P · 已拉到数据 ${p.pulledTotal ?? 0} 个${goneRows.length ? ` · ${perfShowGone ? `含 ${goneRows.length} 个已删除` : `已隐藏 ${goneRows.length} 个已删除`}` : ''}${p.truncated ? ` · 仅显示最新 ${p.rows.length} 个（共 ${liveTotal} 个，按发布时间保留）` : ''}</span>
+      <span style="margin-left:auto;font-weight:400;font-size:var(--fs-s);color:var(--text-2);display:inline-flex;align-items:center;gap:6px">排序
         <button class="btn-sm" id="perfRefreshNow" title="在页面上重查一遍（不动 B站，看的是已落库的最新数据）">🔄 刷新</button>
         <button class="btn-sm" id="perfForceRefresh" title="去 B站 强制拉一次最新统计（忽略每日一次的限制）">⬇️ 强制重拉</button>
-        <select id="perfSortKey" class="inp" style="width:auto;padding:3px 8px;font-size:12.5px">
+        <select id="perfSortKey" class="inp" style="width:auto;padding:3px 8px;font-size:var(--fs-s)">
           ${PERF_SORTS.map((s) => `<option value="${s.key}"${s.key === perfSort ? ' selected' : ''}>${esc(s.label)}</option>`).join('')}
         </select>
         <button class="btn-sm" id="perfSortDir" title="切换升序/降序">${perfSortAsc ? '↑ 升序' : '↓ 降序'}</button>
       </span></h2>
       <p class="hintline" id="perfFreshNote" style="min-height:18px"></p>
-      ${shown.length ? `<table class="tbl"><thead><tr><th>标题</th><th>评分</th><th>播放</th><th>点赞</th><th>投币</th><th>收藏</th><th>弹幕</th><th title="这个稿件最近一次投出切片的时间（同稿件多分P 取最近）">发布时间</th><th>数据日期</th></tr></thead><tbody>
-      ${shown.map((r) => `<tr><td><a href="${esc(r.url)}" target="_blank" rel="noreferrer">${esc(r.title)}</a>${r.gone ? ' <span class="tag-mini">稿件已不存在</span>' : ''}${r.unavailable ? ` <span class="tag-mini">${esc(r.unavailable)}</span>` : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${Number(r.partCount) > 1 ? ` <span class="ai-tag">同一稿件 ${r.partCount} 个分P</span>` : ''}</td>
+      ${shown.length ? `<table class="tbl"><thead><tr><th>标题</th><th>评分</th><th>播放</th><th>点赞</th><th>投币</th><th>收藏</th><th>弹幕</th><th title="这个稿件最近一次投出切片的时间（同稿件多分P 取最近）">发布时间</th><th title="这一行统计数对应的日期（每天回流一次）">数据日期</th></tr></thead><tbody>
+      ${/* ★ 2026-10-16（UI 评审 IA-6）：同一列的重复值不再逐行复读。
+            这一列 10 行有 10 行都是同一天 —— 它是"截止到"时间，属于表头信息。
+            现在只在**值发生变化**时显示，其余留空（悬停仍能看到）。
+            列本身保留是因为排序下拉（PERF_SORTS）里有"数据日期"这一项。 */ ''
+      }${(() => { let prevStat = null; const rowsToShow = perfShowAll ? shown : shown.slice(0, PERF_PAGE); return rowsToShow.map((r) => {
+        const stat = r.statDate || (r.gone ? '已删除' : r.unavailable ? '取不到' : '未拉取');
+        const same = stat === prevStat; prevStat = stat;
+        return `<tr><td><a href="${esc(r.url)}" target="_blank" rel="noreferrer">${esc(r.title)}</a>${r.gone ? ' <span class="tag-mini">稿件已不存在</span>' : ''}${r.unavailable ? ` <span class="tag-mini">${esc(r.unavailable)}</span>` : ''}${r.degraded ? ' <span class="tag-mini">降级</span>' : ''}${Number(r.partCount) > 1 ? ` <span class="ai-tag">同一稿件 ${r.partCount} 个分P</span>` : ''}</td>
         <td class="num">${r.llmScore === undefined ? '—' : Number(r.llmScore).toFixed(1)}</td><td class="num">${r.view ?? '—'}</td><td class="num">${r.like ?? '—'}</td>
         <td class="num">${r.coin ?? '—'}</td><td class="num">${r.favorite ?? '—'}</td><td class="num">${r.danmaku ?? '—'}</td>
         <td class="mono-sm">${esc(r.publishedAt || '—')}</td>
-        <td class="mono-sm">${esc(r.statDate || (r.gone ? '已删除' : r.unavailable ? '取不到' : '未拉取'))}</td></tr>`).join('')}
+        <td class="mono-sm">${same ? `<span class="rep-same" title="${esc(stat)}">〃</span>` : esc(stat)}</td></tr>`;
+      }).join(''); })()}
       </tbody></table>
+      ${shown.length > PERF_PAGE ? `<p class="hintline" style="margin-top:8px">已显示前 ${PERF_PAGE} / ${shown.length} 条（按当前排序）：<button class="linkbtn" id="perfShowAllToggle">${perfShowAll ? '收起，只看前 ' + PERF_PAGE + ' 条' : '展开其余 ' + (shown.length - PERF_PAGE) + ' 条'}</button></p>` : ''}
       <p class="hintline">多分P 模式下同一稿件的各分P 共享稿件总播放，所以按稿件（bvid）列一行；「同一稿件 N 个分P」标出它的规模。播放数为 0 以前是「接口没取到」，现在只有真取到才写数字，取不到会标出原因。</p>` : `<div class="empty">还没有可统计的稿件。${goneRows.length && !live.length
         ? `现存的稿件一个都没有 —— 已隐藏 ${goneRows.length} 个在 B站 上已不存在的（点下面的「显示它们」可核对）。`
         : Number(p.archiveTotal || 0) > 0
@@ -309,6 +377,8 @@ async function renderPerf(box) {
      排序改完**整页重画**：只是重新排一遍，API 数据没变（多一次本地 GET，可忽略）。 */
   const goneToggle = box.querySelector('#perfGoneToggle');
   if (goneToggle) goneToggle.addEventListener('click', () => { perfShowGone = !perfShowGone; renderPerf(box); });
+  const showAllToggle = box.querySelector('#perfShowAllToggle');
+  if (showAllToggle) showAllToggle.addEventListener('click', () => { perfShowAll = !perfShowAll; renderPerf(box); });
   /* ★ 2026-10-14：这一页自己的刷新入口 + **结果反馈**。
      用户实测反馈"刷新不及时"：其实刷新按钮原来只在健康面板上，而且候选为空时接口只回一句 notes、
      界面不显示 ⇒ 点了像没反应。现在：按钮在本页、结果写在这行提示里（含"今天已拉过"这种正常情况）。 */

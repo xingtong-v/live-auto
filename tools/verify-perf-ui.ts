@@ -211,13 +211,17 @@ async function main(): Promise<void> {
     ok('渲染出了「已发布稿件表现」卡片（不是停在加载中）', html.includes('已发布稿件表现'), html.slice(0, 160));
     ok('★ 页面没有白屏：相关性与列表两张卡都在', html.includes('LLM 评分 vs 实际播放') && html.includes('稿件数'), html.slice(0, 200));
 
-    /* 行数：接口给的「在库」稿件都要渲染出来；「稿件已不存在」的行默认不显示（用户 2026-10-07 的要求） */
+    /* 行数：接口给的「在库」稿件都要渲染出来；「稿件已不存在」的行默认不显示（用户 2026-10-07 的要求）。
+       ★ 2026-10-24：这里原来写 `Math.min(liveRows.length, 100)` —— 那个 100 是**服务端旧实现**
+       按播放截断的上限（已废弃，见 server.ts performanceView 的说明）。截断去掉后接口返回全量，
+       页面自己只渲染前 PERF_PAGE=20 条（2026-10-17 用户要求折叠），期望值按这个口径算。 */
+    const PERF_PAGE = 20;
     const liveRows = rows.filter((r) => r['gone'] !== true);
     const goneRows = rows.filter((r) => r['gone'] === true);
     const trCount = await cdp.evalJs<number>(
       `(() => { const card = [...document.querySelectorAll('#otherPage .card')].find((c) => String(c.innerHTML).includes('已发布稿件表现')); if (!card) return -1; return card.querySelectorAll('tbody tr').length; })()`,
     );
-    eq('★ 渲染的行数 = 接口给的「在库」稿件数（已删除的默认不显示）', trCount, Math.min(liveRows.length, 100));
+    eq('★ 渲染的行数 = min(接口「在库」稿件数, 折叠前 20 条)', trCount, Math.min(liveRows.length, PERF_PAGE));
 
     /* 逐个抽查：有播放数据的行必须显示出数字，且标题与接口一致 */
     for (const r of withView.slice(0, 3)) {

@@ -45,6 +45,7 @@ const KEY_EVENT_MAP: Record<string, string> = {
   'analysis-done': 'analysisDone',
   'publish-success': 'publishSuccess',
   'publish-failed': 'failure',
+  'publish-quota-limited': 'failure',
   'task-failed': 'failure',
   'account-expiring': 'accountExpiring',
   'account-expired': 'accountExpiring',
@@ -568,6 +569,46 @@ export class Alerter {
    * 场次结束的复盘摘要（P1-5）：短版正文由 src/recap.ts 的 recapPushText 生成。
    * 刻意用 info 级别 + 每天一场一个 key：复盘是"知会"，不是"告警"，不该触发 error 通道的紧张感。
    */
+  /**
+   * 「账号级投稿配额被打满」—— 2026-10-21 线上事故。
+   *
+   * 与 {@link publishFailed} 的区别：这不是"这一片坏了"，而是**账号今天投不动了**。
+   * 报成 error 会让用户去查代码/重投；报成 warn + 明确的重试时间点，用户只需要等。
+   * 消息里必须带三样东西：本批已投成功几个、什么时候被限的、建议什么时候重试。
+   */
+  async publishQuotaLimited(info: {
+    taskId: string;
+    title: string;
+    /** 本批**已经投成功**的切片数 */
+    submitted: number;
+    /** 本轮还剩几片没投（被跳过、留在待投） */
+    remaining: number;
+    /** 建议多少分钟后重试 */
+    retryAfterMin: number;
+    /** B站 的原话（便于人工判断是不是配额问题） */
+    reason: string;
+  }): Promise<void> {
+    await this.fire({
+      level: 'warn',
+      key: `publish-quota-limited:${info.taskId}`,
+      title: `投稿配额限流，本轮已暂停：${info.title}`,
+      body:
+        `B站 回了「${truncate(info.reason, 200).text}」—— 这是**账号级投稿配额**被限，` +
+        `不是这一片的问题，等 ${info.retryAfterMin} 分钟再投即可。\n` +
+        `本批已投成功 ${info.submitted} 片；剩余 ${info.remaining} 片**已跳过并留在「待投」**（切片产物已保留，不会重切）。\n` +
+        `处理方式：等到建议时间后在任务上点「重跑投稿阶段」，或对每一片点「投稿这一片」重投。\n` +
+        `（同一片不要连点：配额没恢复时每撞一次都只是白挨一次拒绝。）`,
+      taskId: info.taskId,
+      at: nowIso(),
+      fields: {
+        本批已投成功: `${info.submitted} 片`,
+        剩余待投: `${info.remaining} 片`,
+        建议重试: `${info.retryAfterMin} 分钟后`,
+        原始错误: truncate(info.reason, 200).text,
+      },
+    });
+  }
+
   async taskRecap(info: { taskId: string; title: string; text: string }): Promise<void> {
     await this.fire({
       level: 'info',

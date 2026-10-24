@@ -15,6 +15,8 @@
   本脚本的规则（就三条）：
     1. 端口在监听 ⇒ 服务在跑 ⇒ **什么都不做**（哪怕探活超时，也不再起第二个）；
     2. 端口空闲 ⇒ 以**隐藏窗口、独立进程**启动服务，等它就绪，然后退出；
+       2026-10-24 起启动的是**热更新监督进程** `src\hot-watch.ts`（由它再拉起 `src\cli.ts run`），
+       这样"计划任务拉起的服务"和"启动器拉起的服务"都带热更新，行为一致；
     3. **绝不杀任何进程**（全脚本没有 Stop-Process / taskkill）。
   只有真的启动了服务才写一行日志到 data\logs\watchdog.log ——
   平时 10 分钟一次静默通过，日志不会被"检查了一次"刷屏。
@@ -118,16 +120,20 @@ if (-not $nodeExe) {
 $outLog = Join-Path $logDir 'service-console.log'
 $errLog = Join-Path $logDir 'service-error.log'
 
-Write-WdLog ("服务不在运行（端口 $Port 空闲）—— 以隐藏窗口启动：" + $nodeExe + " --max-old-space-size=8192 --report-on-fatalerror src\cli.ts run --port " + $Port)
+Write-WdLog ("服务不在运行（端口 $Port 空闲）—— 以隐藏窗口启动热更新监督进程：" + $nodeExe + " --max-old-space-size=8192 --report-on-fatalerror src\hot-watch.ts --port " + $Port)
 try {
   <#
-    启动参数里的三件事：
+    启动参数里的四件事：
       · --max-old-space-size=8192：给内存尖峰留余量。2026-10-07 01:17:03 服务因为
         `JavaScript heap out of memory` **整个进程 abort**（默认堆上限约 4GB，而机器有 32GB 内存没用上）。
         这不是修复，是别让一次尖峰把服务打死；
       · --report-on-fatalerror：真崩了会在 data\logs 留一份诊断报告（含堆构成、原生栈、环境），
         下次不用再靠猜（这次就是因为没有任何报告，只能从 stderr 的一行 FATAL 反推）；
-      · --report-directory：报告落到日志目录，跟其它日志一起轮转。
+      · --report-directory：报告落到日志目录，跟其它日志一起轮转；
+      · **入口是 src\hot-watch.ts 而不是 src\cli.ts**（2026-10-24）：计划任务/开机自启这条
+        启动路径也必须带热更新，否则"从计划任务起来的服务"和"从启动器起来的服务"行为不一样，
+        用户会遇到"有时改代码会自动生效、有时不会"这种最难查的差异。
+        监督进程自己会拉起 `src\cli.ts run --port <n>`，端口语义不变。
     注意：这里按"路径不含空格"直接拼参数；项目若被搬到含空格的目录，需要给这些参数加引号。
   #>
   $proc = Start-Process -FilePath $nodeExe `
@@ -135,7 +141,7 @@ try {
       '--max-old-space-size=8192',
       '--report-on-fatalerror',
       "--report-directory=$logDir",
-      'src\cli.ts', 'run', '--port', "$Port"
+      'src\hot-watch.ts', '--port', "$Port"
     ) `
     -WorkingDirectory $root `
     -WindowStyle Hidden `

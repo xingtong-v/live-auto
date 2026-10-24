@@ -89,7 +89,18 @@ function makePub(tmpRoot: string, multiPart: boolean, concurrency: number, clips
     JSON.stringify(
       {
         ...realCfg,
-        publish: { ...(realCfg['publish'] as object), multiPart, minSubmitIntervalSec: 0, dailyLimit: 0, autoRetryOnce: false },
+        publish: {
+          ...(realCfg['publish'] as object),
+          multiPart,
+          /* ★ 两个键必须**一起**写（界面保存时就是这么写的）：
+             只改 multiPart、却把线上配置里的 clipPublishMode 一起带进来，配置就自相矛盾了 ——
+             服务端按 clipPublishMode 走（2026-10-16 加了「切片投稿方式」开关之后），
+             本用例就会在"单P 模式"里拿到多分P 的并发数。 */
+          clipPublishMode: multiPart ? 'append' : 'standalone',
+          minSubmitIntervalSec: 0,
+          dailyLimit: 0,
+          autoRetryOnce: false,
+        },
         clip: { ...(realCfg['clip'] as object), concurrency },
       },
       null,

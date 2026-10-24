@@ -4,10 +4,43 @@
 const BOOT = window.__BOOT__ || { csrf: '', version: '?', roomId: '', platform: '' };
 
 /** UI 构建标记：在浏览器控制台里能看到，用来确认页面是不是最新的（避免缓存导致以为功能没做） */
-const UI_BUILD = 'ui-2026-10-13-llmdtype-switch';
+const UI_BUILD = 'ui-2026-10-16-standalone-5min';
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/**
+ * 配置里的「切片投稿方式」：`'append'`（追加切片投稿）/ `'standalone'`（单独投稿）。
+ *
+ * 与服务端 `resolveClipPublishMode()` **同一套口径**：显式值优先，没设时按 `multiPart` 反推。
+ * 前端只有"显示"需要判定（排期面板的提示、本场详情），绝不能凭 `multiPart` 单独猜 ——
+ * 手改 config.json 时两者可能不一致，那样界面会显示成另一个模式（用户按界面理解就错了）。
+ */
+function clipModeOf(publish) {
+  const p = publish || {};
+  if (p.clipPublishMode === 'standalone') return 'standalone';
+  if (p.clipPublishMode === 'append') return 'append';
+  return p.multiPart === true ? 'append' : 'standalone';
+}
+
+/**
+ * 当前**实际生效**的切片排期口径（服务端算好随 bootstrap 下发）。
+ *
+ * 为什么不在这里重算：规则是「单独投稿 ⇒ 固定定时投稿 + 设置里的相邻切片间隔 / 随机抖动
+ * （间隔 300 秒保底、抖动必须小于间隔）」（服务端 `resolveClipPublishSchedule()`）。
+ * 界面上「错峰 X」出现在本场详情、右栏排期、设置弹窗、排期预览四处 —— 若各自读
+ * `config.publish.clipGapSec`，界面就会写着一个值、实际排另一个值（用户填 100 被抬到 300、
+ * 填 900 被压到 470 时尤其明显）。同一口径两端各写一份，本仓库踩过。
+ *
+ * 兜底：bootstrap 里没有这个字段（旧服务端）时按 config 值显示。
+ */
+function publishSchedule() {
+  const b = (state.bootstrap || {});
+  const s = b.publishSchedule;
+  if (s && Number(s.gapSec) > 0) return { ...s, gapSec: Number(s.gapSec), scheduled: s.scheduled !== false, ignored: s.ignored || '' };
+  const pub = (b.config && b.config.publish) || {};
+  return { mode: clipModeOf(pub), gapSec: Number(pub.clipGapSec) || 300, scheduled: pub.immediatePublish !== true, ignored: '' };
+}
 
 const state = {
   view: 'tasks',
@@ -110,6 +143,15 @@ window.toast = toast;
 
 const toSec = (s) => { const p = String(s).split(':').map(Number); return p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p[0] * 60 + p[1]; };
 const toTime = (n) => { n = Math.max(0, Math.round(Number(n) || 0)); return [Math.floor(n / 3600), Math.floor(n % 3600 / 60), n % 60].map((x) => String(x).padStart(2, '0')).join(':'); };
+/* ★ 2026-10-16（UI 评审 3.4）：入点 / 时长这类**相对时长**用 mm:ss 表达，不足 1 小时不补小时位。
+   为什么单独加一个：原来排期那行写成「00:00:58 · 432 秒」，两个数字一个是 hh:mm:ss、
+   一个是裸秒数，紧挨着读极易混淆。统一成「入点 00:58 · 时长 07:12」后一眼能分清。 */
+const toMS = (n) => {
+  n = Math.max(0, Math.round(Number(n) || 0));
+  const h = Math.floor(n / 3600), m = Math.floor((n % 3600) / 60), s = n % 60;
+  const mm = String(m).padStart(2, '0'), ss = String(s).padStart(2, '0');
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+};
 const fmtGB = (b) => { if (!b) return '0 B'; const u = ['B', 'KB', 'MB', 'GB', 'TB']; const i = Math.min(4, Math.floor(Math.log(b) / Math.log(1024))); return (b / 1024 ** i).toFixed(i === 0 ? 0 : 1) + ' ' + u[i]; };
 
 /** 极简 Markdown 渲染（够用即可：标题、列表、粗体、行内代码、引用、段落） */

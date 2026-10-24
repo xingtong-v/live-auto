@@ -8,67 +8,91 @@
     <div class="logo">切</div>
     <h1>直播切片助手</h1>
     <span class="sub" id="brandSub"><span class="live-dot" id="healthDot"></span><span id="brandText">加载中…</span></span>
+    <!-- ★ 2026-10-25（用户要求）：构建徽章。
+         痛点：修复落了盘、测试也绿，但进程没重启 ⇒ 界面还是旧行为，只能靠翻进程启动时间猜。
+         这里显示**正在运行的代码指纹**；磁盘代码更新后会自动转红提示"需重启"。 -->
+    <span class="build-tag" id="buildTag" title="构建指纹：用来判断修复有没有重启生效">v—</span>
   </div>
   <div class="top-right">
-    <div class="mode">
+    <div class="mode" id="modeBox">
       <span id="modeText">半自动 · 需确认后发布</span>
-      <button class="switch" id="modeSwitch" title="切换全自动 / 半自动"></button>
+      <button class="switch" id="modeSwitch" role="switch" aria-checked="false" aria-label="全自动发布（免确认）" title="切换全自动 / 半自动。开启后切片不再等你确认，直接按排期发布。"></button>
     </div>
     <div class="mode" id="subMode" title="切片是否把转写烧成字幕。字幕准不准取决于转写引擎：本地 Fun-ASR 有字级时间戳（实测偏差 ±0.2 秒）；云端 ASR 的句级时间窗不可靠（实测 15 个字的句子占了 0→30.9 秒），烧出来会与声音错位。">
       <span id="subText">字幕：加载中…</span>
-      <button class="switch" id="subSwitch" title="开启 / 关闭字幕烧录（下一次切片生效）"></button>
+      <button class="switch" id="subSwitch" role="switch" aria-checked="false" aria-label="烧录字幕" title="开启 / 关闭字幕烧录（下一次切片生效）"></button>
     </div>
     <button class="ghost" id="btnRepairStuck" title="进程被强杀后任务会停在「切片中」这类状态，点这里修回可操作状态">修复卡住</button>
     <button class="ghost" id="btnCheckNow">立即检查</button>
     <button class="ghost" id="btnImport">导入录播</button>
+    <!-- ★ 2026-10-16：主题切换。深夜看直播切片的多，深色比浅色省眼。
+         选择存在 localStorage（键 liveauto.theme），并且**在页面脚本执行前**就已经
+         按它设好 data-theme —— 见 00-shell-head.html 里的那行内联脚本，
+         否则每次刷新都会先闪一下白底。 -->
+    <button class="ghost icon-btn" id="btnTheme" aria-pressed="false" title="切换深色 / 浅色主题">
+      <span id="themeIcon" aria-hidden="true">◐</span><span id="themeText">深色</span>
+    </button>
+    <!-- ★ 2026-10-16（UI 评审 L-3）：只在窄屏（<1320px）出现 —— 那时排期栏收成了右侧抽屉 -->
+    <button class="ghost only-narrow" id="btnSchedule" aria-expanded="false" aria-controls="colRight" title="展开 / 收起发布排期栏">排期</button>
     <button class="ghost" id="btnSetting">设置</button>
   </div>
 </div>
 
-<div class="tabs" id="tabs">
+<div class="tabs" id="tabs" role="tablist" aria-label="主视图切换">
   <!-- P1-7（2026-10-13）：页签**分组**（分隔线 + 悬停说明）+ 每个页签一句"什么时候来这儿"。
        为什么用 title 而不是加一行说明文字：不动布局、不占高度，且鼠标一停就能看到。
-       三个分组：干活（任务/实时监控）｜运维（健康面板/待删回收站）｜资产（稿件表现/切片库/Prompt）。 -->
-  <button class="tab on" data-view="tasks" title="日常入口：看场次列表、审核切片、改标题、发布">任务</button>
-  <button class="tab" data-view="monitor" title="正在跑什么、在等什么、为什么没动（默认 5 秒自动刷新）">实时监控</button>
-  <button class="tab" data-view="observe" title="边录边转的进度、压制/上传队列与 ETA、我们进程的显存与内存（默认 5 秒自动刷新）">运行观测</button>
-  <span class="tabsep" style="width:1px;height:16px;background:var(--border);margin:0 8px;display:inline-block;vertical-align:middle"></span>
-  <button class="tab" data-view="health" title="现在有没有需要你处理的事（待办）/ 错误 / 磁盘 / 自检">健康面板</button>
+       三个分组：干活（任务/实时监控）｜运维（健康面板/待删回收站）｜资产（稿件表现/切片库/Prompt）。
+
+       ★ 2026-10-16（UI 评审 A-1）：补 role=tablist / role=tab / aria-selected / aria-controls。
+       为什么：这 9 个页签是全站最主要的导航，之前读屏念出来只是 9 个"按钮"，
+       既不知道这是一组互斥选项，也不知道当前在哪一个。aria-selected 由 switchView() 同步。 -->
+  <button class="tab on" data-view="tasks" role="tab" aria-selected="true" aria-controls="viewTasks" title="日常入口：看场次列表、审核切片、改标题、发布">任务</button>
+  <button class="tab" data-view="monitor" role="tab" aria-selected="false" aria-controls="viewOther" title="正在跑什么、在等什么、为什么没动（默认 5 秒自动刷新）">实时监控</button>
+  <button class="tab" data-view="observe" role="tab" aria-selected="false" aria-controls="viewOther" title="边录边转的进度、压制/上传队列与 ETA、我们进程的显存与内存（默认 5 秒自动刷新）">运行观测</button>
+  <span class="tabsep" aria-hidden="true" style="width:1px;height:16px;background:var(--border);margin:0 8px;display:inline-block;vertical-align:middle"></span>
+  <button class="tab" data-view="health" role="tab" aria-selected="false" aria-controls="viewOther" title="现在有没有需要你处理的事（待办）/ 错误 / 磁盘 / 自检">健康面板</button>
   <!-- 「跑完自动关机」独立页签（2026-10-14 用户：「独立页面放在健康界面后面」）：
        里面是 iframe 加载 /api/shutdown/page —— 它有自己的文档与刷新节奏，
        运行观测那页每 5 秒整块重渲染**影响不到它**（这就是不抖的原因）。 -->
-  <button class="tab" data-view="autoshutdown" title="跑完自动关机：开关、允许时段、冷静期倒计时与取消（独立页面，不受其它页刷新影响）">自动关机</button>
+  <button class="tab" data-view="autoshutdown" role="tab" aria-selected="false" aria-controls="viewOther" title="跑完自动关机：开关、允许时段、冷静期倒计时与取消（独立页面，不受其它页刷新影响）">自动关机</button>
   <!-- ★ 2026-10-11 用户要求：「将这两个（查看回收站 / 查看待删清单）放到成本的位置，然后将成本放到稿件表现里」；
        随后又要求「待删清单和回收站放一起」—— 两者本来就是同一条生命周期上的两段（待删 → 已删可恢复），
        合并成一页两段，顺带去掉重复了两遍的"最近已删除"列表。 -->
-  <button class="tab" data-view="trash" title="用完即删的宽限期内可反悔 / 已删除的可恢复（按天折叠）">待删 / 回收站<span id="pendingTabBadge"></span></button>
-  <span class="tabsep" style="width:1px;height:16px;background:var(--border);margin:0 8px;display:inline-block;vertical-align:middle"></span>
-  <button class="tab" data-view="perf" title="长期资产视角：已发布稿件的播放/点赞/评分，以及月度成本">稿件表现</button>
-  <button class="tab" data-view="clips" title="跨场次找切片：按标题/状态/评分检索，可试看、可跳到那一场">切片库</button>
-  <button class="tab" data-view="prompts" title="选片与标题的提示词（改这里会影响后续场次的挑选质量）">Prompt</button>
+  <button class="tab" data-view="trash" role="tab" aria-selected="false" aria-controls="viewOther" title="用完即删的宽限期内可反悔 / 已删除的可恢复（按天折叠）">待删 / 回收站<span id="pendingTabBadge"></span></button>
+  <span class="tabsep" aria-hidden="true" style="width:1px;height:16px;background:var(--border);margin:0 8px;display:inline-block;vertical-align:middle"></span>
+  <button class="tab" data-view="perf" role="tab" aria-selected="false" aria-controls="viewOther" title="长期资产视角：已发布稿件的播放/点赞/评分，以及月度成本">稿件表现</button>
+  <button class="tab" data-view="clips" role="tab" aria-selected="false" aria-controls="viewOther" title="跨场次找切片：按标题/状态/评分检索，可试看、可跳到那一场">切片库</button>
+  <button class="tab" data-view="prompts" role="tab" aria-selected="false" aria-controls="viewOther" title="选片与标题的提示词（改这里会影响后续场次的挑选质量）">Prompt</button>
 </div>
 
 <div id="viewTasks">
   <div class="app">
-    <aside class="col col-left">
+    <aside class="col col-left" aria-label="场次列表">
       <div class="searchbar">
-        <input id="searchInput" placeholder="搜索标题 / 日期 / 任务 ID">
-        <div class="filters" id="statusFilters">
-          <button data-status="" class="on">全部</button>
-          <button data-status="processing">处理中</button>
-          <button data-status="review">待审核</button>
-          <button data-status="published">已发布</button>
-          <button data-status="failed">失败</button>
+        <input id="searchInput" placeholder="搜索标题 / 日期 / 任务 ID" aria-label="搜索场次">
+        <div class="filters" id="statusFilters" role="group" aria-label="按状态筛选">
+          <button data-status="" class="on" aria-pressed="true">全部</button>
+          <button data-status="processing" aria-pressed="false">处理中</button>
+          <button data-status="review" aria-pressed="false">待审核</button>
+          <button data-status="published" aria-pressed="false">已发布</button>
+          <button data-status="failed" aria-pressed="false">失败</button>
         </div>
-        <button class="ghost" id="btnMulti" title="多选：批量删除任务（一次清理一批已发布的场次）">多选</button>
+        <button class="ghost" id="btnMulti" aria-pressed="false" title="多选：批量删除任务（一次清理一批已发布的场次）">多选</button>
       </div>
       <!-- 测试夹具开关（默认隐藏；由 renderTaskList 按实际条数填充，没有夹具时这里是空的） -->
       <div id="fixtureToggleBar" style="padding:0 12px 6px"></div>
       <div id="multiBar" style="display:none"></div>
-      <div id="taskList"></div>
+      <div id="taskList" role="list"></div>
     </aside>
-    <main class="col col-mid"><div id="detail"><div class="empty">正在加载…</div></div></main>
-    <aside class="col col-right">
+    <main class="col col-mid" aria-label="本场详情">
+      <div id="detail"><div class="empty">正在加载…</div></div>
+      <!-- ★ 2026-10-16（用户实拍）：底部操作栏的停靠位。renderDetail 会把
+           .actionbar 从 #detail 里搬到这里 —— 它不再随内容滚动，因此永远不会盖住内容。 -->
+      <div id="detailFoot" class="detail-foot"></div>
+    </main>
+    <!-- ★ 2026-10-16（UI 评审 L-3）：宽度 <1320px 时排期栏收成右侧抽屉，
+         由顶栏的「排期」按钮（#btnSchedule）开关。之前三栏写死、小屏上中栏被挤到 700px。 -->
+    <aside class="col col-right" id="colRight" aria-label="发布排期">
       <div class="col-label">发布排期</div>
       <div id="schedule"></div>
     </aside>
@@ -78,8 +102,8 @@
 <div id="viewOther" style="display:none"><div class="fullpage" id="otherPage"></div></div>
 
 <!-- ============ 设置弹窗 ============ -->
-<div class="mask" id="cfgMask"><div class="modal">
-  <div class="modal-head"><h2>设置</h2><button class="x" onclick="closeCfg()">✕</button></div>
+<div class="mask" id="cfgMask"><div class="modal setting" role="dialog" aria-modal="true" aria-labelledby="cfgTitle">
+  <div class="modal-head"><h2 id="cfgTitle">设置</h2><button class="x" onclick="closeCfg()" aria-label="关闭设置">✕</button></div>
   <div class="modal-body" id="cfgBody"></div>
   <div class="modal-foot">
     <span class="tip">保存后热加载，对新步骤立即生效；已在排期的切片不受影响</span>
@@ -90,11 +114,11 @@
 </div></div>
 
 <!-- ============ 通用弹窗 ============ -->
-<div class="mask" id="infoMask"><div class="modal wide">
+<div class="mask" id="infoMask"><div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="infoTitle">
   <div class="modal-head"><h2 id="infoTitle">详情</h2>
     <div style="display:flex;gap:8px;align-items:center">
       <button class="btn-sm" id="infoCopy">一键复制</button>
-      <button class="x" onclick="closeInfo()">✕</button>
+      <button class="x" onclick="closeInfo()" aria-label="关闭详情">✕</button>
     </div>
   </div>
   <div class="modal-body" id="infoBody"></div>
@@ -102,5 +126,7 @@
     <button class="btn-plain" style="margin-left:auto" onclick="closeInfo()">关闭</button></div>
 </div></div>
 
-<div id="toast"></div>
+<!-- ★ 2026-10-16（UI 评审 A-1）：role=status + aria-live=polite。
+     之前所有操作结果（"已复制""保存失败"）都只走视觉，读屏用户完全收不到。 -->
+<div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 

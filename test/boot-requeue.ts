@@ -19,6 +19,7 @@ import path from 'node:path';
 import { Ledger } from '../src/ledger.ts';
 import type { Logger } from '../src/logger.ts';
 import { Orchestrator } from '../src/daemon.ts';
+import { ROOT_DIR } from '../src/util.ts';
 import type { ClipRecord, TaskRecord } from '../src/types.ts';
 
 let pass = 0;
@@ -155,6 +156,45 @@ const enqueued: string[] = [];
   eq('用户停过的不在返回值里', r.requeued.includes('boot-stopped'), false);
   ok('素材缺失的那个没有被入队（只记 warning）', !enqueued.includes('boot-gone'));
   eq('重新入队会给它计数（供崩溃循环刹车用）', ledger.getTask('boot-go')?.autoResumeCount, 1);
+}
+
+/* ========================================================================== */
+section('②c ★ 停在中间态的任务也要接着跑（2026-10-13 用户报"卡了有一会了，为什么不继续切片"）');
+{
+  /* 现场：服务在**切片进行中**被重启，任务状态留在 CLIPPING；而启动恢复只捡 RECORDED，
+     于是它永远躺在中间态（界面上看不出在跑、切片也不会继续）。
+     现在：先把运行态修回可恢复状态，再**按修好的阶段**接着跑（不是一律从头）。 */
+  const l2 = new Ledger({ path: path.join(tmp, 'l2', 'ledger.json'), logger: silentLogger });
+  fs.mkdirSync(path.join(tmp, 'l2'), { recursive: true });
+  const src2 = path.join(dataDir, 'src2.ts');
+  fs.writeFileSync(src2, 'x');
+  const srcOf = { segments: [{ path: src2, duration: 60, globalStart: 0, globalEnd: 60, size: 1 }], totalDuration: 60, rawFiles: [src2], fullVideoHasDanmaku: false };
+  /* 切到一半（2 个切片已切、0 个已发布）→ 应该修成 ANALYZED */
+  l2.createTask(mkTask('stuck-clipping', { status: 'CLIPPING', source: srcOf, clips: [{ status: 'CUT' }, { status: 'CUT' }] as never }));
+  /* 分析到一半 → 应该修成 TRANSCRIBED */
+  l2.createTask(mkTask('stuck-analyzing', { status: 'ANALYZING', source: srcOf }));
+  /* 用户主动停过的：一律不碰 */
+  l2.createTask(mkTask('stuck-stopped', { status: 'CLIPPING', source: srcOf, stoppedByUserAt: now }));
+  const o2 = new Orchestrator({ ledger: l2, dataDirOverride: dataDir });
+  o2.logger.setConsole(false);
+  const calls: Array<{ id: string; stage?: string }> = [];
+  (o2 as unknown as { enqueue: (id: string, from?: string) => Promise<void> }).enqueue = async (id: string, from?: string) => {
+    calls.push({ id, ...(from ? { stage: from } : {}) });
+  };
+  const r2 = await o2.recoverUnfinishedTasks();
+  const ids = calls.map((c) => c.id).sort();
+  eq('★ 两个停在中间态的任务都重新入队了', ids, ['stuck-analyzing', 'stuck-clipping']);
+  eq('★ 切到一半的那个从 ANALYZED 接着跑（不重跑转写/分析）', calls.find((c) => c.id === 'stuck-clipping')?.stage, 'ANALYZED');
+  eq('★ 分析到一半的那个从 TRANSCRIBED 接着跑', calls.find((c) => c.id === 'stuck-analyzing')?.stage, 'TRANSCRIBED');
+  eq('台账状态被修回可恢复状态（不再是假的"运行中"）', [l2.getTask('stuck-clipping')?.status, l2.getTask('stuck-analyzing')?.status], ['ANALYZED', 'TRANSCRIBED']);
+  eq('★ 用户主动停过的仍然不碰', l2.getTask('stuck-stopped')?.status, 'CLIPPING');
+  ok('返回值如实报出"修了哪几个"', r2.repaired.length === 2, JSON.stringify(r2.repaired));
+  /* 半自动模式下 ANALYZED 是"等用户确认"，绝不自动越过审核 —— 这条规则用静态断言钉住 */
+  const src = fs.readFileSync(path.join(ROOT_DIR, 'src', 'daemon.ts'), 'utf8');
+  ok(
+    '★ 半自动模式下不自动跑 ANALYZED（不越过用户审核）',
+    /status === 'ANALYZED'\) return this\.cfg\.publish\.autoPublish \? 'ANALYZED' : undefined/.test(src),
+  );
 }
 
 /* ========================================================================== */

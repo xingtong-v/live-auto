@@ -92,7 +92,7 @@ function makeEnv(
   fs.writeFileSync(
     configPath,
     JSON.stringify(
-      { ...realCfg, publish: { ...(realCfg['publish'] as object), multiPart, resumeAid: '', resumeTitleTemplate: '', ...extraPublish } },
+      { ...realCfg, publish: { ...(realCfg['publish'] as object), multiPart, /* ★ 两个键一起写（与界面保存同一口径）：本套件的用例只关心 multiPart，但线上 config.json 里可能配着另一个模式的 clipPublishMode —— 不一起写就会造出自相矛盾的配置（服务端按 clipPublishMode 走，用例就会跑到另一条路上）*/ clipPublishMode: multiPart ? 'append' : 'standalone', resumeAid: '', resumeTitleTemplate: '', ...extraPublish } },
       null,
       2,
     ),
@@ -370,17 +370,28 @@ async function main(): Promise<void> {
     const cfgMod = await import('../src/config.ts');
     const live = cfgMod.loadConfig().config;
     eq('线上配置取到默认「完整版归 biliLive-tools」', live.publish.fullVideoBy, 'bililive-tools');
-    eq('线上配置 multiPart 打开（同稿件的前提）', live.publish.multiPart, true);
+    /* ⚠️ 不再断言"线上必须 multiPart=true"：2026-10-16 加了「切片投稿方式」开关之后，
+       线上选「单独投稿」（multiPart=false）是**合法**的用户意图（该用例红过：另一个会话正在
+       实测单独投稿，本行就假红了）。这里改钉真正该守的性质 —— 两个键**不能自相矛盾**
+       （界面保存时一起写，手改也不该只改一个）。 */
+    ok(
+      '线上配置的两个口径自洽（clipPublishMode 与 multiPart 不打架）',
+      live.publish.clipPublishMode === undefined || (live.publish.clipPublishMode === 'append') === (live.publish.multiPart === true),
+      `clipPublishMode=${String(live.publish.clipPublishMode)} multiPart=${String(live.publish.multiPart)}`,
+    );
     ok(
       '线上配置通过校验（这条规则没把现有配置判成错）',
       !cfgMod.validateConfig(live).some((i) => i.level === 'error' && /fullVideoBy|multiPart/.test(i.field)),
       JSON.stringify(cfgMod.validateConfig(live).filter((i) => /fullVideoBy|multiPart/.test(i.field))),
     );
 
+    /* 「配置错位」现在必须用**两个键一起**表达：显式选了追加、却把 multiPart 关掉。
+       只改 multiPart 而 clipPublishMode 是 standalone 时那是用户的明确选择，不该拦（见第 6 节）。 */
     const bad = cfgMod.loadConfig().config;
+    bad.publish.clipPublishMode = 'append';
     bad.publish.multiPart = false;
     ok(
-      '关掉 multiPart 会被拦住（否则切片投成独立稿件、与完整版不在同一稿件）',
+      '选了「追加切片投稿」却关掉 multiPart 会被拦住（否则切片投成独立稿件、与完整版不在同一稿件）',
       cfgMod.validateConfig(bad).some((i) => i.level === 'error' && i.field === 'publish.multiPart'),
       JSON.stringify(cfgMod.validateConfig(bad).filter((i) => i.field === 'publish.multiPart')),
     );

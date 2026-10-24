@@ -138,6 +138,9 @@ async function main(): Promise<void> {
   const publisher = new Publisher({
     client: {
       biliArchives: async (): Promise<unknown[]> => [],
+      /* ⚠️ `publishAsMultiPart` 开头要 `ensureAnchorUid`（按房间号查主播 UID），
+         桩缺这个方法会直接抛 TypeError（既有桩的缺口，与本套件要验的事无关） */
+      anchorInfoByRoom: async (): Promise<{ uid: string; name: string }> => ({ uid: '12345', name: '测试主播' }),
       biliUpload: async (p: Record<string, unknown>): Promise<{ taskId: string }> => {
         uploads.push(p);
         return { taskId: `upload-${uploads.length}` };
@@ -231,6 +234,8 @@ async function main(): Promise<void> {
     const publisher3 = new Publisher({
       client: {
         biliArchives: async (): Promise<unknown[]> => [],
+        /* `publishAsMultiPart` 开头要 `ensureAnchorUid`（既有桩的缺口，补齐才能跑到投稿逻辑） */
+        anchorInfoByRoom: async (): Promise<{ uid: string; name: string }> => ({ uid: '12345', name: '测试主播' }),
         /* 续传目标稿件的分P 列表里**始终没有**这条标题 ⇒ 落地确认必然失败 */
         biliArchiveDetail: async (): Promise<unknown> => ({
           View: { bvid: 'BV1FAIL00001', videos: 1, pages: [{ part: '完整版', duration: 10 }] },

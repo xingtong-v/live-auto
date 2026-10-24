@@ -506,6 +506,28 @@ export interface TaskRecord {
    * （空 = 没有证据，界面与提示词都不注入，绝不猜）。
    */
   streamer?: string;
+  /**
+   * 主播的 B站 UID（数字 ID，如 266143242），由房间号反查 `room_init` 得到。
+   *
+   * 为什么需要：简介模板的 `{{anchorUid}}` 用它来标「这场是谁的直播」，与 `roomUrl`
+   * 一一对应（同一个主播的 UID ↔ 房间号）。房间号会变（B站 换房/停播），UID 稳定，
+   * 所以简介里给 UID 比只给房间链接更能定位到人。取不到时为空字符串。
+   */
+  anchorUid?: string;
+  /**
+   * 主播昵称（与 `anchorUid` 一起由房间号反查得到，见 `anchorInfoByRoom`）。
+   * 简介模板 `{{anchorName}}` 用它拼「@昵称 + 空间链接」；取不到时为空。
+   */
+  anchorName?: string;
+  /**
+   * 「这一场到底属于哪个直播间」—— 用于反查 `anchorUid/anchorName` 与简介里的 `{{roomUrl}}`。
+   *
+   * 为什么不能直接用 `roomId`：目录轮询导入的场次**不知道房间号**，创建时按
+   * `cfg.room.roomId` 兜底，而配置里的主房间不一定是这一场的主播（实测：乙主播的场次被兜底成
+   * 甲主播的房间 23456789 → 简介写着「@甲主播」+ 原文链接指向甲主播的直播间）。
+   * 现在在投稿前按 `streamer` 去配置的所有房间里匹配，命中的房间号存这里；取不到就不写。
+   */
+  anchorRoomId?: string;
   /** 开播时刻（秒级时间戳） */
   liveStartTime?: number;
   recordStartTime?: number;

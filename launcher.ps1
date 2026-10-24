@@ -14,11 +14,16 @@
     -DryRun        只跑到分析产出，不切片不投稿，且默认不调用付费 AI
     -AllowPaid     显式允许产生 ASR / LLM 费用
     -NoBrowser     只启动后端，不打开界面
+    -NoWatch       关闭代码热更新（直接起服务；改代码后需手动重启）
     -Port 3000     指定 Web UI 端口
     -Room 22886881 覆盖目标直播间
     -NoPause       退出时不等待按键（供自动化调用）
 
   实现说明（为什么这么做）：
+    · **默认启动的是热更新监督进程 `src/hot-watch.ts`**（2026-10-24 用户需求：
+      「每次更新和修bug后 都要手动关闭重新启动 能不能热更新 不需要关闭」）。
+      它持有真正的服务子进程，保存 `src/**/*.ts` 后自动做「类型检查 → 判忙 → 优雅重启」。
+      不用热更新时用 `-NoWatch` 回退到直启服务。
     · 服务用 Start-Process 起独立进程并持有句柄 —— 关闭本窗口时能确保把它一起收掉，
       不会留下孤儿 node 进程。
     · 服务日志先写文件再读出来显示 —— 比 PowerShell Job 的管道可靠，
@@ -29,6 +34,7 @@ param(
   [switch]$DryRun,
   [switch]$AllowPaid,
   [switch]$NoBrowser,
+  [switch]$NoWatch,
   [int]$Port = 3000,
   [string]$Room,
   [switch]$NoPause
@@ -158,6 +164,7 @@ Write-Host '  直播切片助手' -ForegroundColor White -BackgroundColor DarkMa
 Write-Host '  B站直播全自动切片系统' -ForegroundColor DarkGray
 Write-Host "  工作目录  $ROOT" -ForegroundColor DarkGray
 Write-Host "  运行模式  $(if ($DryRun) { 'dry-run（不切片、不投稿）' } else { '正常运行' })" -ForegroundColor DarkGray
+Write-Host "  热更新    $(if ($NoWatch) { '已关闭（-NoWatch：改代码后需手动重启）' } else { '已开启（保存 src 下 .ts 后自动重启；改 web/src 自动构建）' })" -ForegroundColor DarkGray
 # 代码页没切成 UTF-8 时，上面的中文会被控制台按 2 字节/字解码成"每字变两个"。
 # 与其让用户看一屏乱码猜原因，不如直接说清楚怎么办。
 if (-not $CpOk) {
@@ -178,6 +185,19 @@ if (-not $already -and (Test-Port $Port)) {
 }
 if ($already) {
   Ok "服务已经在运行：$URL"
+  # 已经在跑的是不是**热更新守护**？这决定了"改代码要不要手动重启"这个用户最关心的问题。
+  # 只读 /api/health 看 hot 字段（服务若在忙可能超时 ⇒ 什么都不说，不给错误结论）。
+  try {
+    $hj = (Invoke-WebRequest -Uri "$URL/api/health" -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop).Content | ConvertFrom-Json
+    if ($hj.hot -and $hj.hot.alive) {
+      Ok "代码热更新：已开启（保存 src 下 .ts 会自动重载）"
+    } elseif ($hj.hot) {
+      Warn "代码热更新：监督进程已退出（当前是遗留的服务进程）—— 改代码需手动重启"
+    } else {
+      Warn "代码热更新：未开启（当前是直启的服务，改代码需手动重启）"
+      Say '       关掉那个服务后重跑本启动器即可切到热更新模式。' DarkGray
+    }
+  } catch { }
   if (-not $NoBrowser) {
     Say '  正在打开界面…' DarkGray
     $null = Open-App $URL
@@ -266,15 +286,28 @@ if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Forc
 # 与 tools\ensure-service.ps1 保持一致：给内存尖峰留余量 + 崩了留诊断报告。
 # （2026-10-07 01:17:03 服务因 `JavaScript heap out of memory` 整个进程 abort，默认堆上限约 4GB，
 #   而机器有 32GB —— 事后没有任何报告，只能从 stderr 的一行 FATAL 反推。现在两边都带这三个参数。）
+#
+# 默认入口是**热更新监督进程**（src\hot-watch.ts），不是服务本身：
+#   它持有 `src\cli.ts run` 子进程，保存 .ts 后自动「类型检查 → 判忙 → 优雅重启」。
+#   `-NoWatch` 回退到直启服务（排障时用：可以排除监督进程这一层）。
+#   传参差别：经监督进程时要包一层 `--child-arg`，否则那些开关会被监督进程自己吃掉。
 $cliArgs = @(
   '--max-old-space-size=8192',
   '--report-on-fatalerror',
-  "--report-directory=$logDir",
-  'src\cli.ts', 'run', '--port', "$Port"
+  "--report-directory=$logDir"
 )
-if ($DryRun) { $cliArgs += '--dry-run' }
-if ($AllowPaid) { $cliArgs += '--allow-paid' }
-if ($Room) { $cliArgs += @('--room', $Room) }
+if (-not $NoWatch) {
+  $cliArgs += @('src\hot-watch.ts', '--port', "$Port")
+  if ($DryRun) { $cliArgs += @('--child-arg', '--dry-run') }
+  if ($AllowPaid) { $cliArgs += @('--child-arg', '--allow-paid') }
+  if ($Room) { $cliArgs += @('--child-arg', '--room', '--child-arg', $Room) }
+} else {
+  $cliArgs += @('src\cli.ts', 'run', '--port', "$Port")
+  if ($DryRun) { $cliArgs += '--dry-run' }
+  if ($AllowPaid) { $cliArgs += '--allow-paid' }
+  if ($Room) { $cliArgs += @('--room', $Room) }
+}
+
 
 Say "  $nodeExe $($cliArgs -join ' ')" DarkGray
 if ($DryRun -and -not $AllowPaid) {
@@ -362,11 +395,26 @@ try {
   #   （`CommandLine -like "*$ROOT*"`）逐个 Stop-Process。那太危险了：
   #   只要本窗口是在"误判服务没在跑"之后打开的，这一发就会把**另一个健康实例**杀掉。
   #   现在只收自己的子进程（ParentProcessId == 本进程），别人的服务一律不碰。
+  #
+  # ★ 2026-10-24（热更新）：默认启动的是监督进程，真正的服务是它的**子进程**（孙子）。
+  #   Stop-Process -Force 是 TerminateProcess，监督进程的 exit 钩子跑不到，孙子会变成
+  #   "占着 3000 却没人管热更新"的孤儿 —— 下次双击启动器会提示"服务已在运行"，热更新却是哑的。
+  #   所以先记下孙子的 pid，杀掉监督进程后再逐个补刀。
   if ($proc -and -not $proc.HasExited) {
     Write-Host ''
     Say '正在停止服务…' DarkGray
+    $grandKids = @()
+    try {
+      $grandKids = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ParentProcessId -eq $proc.Id } |
+        Select-Object -ExpandProperty ProcessId)
+    } catch { }
     try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch { }
-    Start-Sleep -Milliseconds 800
+    Start-Sleep -Milliseconds 500
+    foreach ($gid in $grandKids) {
+      try { Stop-Process -Id $gid -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    Start-Sleep -Milliseconds 300
   }
   Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.ParentProcessId -eq $PID } |

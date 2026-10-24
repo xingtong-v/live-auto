@@ -810,7 +810,15 @@ export function readErrorEvents(opts: { taskId?: string; sinceMs?: number; limit
   const sinceMs = opts.sinceMs;
   const taskId = opts.taskId;
   const type = opts.type;
-  let out = readJsonl<ErrorEvent>(getErrorsPath()).filter((e) => e && typeof e.at === 'string');
+  /* 读取下推（P2）：sinceMs 让读取层从尾部回读到窗口起点就停；limit 只在**没有** taskId/type
+     过滤时才下推 —— 带过滤时"先取尾部 N 行再过滤"会少给结果，语义不能变。
+     多要 16 行抵掉随后被 `typeof at === 'string'` 挡掉的畸形行，最后仍按 limit 切。 */
+  const limit = opts.limit && opts.limit > 0 ? opts.limit : undefined;
+  const pushLimit = !taskId && !type && limit !== undefined ? limit + 16 : undefined;
+  let out = readJsonl<ErrorEvent>(getErrorsPath(), {
+    ...(typeof sinceMs === 'number' && Number.isFinite(sinceMs) ? { sinceMs } : {}),
+    ...(pushLimit !== undefined ? { limit: pushLimit } : {}),
+  }).filter((e) => e && typeof e.at === 'string');
   if (taskId) out = out.filter((e) => e.taskId === taskId);
   if (type) out = out.filter((e) => e.type === type);
   if (sinceMs !== undefined) {

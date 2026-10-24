@@ -433,7 +433,7 @@ async function main(): Promise<void> {
       publish: {
         autoPublish: false,
         isOnlySelf: 1,
-        submitGapSec: 7800,
+        submitGapSec: 1200,
         clipGapSec: 7500,
         jitterSec: 1800,
         dailyLimit: 10,
@@ -782,7 +782,7 @@ async function main(): Promise<void> {
       ok('投稿配置带 title', typeof uploadCfg['title'] === 'string' && String(uploadCfg['title']).length > 0);
       ok('投稿配置的标签为数组', Array.isArray(uploadCfg['tag']), JSON.stringify(uploadCfg['tag']));
       ok('投稿配置的 tid 来自白名单', [17, 65, 21].includes(Number(uploadCfg['tid'])), String(uploadCfg['tid']));
-      ok('投稿配置带 dtime 且距提交 > 7200 秒（硬约束 #4）', typeof uploadCfg['dtime'] === 'number' && Number(uploadCfg['dtime']) - Math.floor(Date.now() / 1000) > 7100, `dtime-now=${Number(uploadCfg['dtime']) - Math.floor(Date.now() / 1000)}`);
+      ok('投稿配置带 dtime 且距提交 ≥ 1200 秒（硬约束 #4）', typeof uploadCfg['dtime'] === 'number' && Number(uploadCfg['dtime']) - Math.floor(Date.now() / 1000) >= 1200, `dtime-now=${Number(uploadCfg['dtime']) - Math.floor(Date.now() / 1000)}`);
       /* 可见性：这里要验的是**配置值真的传到了投稿载荷里**，而不是某个固定值。
          ★ 2026-10-06 用户明确选择公开可见（真实 `config.json` 的 `publish.isOnlySelf = 0`），
         所以"必须等于 1"不再是判定标准（那是试跑期的临时约定）。

@@ -126,6 +126,99 @@ section('5. 被实测证伪/待验证的开关，必须在界面上写明结论�
   ok('★ whisper-cpp 标明「已被 Fun-ASR 压过，不推荐」', /不推荐/.test(uiHtml) && /差一倍/.test(uiHtml));
 }
 
+section('6. 「切片投稿方式」开关（追加切片投稿 / 单独投稿）的端到端三件套');
+{
+  /* 2026-10-16 用户要求：切片投稿要能选「追加切片投稿」（进同一个稿件的分P）或
+     「单独投稿」（每片一稿）。这是一个**行为分流**开关，而这个仓库里"开关点了没反应"
+     已经出过两次（`multiPart` 在自动流程里从没被读、llm_dtype 传错了位置）——
+     两次都是"界面看着开了、链路里没人读"。所以这里钉住五件事。 */
+  const cfg = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'config.json'), 'utf8')) as {
+    publish?: Record<string, unknown>;
+  };
+  const daemonText = fs.readFileSync(path.join(ROOT_DIR, 'src', 'daemon.ts'), 'utf8');
+  ok('① 产物里有 #c_clipPublishMode 控件', /id="c_clipPublishMode"/.test(uiHtml));
+  ok(
+    '② 两个选项都在（追加切片投稿 / 单独投稿）',
+    /data-mode="append"[^>]*>追加切片投稿/.test(uiHtml) && /data-mode="standalone"[^>]*>单独投稿/.test(uiHtml),
+  );
+  ok(
+    '③ saveCfg 里真的存它，且 multiPart 由它派生（两个键必须一致，否则配置自相矛盾）',
+    /clipPublishMode:\s*clipModeFromForm\(\)/.test(saveText) &&
+      /multiPart:\s*clipModeFromForm\(\)\s*===\s*'append'/.test(saveText),
+  );
+  ok('④ config.json 里真有这个键（不然存了也没人读）', cfg.publish !== undefined && 'clipPublishMode' in cfg.publish);
+  ok(
+    '⑤ ★ 服务端真的按它分流（daemon 用 resolveClipPublishMode 判定，而不是只看 multiPart）',
+    /resolveClipPublishMode\(cfg\.publish\)/.test(daemonText) && /clipMode === 'append'/.test(daemonText),
+  );
+  ok(
+    '⑥ 两个模式的差别在界面上写清楚了（等不等完整版稿件 / 占几个额度 / 能不能错峰）',
+    /等完整版稿件/.test(uiHtml) && /每片占 1 个每日额度/.test(uiHtml) && /错峰/.test(uiHtml),
+  );
+}
+
+section('7. 「单独投稿 ⇒ 定时投稿 + 片间隔/抖动按设置生效」的端到端门禁');
+{
+  /* 2026-10-16 用户要求：「选择单独投稿后，切片会默认以定时投稿的方式、每个投稿 5 分钟的间隔进行投稿」。
+     这条规则有两层：口径（resolveClipPublishSchedule）与**送达**（真正发给 B站 的 dtime）。
+     口径有纯函数测试（dtime-schedule）与真 payload 测试（standalone-schedule）盯着，
+     这里只钉"接线没断"：常量在、切片路径真的调它、界面与 bootstrap 都跟着这个口径走。 */
+  const cfgText = fs.readFileSync(path.join(ROOT_DIR, 'src', 'config.ts'), 'utf8');
+  const pubText = fs.readFileSync(path.join(ROOT_DIR, 'src', 'publish.ts'), 'utf8');
+  const serverText = fs.readFileSync(path.join(ROOT_DIR, 'src', 'server.ts'), 'utf8');
+  const steps = fs.readFileSync(path.join(ROOT_DIR, 'verify.steps.json'), 'utf8');
+
+  ok('① 常量就是 300 秒（5 分钟）', /export const STANDALONE_CLIP_GAP_SEC = 300;/.test(cfgText));
+  ok(
+    '② 切片投稿路径真的调 resolveClipPublishSchedule(cfg.publish)（而不是自己读 immediatePublish）',
+    /const sched = resolveClipPublishSchedule\(cfg\.publish\);/.test(pubText),
+  );
+  ok(
+    '③ ★ 单切片路径不再直接读 config 的立即发布（那正是"改了口径但链路没读"的事故形态）',
+    !/let immediate = cfg\.publish\.immediatePublish === true;/.test(pubText),
+  );
+  ok(
+    '④ bootstrap 把生效口径下发（界面四处「错峰 X」不再各自读 config.publish.clipGapSec）',
+    /publishSchedule: \(\(\) => \{/.test(serverText) && /resolveClipPublishSchedule\(liveCfg\.publish\)/.test(serverText),
+  );
+  ok(
+    '⑤ 界面用下发的口径渲染（publishSchedule() 在模块里被调用）',
+    /<span>\$\{sched\.scheduled \? `错峰 \$\{fmtSpan\(sched\.gapSec\)\}`/.test(uiHtml) && /function publishSchedule\(\)/.test(moduleText),
+  );
+  ok(
+    '⑥ 设置面板写明「单独投稿固定定时投稿 + 片间隔/抖动按设置生效（300 保底、抖动<间隔）」，且旧红字已删',
+    /固定走定时投稿/.test(uiHtml) &&
+      /低于 300 会被抬到 300/.test(uiHtml) &&
+      /hintClipGapUse/.test(uiHtml) &&
+      /paintScheduleHints/.test(uiHtml) &&
+      /scheduleFormula/.test(uiHtml) &&
+      !/对切片都不生效/.test(uiHtml),
+    '设置面板里的排期文案没跟上新口径（或旧的"这两项对切片都不生效"红字还在）',
+  );
+  ok(
+    '⑦ 真 payload 测试（standalone-schedule）已接入 verify 清单与 package.json',
+    /"standalone-schedule-test"/.test(fs.readFileSync(path.join(ROOT_DIR, 'package.json'), 'utf8')) && /standalone-schedule-test/.test(steps),
+  );
+  /* ★ 2026-10-17 口径（用户要求「这里改成对定时投稿也生效」）：单独投稿分支必须真的**用**
+     clipGapSec / jitterSec，而不是像 2026-10-16 那样把它们钉死成 300 / 0。
+     这两行字符串就是那条口径：间隔取 max(平台底线, 用户值)、抖动走同一道夹子。
+     它们被改坏时的表现极其隐蔽 —— 配置页写着 500/120，排期仍是每 5 分钟等距。 */
+  ok(
+    '⑧ ★ 单独投稿分支真的用 clipGapSec（间隔 = max(300, 用户值)，不再钉死常量）',
+    /Math\.max\(STANDALONE_CLIP_GAP_SEC, rawGap\)/.test(cfgText),
+    'src/config.ts 的 resolveClipPublishSchedule 里找不到 `Math.max(STANDALONE_CLIP_GAP_SEC, rawGap)`',
+  );
+  ok(
+    '⑨ ★ 单独投稿分支的抖动走同一道夹子（effectiveJitterSec，防排期倒挂）',
+    /effectiveJitterSec\(rawJitter, gapSec\)/.test(cfgText),
+    'src/config.ts 里找不到 `effectiveJitterSec(rawJitter, gapSec)`',
+  );
+  ok(
+    '⑩ effectiveJitterSec 定义在 config.ts（避免 publish→config→publish 循环依赖），publish 侧仍导出同名',
+    /export function effectiveJitterSec/.test(cfgText) && /export \{ effectiveJitterSec \}/.test(pubText),
+  );
+}
+
 console.log('\n' + '─'.repeat(74));
 console.log(`\x1b[1m结果：PASS=${pass} FAIL=${fail}\x1b[0m`);
 if (failures.length) {

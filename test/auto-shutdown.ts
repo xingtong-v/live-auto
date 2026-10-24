@@ -68,6 +68,14 @@ section('2. 六条门槛缺一不可（每条都要能挡住关机）');
     eq(`★ ${name} → 不关`, d.shutdown, false);
     ok(`  （原因说得清：${name}）`, re.test(d.reason), d.reason);
   }
+  /* 原因里要带回"是哪一场在录"（`recordingDetail`）：只写"有 1 场在录"用户没法核对，
+     而这一条正是"号码对不上就丢数据"的那条（2026-10-24 漏判 .ts 的现场就出在这里）。 */
+  const withDetail = decideShutdown(
+    base({ recordingSessions: 1, recordingDetail: '1 场可能还在录（原始分段在写：…-PART007.ts）' }, now),
+    policy,
+    since,
+  );
+  ok('★ 原因里带上来由（哪一场、什么来源）', /原始分段在写/.test(withDetail.reason) && /PART007\.ts/.test(withDetail.reason), withDetail.reason);
 }
 
 section('3. 冷静期：刚空闲不关，够了才关');
@@ -119,7 +127,11 @@ section('6. 静态接线：默认关 + 只生效一次（避免"哪天白天跑�
   /* 接线（2026-10-14）：daemon 每分钟评估一次；服务端只暴露状态与开关，不重复实现判据 */
   const daemon = fs.readFileSync(path.join(ROOT_DIR, 'src', 'daemon.ts'), 'utf8');
   ok('★ daemon 里有每分钟的评估定时器', /setInterval\(\(\) => \{\s*void this\.evaluateAutoShutdown\(\);\s*\}, 60_000\)/.test(daemon));
-  ok('★ 六条事实都取自既有接口（busy/队列/转写/watcher/它那边队列）', /activeTranscriptions: listActiveLocalAsrRuns\(\)\.length/.test(daemon) && /possiblyRecording === true \|\| \(o\.pendingParts \?\? 0\) > 0/.test(daemon));
+  ok('★ 六条事实都取自既有接口（busy/队列/转写/它那边队列）', /activeTranscriptions: listActiveLocalAsrRuns\(\)\.length/.test(daemon));
+  /* ★ 2026-10-24：「还在录」改成多源归并（watcher 候选项 + 原始分段在写 + 录制器 recording）。
+     旧写法只 filter watcher 的 mp4 候选项 ⇒ 直播正在写 .ts 时恒为 0，自动关机会在录制中途执行。
+     逐条断言见 test/recording-gate.ts；这里只钉住"接入点是多源的"这一件事。 */
+  ok('★ 「还在录」由 gatherRecordingGate 多源归并（不再是单源 filter）', /gatherRecordingGate\(\{/.test(daemon) && !/recordingSessions: this\.watcher/.test(daemon));
   ok('★ biliLive-tools 队列查不到时按"忙"算（绝不当空闲）', /catch \{\s*llcQueueLength = 1;\s*\}/.test(daemon));
   ok('★ 同一个运行周期内不重复下发关机', /shutdownFiredAt && Date\.now\(\) - this\.shutdownFiredAt < 6 \* 3600_000/.test(daemon));
   ok('dry-run 时只记日志、不下发', /dry-run）：本应关机/.test(daemon));

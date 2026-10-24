@@ -8,30 +8,46 @@ function renderDetail() {
   if (!d) return;
   const box = $('#detail');
   // 在详情页顶部给一句指路：任务操作还能从左侧列表的「⋯」或右键打开
-  const opsTip = `<div style="font-size:11.5px;color:var(--text-3);margin:-6px 0 8px">
+  const opsTip = `<div style="font-size:var(--fs-meta);color:var(--text-3);margin:-6px 0 8px">
     提示：这些操作在左侧任务卡片的「⋯」按钮或右键菜单里同样可用
   </div>`;
 
   // 任务级操作栏：删除 / 停止 / 重跑 —— 这些以前只能改 json 才能做
   const publishedN = (d.clips || []).filter((c) => c.bvid).length;
-  const ops = `<div class="barstrip" style="gap:8px">
-    <span style="font-size:12.5px;color:var(--text-3)">任务操作</span>
-    ${['PUBLISHED','ARCHIVED'].includes(d.status) ? '<span class="tag-mini">已完成</span>' : ''}
-    ${['TRANSCRIBING','ANALYZING','CLIPPING','PUBLISHING','PENDING','RECORDED','TRANSCRIBED'].includes(d.status)
-      ? '<button class="btn-sm" data-act="stop-task">停止处理</button>' : ''}
-    <button class="btn-sm" data-act="retry-from">从某阶段重跑</button>
-    ${publishedN ? '<button class="btn-sm" data-act="copy-links">复制全部稿件链接</button>' : ''}
-    <button class="btn-sm" data-act="refresh-publish" title="立刻去 B站 反查一次这一场的投稿落地情况（不等后台每 5 分钟那一轮）；只读，不会重复投稿">刷新投稿状态</button>
-    <button class="btn-sm" data-act="publish-audit">投稿体检</button>
-    <button class="btn-sm" data-act="publish-batches" title="每次投稿本该产生哪几个分P、实际落地了哪几个">投稿批次</button>
-    <button class="btn-sm" data-act="recap" title="这一场的产出复盘：切片/评分/投稿/表现/待办，一页看完">复盘报告</button>
-    <button class="btn-sm" data-act="open-dir">打开产物目录</button>
-    <button class="btn-sm" data-act="delete-task" style="color:#c33;border-color:#f0c8c8">删除任务…</button>
-    <span style="margin-left:auto;font-size:11.5px;color:var(--text-3)" class="mono">${esc(d.id)}</span>
+  const running = ['TRANSCRIBING','ANALYZING','CLIPPING','PUBLISHING','PENDING','RECORDED','TRANSCRIBED'].includes(d.status);
+  /* ★ 2026-10-16（UI 评审 IA-1）：工具条分层。
+     改版前这里是 9 个半径/底色/字号完全一致的按钮 —— 日常下一步是哪个，看不出来。
+     现在分三层：**常用 3 个常显**（刷新投稿状态 / 复制链接 / 打开目录）、
+     **诊断类收进「更多 ▾」**（从某阶段重跑 / 投稿体检 / 投稿批次 / 复盘报告 / 停止处理）、
+     **删除独立在右端**并用红色区分。
+     ⚠️ 菜单里的按钮**仍然在 DOM 里**（只是视觉上收起），因为 36- 是渲染后用
+     $('[data-act="…"]') 逐个绑事件的 —— 从 DOM 里去掉会直接让那些功能失效。 */
+  const opsMoreItems = [
+    running ? '<button data-act="stop-task">停止处理</button>' : '',
+    '<button data-act="retry-from">从某阶段重跑</button>',
+    '<button data-act="publish-audit">投稿体检</button>',
+    '<button data-act="publish-batches" title="每次投稿本该产生哪几个分P、实际落地了哪几个">投稿批次</button>',
+    '<button data-act="recap" title="这一场的产出复盘：切片/评分/投稿/表现/待办，一页看完">复盘报告</button>',
+  ].filter(Boolean).join('');
+  const ops = `<div class="barstrip ops-bar">
+    <div class="ops-main">
+      <button class="btn-sm" data-act="refresh-publish" title="立刻去 B站 反查一次这一场的投稿落地情况（不等后台每 5 分钟那一轮）；只读，不会重复投稿">刷新投稿状态</button>
+      ${publishedN ? '<button class="btn-sm" data-act="copy-links">复制链接</button>' : ''}
+      <button class="btn-sm" data-act="open-dir">打开目录</button>
+      <div class="ops-more">
+        <button class="btn-sm ops-more-btn" id="opsMoreBtn" aria-expanded="false" aria-haspopup="true">更多 ▾</button>
+        <div class="ops-menu" id="opsMenu" role="menu" hidden>${opsMoreItems}</div>
+      </div>
+    </div>
+    <div class="ops-meta">
+      ${['PUBLISHED','ARCHIVED'].includes(d.status) ? '<span class="tag-mini">已完成</span>' : ''}
+      <span class="mono ops-id" title="任务 ID">${esc(d.id)}</span>
+      <button class="btn-sm danger-ghost" data-act="delete-task">删除任务</button>
+    </div>
   </div>`;
   // 已投稿的场次额外提醒一句：本地删除不撤回稿件
   const publishNote = publishedN
-    ? `<div style="font-size:11.5px;color:#c8811a;margin:-6px 0 8px">本场有 ${publishedN} 个切片已投稿到 B站 —— 删除本地记录<b>不会撤回投稿</b>，需下架请到 B站创作中心</div>`
+    ? `<div style="font-size:var(--fs-meta);color:#c8811a;margin:-6px 0 8px">本场有 ${publishedN} 个切片已投稿到 B站 —— 删除本地记录<b>不会撤回投稿</b>，需下架请到 B站创作中心</div>`
     : '';
 
   let html = opsTip + ops + publishNote + `<div class="stages">${d.stages.map((s, i) => {
@@ -89,11 +105,11 @@ function renderDetail() {
     <div class="field"><label>本场最多候选切片数</label><input class="inp num" id="ovMaxClips" value="${d.overrides && d.overrides.maxClips !== undefined ? d.overrides.maxClips : (state.bootstrap.config.clip.maxCandidates)}"></div>
     <div class="field"><label>本场不参与自动发布</label>
       <div class="inline-switch"><button class="switch sm ${d.overrides && d.overrides.skipAutoPublish ? 'on' : ''}" id="ovSkip"></button>
-      <span style="font-size:12.5px;color:var(--text-3)">开启后仅产出候选，需手动发布</span></div></div>
+      <span style="font-size:var(--fs-s);color:var(--text-3)">开启后仅产出候选，需手动发布</span></div></div>
     <div class="field full"><label>本场追加标签</label><input class="inp" id="ovTags" placeholder="例如：DLC开荒（逗号分隔，追加到全局标签之后）" value="${esc((d.overrides && d.overrides.extraTags || []).join(', '))}"></div>
     <div class="field"><label>完整版由切片助手投（例外）</label>
       <div class="inline-switch"><button class="switch sm ${d.overrides && d.overrides.fullVideoBy === 'assistant' ? 'on' : ''}" id="ovFullVideoBy"></button>
-      <span style="font-size:12.5px;color:var(--text-3)">默认关闭：完整版（弹幕版+纯享版）由 biliLive-tools 投，本服务只追加切片分P。
+      <span style="font-size:var(--fs-s);color:var(--text-3)">默认关闭：完整版（弹幕版+纯享版）由 biliLive-tools 投，本服务只追加切片分P。
         只有你**明确**需要本服务自己烧弹幕版 + remux 纯享版并新建 2+N 稿件时才打开这一场。</span></div></div>
     <div class="field full"><label>本场续传目标 aid（可选）</label>
       <input class="inp" id="ovResumeAid" value="${esc((d.overrides && d.overrides.resumeAid) || '')}" placeholder="例如 117321041512930（留空 = 按标题自动找）">
@@ -118,7 +134,9 @@ function renderDetail() {
     const publishable = d.clips.filter((c) => c.selected && !DONE.includes(c.status));
     const alreadyDone = d.clips.filter((c) => c.selected && ['PUBLISHED', 'SUBMITTED', 'SUBMITTING'].includes(c.status));
     html += `<div class="actionbar">
-      <span class="info">已选 <b id="cntSelected">${checked}</b> / ${d.clips.length} 个切片　·　定时发布间隔 ${fmtSpan(state.bootstrap.config.publish.clipGapSec)}${
+      <span class="info">已选 <b id="cntSelected">${checked}</b> / ${d.clips.length} 个切片　·　${
+        publishSchedule().scheduled ? `定时发布间隔 ${fmtSpan(publishSchedule().gapSec)}` : '立即发布（不排期）'
+      }${
         alreadyDone.length ? `　·　<span style="color:var(--text-3)">其中 ${alreadyDone.length} 个已投过，不会重复投</span>` : ''
       }</span>
       <span id="publishHint" style="font-size:12px;color:var(--text-3)"></span>
@@ -145,7 +163,7 @@ function renderDetail() {
       <div class="k">封面</div><div>来源 ${esc(d.cover.source)}${d.cover.cover ? ' · ' + esc(String(d.cover.cover).split(/[\\/]/).pop()) : ''}</div>
       ${d.seasonId ? `<div class="k">合集</div><div>seasonId=${d.seasonId}</div>` : '<div class="k">合集</div><div style="color:#c8811a">未配置 —— 切片不会归入同一合集</div>'}
     </div>
-    ${d.files && d.files.length ? `<div style="margin-top:12px"><div class="k" style="font-size:11.5px;color:var(--text-3);margin-bottom:6px">任务目录文件（点击预览）</div>
+    ${d.files && d.files.length ? `<div style="margin-top:12px"><div class="k" style="font-size:var(--fs-meta);color:var(--text-3);margin-bottom:6px">任务目录文件（点击预览）</div>
       <div class="filelist">${d.files.map((f) => `<button data-act="preview" data-file="${esc(f)}">${esc(f)}</button>`).join('')}</div></div>` : ''}
   </div>`;
 
@@ -155,6 +173,17 @@ function renderDetail() {
   }
 
   box.innerHTML = html;
+  /* ★ 2026-10-16（用户实拍反馈）：把底部操作栏**搬出滚动区**，停靠在中栏底部。
+     之前它留在滚动区里用 position:sticky 浮着 —— 滚到任意位置都会压在内容上，
+     实拍效果就是"已选 6/6…"横在切片卡片中间，把「理由 / 试看 / 看稿件」那几行盖住；
+     光加 padding-bottom 只能保证滚到底时不挡，挡不住滚动过程中的遮挡。
+     现在它是中栏的固定页脚，滚动区高度自动让出它的位置 ⇒ 任何滚动位置都不重叠。 */
+  const foot = $('#detailFoot');
+  const ab = box.querySelector('.actionbar');
+  if (foot) {
+    foot.innerHTML = '';
+    if (ab) foot.appendChild(ab);
+  }
   bindDetail();
 }
 

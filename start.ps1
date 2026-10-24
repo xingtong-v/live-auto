@@ -16,6 +16,11 @@
 .PARAMETER NoUi
   不启动 Web UI，只跑常驻轮询（适合注册为服务）。
 
+.PARAMETER NoWatch
+  关闭代码热更新（直接起服务）。默认「常驻运行」会先起热更新监督进程
+  （`src\hot-watch.ts`）：保存 `src/**/*.ts` 后自动「类型检查 → 判忙 → 优雅重启」。
+  排障时用这个开关，可以把监督进程这一层排除掉。
+
 .PARAMETER Once
   跑一次「检查 + 补漏对账」后退出（适合计划任务）。
 
@@ -43,6 +48,7 @@ param(
   [switch]$DryRun,
   [switch]$AllowPaid,
   [switch]$NoUi,
+  [switch]$NoWatch,
   [switch]$Once,
   [switch]$SelfCheck,
   [switch]$Probe,
@@ -130,22 +136,39 @@ if ($Probe) {
   exit $LASTEXITCODE
 }
 
-$cliArgs = @('src\cli.ts')
-if ($SelfCheck) { $cliArgs += 'selfcheck' }
-elseif ($Once) { $cliArgs += 'once' }
-else { $cliArgs += 'run' }
+# 只有「常驻运行」才走热更新监督进程（2026-10-24，与 launcher.ps1 / ensure-service.ps1 对齐）：
+#   · 一次性的 SelfCheck / Once 套一层监督进程毫无意义（跑完就退），保持直连 cli.ts；
+#   · `-NoWatch` 显式关掉热更新（排障时能把监督进程这一层排除）；
+#   · 业务开关必须包一层 `--child-arg`，否则会被监督进程自己吃掉（它不认识 --dry-run）；
+#   · 端口由监督进程透传给子进程，所以只写一次 `--port`。
+$cliArgs = @()
+if ($SelfCheck -or $Once -or $NoWatch) {
+  $cliArgs += @('src\cli.ts')
+  if ($SelfCheck) { $cliArgs += 'selfcheck' }
+  elseif ($Once) { $cliArgs += 'once' }
+  else { $cliArgs += 'run' }
 
-if ($DryRun) { $cliArgs += '--dry-run' }
-if ($AllowPaid) { $cliArgs += '--allow-paid' }
-if ($NoUi) { $cliArgs += '--no-ui' }
-if ($Room) { $cliArgs += @('--room', $Room) }
-if ($Port) { $cliArgs += @('--port', "$Port") }
-if ($ExtraArgs) { $cliArgs += $ExtraArgs }
+  if ($DryRun) { $cliArgs += '--dry-run' }
+  if ($AllowPaid) { $cliArgs += '--allow-paid' }
+  if ($NoUi) { $cliArgs += '--no-ui' }
+  if ($Room) { $cliArgs += @('--room', $Room) }
+  if ($Port) { $cliArgs += @('--port', "$Port") }
+  if ($ExtraArgs) { $cliArgs += $ExtraArgs }
+} else {
+  $watchPort = if ($Port) { $Port } else { 3000 }
+  $cliArgs += @('src\hot-watch.ts', '--port', "$watchPort")
+  if ($DryRun) { $cliArgs += @('--child-arg', '--dry-run') }
+  if ($AllowPaid) { $cliArgs += @('--child-arg', '--allow-paid') }
+  if ($NoUi) { $cliArgs += @('--child-arg', '--no-ui') }
+  if ($Room) { $cliArgs += @('--child-arg', '--room', '--child-arg', $Room) }
+  if ($ExtraArgs) { foreach ($a in $ExtraArgs) { if ($a) { $cliArgs += @('--child-arg', $a) } } }
+}
 
 Write-Head '直播切片助手 · live_auto'
 Write-Host "启动时间 : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 Write-Host "工作目录 : $PSScriptRoot"
 Write-Host "运行参数 : $($cliArgs -join ' ')"
+Write-Host ("热更新   : " + $(if ($SelfCheck -or $Once) { "不适用（一次性命令）" } elseif ($NoWatch) { "已关闭（-NoWatch）" } else { "已开启（保存 src 下 .ts 自动重载；-NoWatch 可关闭）" }))
 if ($DryRun -and -not $AllowPaid) {
   Write-Ok 'dry-run 且未允许付费：不会调用付费 ASR / LLM（硬约束 #14）'
 }

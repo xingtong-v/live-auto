@@ -39,50 +39,112 @@ const SHUTDOWN_PAGE = [
   '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
   '<title>跑完自动关机 · 直播切片助手</title>',
   '<style>',
-  'body{font:14px/1.7 system-ui,"Microsoft YaHei",sans-serif;background:#f6f7f9;color:#222;margin:0;padding:28px}',
-  '.card{max-width:720px;margin:0 auto;background:#fff;border:1px solid #e6e8eb;border-radius:10px;padding:20px 22px}',
-  'h1{font-size:17px;margin:0 0 14px}',
-  '.row{margin:10px 0}',
-  '.badge{display:inline-block;padding:2px 10px;border-radius:10px;font-size:12px;background:#eee;color:#666}',
-  '.badge.on{background:#e6f2fd;color:#1a86c7}',
-  '.badge.fired{background:#fdecea;color:#c0392b}',
-  '#cd{font-variant-numeric:tabular-nums;font-size:22px;font-weight:600;min-height:1.4em;margin:2px 0 2px}',
-  '.bar{height:10px;background:#eef1f4;border-radius:5px;overflow:hidden;margin:12px 0 4px}',
-  '#bar{height:100%;width:0;background:#1a86c7;transition:width .3s}',
-  '.pctrow{display:flex;justify-content:space-between;color:#888;font-size:12.5px;font-variant-numeric:tabular-nums;margin-bottom:10px}',
-  'button{font:14px system-ui;padding:7px 14px;margin-right:8px;border:1px solid #d5d9de;background:#fff;border-radius:8px;cursor:pointer}',
-  'button:hover{background:#f2f6fb}',
-  '#hint{color:#888;font-size:12.5px;margin-top:12px}',
-  '.gate{display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:13px}',
-  '.gate .gi{width:18px;flex:0 0 18px}',
+  /* 设计令牌：与主界面（web/src/10-style.css）同名同值，深浅两套。
+     这块原先写死了浅色 —— 主界面切到深色后，整个 iframe 是一块刺眼白板
+     （2026-10-16 实拍：外层 data-theme=dark，内页 body 仍是 rgb(246,247,249)）。 */
+  ':root{',
+  '  --p-bg:#f4f6f8;--p-card:#fff;--p-line:#e3e6ea;--p-line2:#eef1f4;--p-track:#e9edf1;',
+  '  --p-t1:#1a1c1f;--p-t2:#5c6167;--p-t3:#6b7078;',
+  '  --p-blue:#0b6ea8;--p-blue-ink:#fff;',
+  /* --p-ok 从 #2f7d32 压到 #2a6f2d：前者压在 --p-ok-soft 徽章底上只有 4.27:1，
+     12px 徽章字要 4.5:1（实测 2026-10-16） */
+  '  --p-ok:#2a6f2d;--p-wait:#8a6100;--p-no:#b3261e;',
+  '  --p-ok-soft:#eaf5ea;--p-wait-soft:#fdf3df;--p-no-soft:#fdeceb;',
+  '  --p-shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.05);',
+  '}',
+  '[data-theme="dark"]{',
+  '  --p-bg:#16181d;--p-card:#1e2026;--p-line:#2e3138;--p-line2:#282b31;--p-track:#2b2e35;',
+  '  --p-t1:#e8eaed;--p-t2:#a8adb5;--p-t3:#8b9099;',
+  '  --p-blue:#6cb8e0;--p-blue-ink:#10222e;',
+  '  --p-ok:#4cc38a;--p-wait:#e0a94a;--p-no:#f07f75;',
+  '  --p-ok-soft:#16301f;--p-wait-soft:#33290f;--p-no-soft:#3a1f1d;',
+  '  --p-shadow:none;',
+  '}',
+  '*{box-sizing:border-box}',
+  /* 底部留 30px：原来 28px 均分 + 内容比 iframe 高，最后一行紧贴切口被切一半 */
+  'body{font:14px/1.65 system-ui,"Microsoft YaHei",sans-serif;background:var(--p-bg);color:var(--p-t1);margin:0;padding:22px 22px 30px}',
+  '.card{max-width:900px;margin:0 auto;background:var(--p-card);border:1px solid var(--p-line);border-radius:12px;padding:18px 22px 22px;box-shadow:var(--p-shadow)}',
+  '.hd{display:flex;align-items:center;gap:10px;margin-bottom:6px}',
+  'h1{font-size:16px;font-weight:600;margin:0;letter-spacing:.2px}',
+  '.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;line-height:18px;background:var(--p-line2);color:var(--p-t2)}',
+  '.badge.on{background:var(--p-ok-soft);color:var(--p-ok)}',
+  '.badge.fired{background:var(--p-no-soft);color:var(--p-no)}',
+  '#persist{font-size:13px;margin:0}',
+  '#l2{font-size:12.5px;color:var(--p-t3);margin:2px 0 0}',
+  '#cd{font-variant-numeric:tabular-nums;font-size:20px;font-weight:600;margin:10px 0 0;color:var(--p-t1)}',
+  '.bar{height:8px;background:var(--p-track);border-radius:999px;overflow:hidden;margin:12px 0 6px}',
+  '#bar{display:block;height:100%;width:0;background:var(--p-blue);transition:width .3s}',
+  '.pctrow{display:flex;justify-content:space-between;gap:12px;color:var(--p-t3);font-size:12.5px;font-variant-numeric:tabular-nums}',
+  'h2{font-size:12.5px;font-weight:600;color:var(--p-t2);margin:18px 0 2px;letter-spacing:.3px}',
+  '.gate{display:flex;gap:9px;align-items:baseline;padding:4px 0;font-size:13px;border-top:1px solid var(--p-line2)}',
+  '.gate:first-child{border-top:0}',
+  '.gate .gi{width:16px;flex:0 0 16px;font-size:12px;line-height:1.55}',
   '.gate .gl{flex:0 0 auto}',
-  '.gate.ok .gl{color:#2f7d32}',
-  '.gate.no .gl{color:#b3261e}',
-  '.gate .gd{color:#888;font-size:12.5px}',
-  '#msg{min-height:1.6em;color:#c0392b;font-size:13px}',
-  '</style></head><body><div class="card">',
-  '<h1>跑完自动关机 <span class="badge" id="badge">读取中…</span></h1>',
-  '<div class="row" id="l1">正在读取状态…</div>',
-  '<div class="bar"><div id="bar"></div></div>',
-  '<div class="pctrow"><span id="pctL">冷静期进度</span><span id="pctR">—</span></div>',
-  '<div id="cd">—</div>',
-  '<div class="row" id="l2" style="color:#888;font-size:12.5px"></div>',
-  '<div class="row" style="margin-top:10px"><b style="font-size:13px">六条条件（逐条实时状态）</b></div>',
+  '.gate .gd{color:var(--p-t3);font-size:12.5px}',
+  '.gate.ok .gl{color:var(--p-ok)}',
+  '.gate.wait .gl{color:var(--p-wait)}',
+  '.gate.no .gl{color:var(--p-no)}',
+  '.actions{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 0}',
+  'button{font:13px/1 system-ui,"Microsoft YaHei",sans-serif;height:32px;padding:0 14px;border:1px solid var(--p-line);background:var(--p-card);color:var(--p-t1);border-radius:8px;cursor:pointer;transition:background .15s,border-color .15s}',
+  'button:hover{background:var(--p-line2)}',
+  'button.primary{background:var(--p-blue);border-color:var(--p-blue);color:var(--p-blue-ink);font-weight:500}',
+  'button.primary:hover{filter:brightness(1.06)}',
+  'button:focus-visible,input:focus-visible{outline:2px solid var(--p-blue);outline-offset:2px}',
+  '.sect{margin-top:18px;padding-top:14px;border-top:1px solid var(--p-line2)}',
+  '.params{display:flex;gap:14px;align-items:center;flex-wrap:wrap;font-size:13px;color:var(--p-t2)}',
+  '.params label{display:inline-flex;align-items:center;gap:6px}',
+  'input{font:13px system-ui;height:30px;padding:0 8px;border:1px solid var(--p-line);border-radius:7px;background:var(--p-card);color:var(--p-t1);font-variant-numeric:tabular-nums}',
+  '.note{font-size:12.5px;color:var(--p-t3);margin-top:8px}',
+  '#msg{min-height:1.5em;font-size:13px;margin-top:10px}',
+  '#hint{color:var(--p-t3);font-size:12.5px;margin:6px 0 0}',
+  '@media (prefers-reduced-motion:reduce){*{transition:none!important}}',
+  '</style>',
+  /* 主题引导：必须赶在首屏渲染前执行，否则深色下会先闪一块白板。
+     同源 iframe 能直接读主界面的 localStorage（键与 web/src/00-shell-head.html 一致）；
+     主界面中途切换会触发同源文档的 storage 事件，这里顺带跟上，无需父页面配合。 */
+  '<script>',
+  '(function(){var t="";',
+  ' try{t=localStorage.getItem("liveauto.theme")||""}catch(e){}',
+  ' if(t!=="dark"&&t!=="light"){t=(window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light"}',
+  ' document.documentElement.setAttribute("data-theme",t);',
+  ' window.addEventListener("storage",function(e){',
+  '   if(e&&e.key==="liveauto.theme")document.documentElement.setAttribute("data-theme",e.newValue||"light");',
+  ' });',
+  '})();',
+  '</script>',
+  '</head><body><div class="card">',
+  '<div class="hd"><h1>跑完自动关机</h1><span class="badge" id="badge">读取中…</span></div>',
+  /* 状态只说一遍：原来 badge / #l1 / #cd / #persist 说了四遍「已关闭」，
+     而且最大的字号给了信息量最低的那句。#persist 留下（它讲"会发生什么"），#l1 删掉。 */
+  '<div id="persist"></div>',
+  '<div id="l2">正在读取状态…</div>',
+  /* #cd 只承载"还差多久"这类真正需要大字的东西；关闭态下 JS 会把它藏起来 */
+  '<div id="cd"></div>',
+  /* 关闭态下这条空进度槽 + "—" 占 40px 却零信息，JS 会把 #prog 整块收起 */
+  '<div id="prog">',
+  '  <div class="bar"><span id="bar"></span></div>',
+  '  <div class="pctrow"><span id="pctL">冷静期进度</span><span id="pctR">—</span></div>',
+  '</div>',
+  /* 计数由 JS 按 gates.length 写 —— 原来写死"六条条件"，而服务端实际发 7 条（开关 + 6 项） */
+  '<h2 id="gateTitle">条件检查</h2>',
   '<div id="gates"></div>',
-  '<div class="row"><button id="on">打开（本次运行）</button><button id="off">关闭</button><button id="cancel">取消关机</button></div>',
-  '<div class="row" id="persist" style="font-size:13px"></div>',
-  '<div class="row" style="margin-top:10px;padding-top:10px;border-top:1px solid #eef1f4">',
-  '  允许关机时段 <input id="wf" size="5" placeholder="22:00"> – <input id="wt" size="5" placeholder="08:00">',
-  '  &nbsp;冷静期 <input id="mi" size="3" type="number" min="0" max="720"> 分',
-  '  &nbsp;倒计时 <input id="gs" size="4" type="number" min="0" max="3600"> 秒',
-  '  &nbsp;<button id="save">保存</button> <span id="saver" style="font-size:12.5px"></span>',
+  '<div class="actions"><button id="on" class="primary">打开（本次运行）</button><button id="off">关闭</button><button id="cancel">取消关机</button></div>',
+  '<div class="sect">',
+  '  <div class="params">',
+  '    <label>允许关机时段 <input id="wf" size="5" placeholder="22:00">–<input id="wt" size="5" placeholder="08:00"></label>',
+  '    <label>冷静期 <input id="mi" size="3" type="number" min="0" max="720">分</label>',
+  '    <label>倒计时 <input id="gs" size="4" type="number" min="0" max="3600">秒</label>',
+  '    <button id="save">保存</button><span id="saver" style="font-size:12.5px"></span>',
+  '  </div>',
+  '  <div class="note">时段留空 = 不限时段；长期开关与这三项也可直接改 config.json → runtime.shutdownWhenIdle（改完热加载，重启仍生效）。</div>',
   '</div>',
   '<div id="msg"></div>',
-  '<div id="hint">开关打开且<b>六条条件全部满足</b>（没有在录的场次、流水线空闲、没有转写在跑、biliLive-tools 队列为空、在允许时段内、空闲满冷静期）才会关机；倒计时期间点「取消关机」可撤销。时段/冷静期/倒计时/长期开关见 config.json → runtime.shutdownWhenIdle（改完热加载）。</div>',
+  '<div id="hint">只有在<b>全部条件满足</b>且空闲满冷静期之后才会关机；倒计时期间点「取消关机」可撤销。</div>',
   '</div><script>',
   'var BOOT={csrf:""};',
   'function $(s){return document.querySelector(s)}',
   'function set(id,v){var e=$(id);if(e&&e.textContent!==v)e.textContent=v}',
+  'function show(sel,on){var e=$(sel);if(e)e.style.display=on?"":"none"}',
   'async function api(path,opts){opts=opts||{};var r=await fetch(path,{method:opts.method||"GET",headers:{"Content-Type":"application/json","X-CSRF-Token":BOOT.csrf},body:opts.body?JSON.stringify(opts.body):undefined});var t=await r.text();var d={};try{d=t?JSON.parse(t):{}}catch(e){d={error:t}}if(!r.ok)throw new Error(d.error||("HTTP "+r.status));return d}',
   'var last=null,at=0;',
   'function fmt(s){s=Math.max(0,Math.floor(s));var m=Math.floor(s/60),x=s%60;return (m<10?"0":"")+m+":"+(x<10?"0":"")+x}',
@@ -92,26 +154,29 @@ const SHUTDOWN_PAGE = [
   '  var idle=(Number(last.idleForSec)||0)+(Date.now()-at)/1000;',
   '  var pct=Math.max(0,Math.min(100,Math.round(idle/need*100)));',
   '  var bar=$("#bar");bar.style.width=(last.enabled?pct:0)+"%";',
-  '  bar.style.background=last.firedAt?"#c0392b":(pct>=100?"#2fa84f":"#1a86c7");',
+  '  bar.style.background=last.firedAt?"var(--p-no)":(pct>=100?"var(--p-ok)":"var(--p-blue)");',
   '  var pl=$("#pctL"),pr=$("#pctR");',
-  '  if(pl)pl.textContent=last.enabled?"冷静期进度":"开关已关闭";',
-  '  if(pr)pr.textContent=last.enabled?(pct+"% · "+fmt(idle)+" / "+fmt(need)):"—";',
-  '  var b=$("#badge");',
-  '  if(!last.enabled){b.className="badge";set("#badge","已关闭");set("#cd","开关已关闭 —— 不会自动关机");return}',
+  '  if(pl)pl.textContent="冷静期进度";',
+  '  if(pr)pr.textContent=pct+"% · "+fmt(idle)+" / "+fmt(need);',
+  '  var b=$("#badge");var on=!!last.enabled;',
+  /* 关着的时候，进度槽与那句大字都是零信息（空条 + 重复"已关闭"）→ 整块收起 */
+  '  show("#prog",on);show("#cd",on);',
+  '  if(!on){b.className="badge";set("#badge","已关闭");set("#cd","");return}',
   '  if(last.firedAt){b.className="badge fired";set("#badge","已下发关机");set("#cd","已下发关机命令（"+new Date(last.firedAt).toLocaleTimeString("zh-CN",{hour12:false})+"）—— 点「取消关机」可撤销");return}',
   '  b.className="badge on";set("#badge","已打开");',
   '  if(idle>=need)set("#cd","冷静期已满（"+fmt(idle)+" / "+fmt(need)+"）—— 正在检查其余条件…");',
-  '  else set("#cd","等待条件满足："+fmt(idle)+" / "+fmt(need)+"（还差 "+fmt(need-idle)+" 关机）");',
+  /* 只给"还差多久"—— 具体进度下一行已经有了（原来这里又把 05:07 / 10:00 报了一遍） */
+  '  else set("#cd","等待条件满足：还差 "+fmt(need-idle));',
   '}',
   'function paint(s){last=s;at=Date.now();',
-  '  var p=s.policy||{};',
-  '  set("#l1",(s.enabled?"✅ 已打开 —— 条件满足就会关机":"⏸ 已关闭 —— 不会自动关机")+(s.dryRun?"（dry-run：只记日志不真关）":""));',
-  /* 参数只在底部提示里出现一次（原来"上次判定"那行又重复了一遍时段/冷静期/倒计时 —— 信息重复反而看不清） */
-  '  set("#l2","上次判定："+(s.lastReason||"—"));',
+  /* 原 #l1（"⏸ 已关闭 —— 不会自动关机"）与 badge、#cd、#persist 说的是同一件事，删掉；
+     dry-run 提示移到"上次判定"这行，不再单独占一行。 */
+  '  set("#l2","上次判定："+(s.lastReason||"—")+(s.dryRun?"（dry-run：只记日志不真关）":""));',
   '  paintGates(s);',
   '  paintPersist(s);',
   '  fillPolicy(s);',
   '  live();',
+  '  reportH();',
   '}',
   /* 常驻说明（2026-10-14 用户：「我希望打开时绿字可以一直显示」）：
      由**状态**生成、不由动作回执生成 —— 所以它永远不会过期，轮询也清不掉它。
@@ -119,24 +184,34 @@ const SHUTDOWN_PAGE = [
   'function paintPersist(s){',
   '  var el=$("#persist");if(!el)return;',
   '  var p=s.policy||{};var win=(p.windowFrom||p.windowTo)?((p.windowFrom||"不限")+"–"+(p.windowTo||"不限")):"不限时段";',
-  '  if(s.firedAt){el.style.color="#c0392b";set("#persist","已下发关机命令（"+new Date(s.firedAt).toLocaleTimeString("zh-CN",{hour12:false})+"）—— 点「取消关机」可撤销");return}',
-  '  if(s.enabled){el.style.color="#2f7d32";set("#persist","已打开（仅本次运行生效）：六条条件都满足且空闲满 "+(p.minIdleMinutes==null?"—":p.minIdleMinutes)+" 分钟后关机（时段 "+win+"）"+(s.dryRun?"；当前 dry-run，只会写日志不会真关":""));return}',
-  '  el.style.color="#888";set("#persist","已关闭：不会自动关机。点「打开」（仅本次运行）或改 config.json 的 runtime.shutdownWhenIdle.enabled（重启后仍生效）");',
+  '  if(s.firedAt){el.style.color="var(--p-no)";set("#persist","已下发关机命令（"+new Date(s.firedAt).toLocaleTimeString("zh-CN",{hour12:false})+"）—— 点「取消关机」可撤销");return}',
+  '  if(s.enabled){el.style.color="var(--p-ok)";set("#persist","已打开（仅本次运行生效）：全部条件满足且空闲满 "+(p.minIdleMinutes==null?"—":p.minIdleMinutes)+" 分钟后关机（时段 "+win+"）"+(s.dryRun?"；当前 dry-run，只会写日志不会真关":""));return}',
+  '  el.style.color="var(--p-t3)";set("#persist","已关闭：不会自动关机。点「打开」（仅本次运行）或改 config.json 的 runtime.shutdownWhenIdle.enabled（重启后仍生效）");',
   '}',
-  /* 六条条件的可视化：✅/⛔ + 当前值。行结构按 key 建一次，之后只改文本与类名（不重建 DOM → 不抖）。 */
+  /* 条件可视化：**三态**而不是两态 —— 原来所有"未满足"一律红色，把"等你动手"（开关没开）
+     和"等它自己满足"（还在录 / 冷静期没到）混成一类，整屏看着像一片报错。
+     红只留给需要用户处理的，等待类用琥珀；图标形状本身也区分（✅/⏳/⛔），不只靠颜色。
+     行结构按条数建一次，之后只改文本与类名（不重建 DOM → 不抖）。 */
+  'var GATE_ACTS={"enabled":1};',
   'function paintGates(s){',
   '  var box=$("#gates");if(!box)return;var gs=s.gates||[];',
+  '  set("#gateTitle","条件检查（"+gs.length+" 项，逐条实时）");',
   '  if(box.childElementCount!==gs.length){',
-  '    box.innerHTML=gs.map(function(g){return \'<div class="gate" data-k="\'+g.key+\'"><span class="gi"></span><span class="gl"></span><span class="gd"></span></div>\'}).join("");',
+  '    box.innerHTML=gs.map(function(){return \'<div class="gate"><span class="gi"></span><span class="gl"></span><span class="gd"></span></div>\'}).join("");',
   '  }',
   '  gs.forEach(function(g,i){',
   '    var row=box.children[i];if(!row)return;',
   '    var i2=row.querySelector(".gi"),l=row.querySelector(".gl"),d=row.querySelector(".gd");',
-  '    var icon=g.ok?"✅":"⛔";if(i2.textContent!==icon)i2.textContent=icon;',
+  '    var st=g.ok?"ok":(GATE_ACTS[g.key]?"no":"wait");',
+  '    var icon=st==="ok"?"✅":(st==="no"?"⛔":"⏳");',
+  '    if(i2.textContent!==icon)i2.textContent=icon;',
   '    if(l.textContent!==g.label)l.textContent=g.label;',
-  '    var det=g.ok?"（已满足）"+(g.detail?" · "+g.detail:""):(g.detail?"（"+g.detail+"）":"");',
+  /* 行本身只给"当前值"：✅/⏳/⛔ 的形状已经说明了状态，
+     再给每行都挂一句"已满足 ·"只是让七行一起变吵。只有状态需要解释时才补一句。 */
+  '    var det=g.detail||(st==="no"?"需要处理":"");',
   '    if(d.textContent!==det)d.textContent=det;',
-  '    var cls="gate"+(g.ok?" ok":" no");if(row.className!==cls)row.className=cls;',
+  '    var cls="gate "+st;if(row.className!==cls)row.className=cls;',
+  '    if(i2.title!==det)i2.title=det;',
   '  });',
   '}',
   /* 轮询**不清空** #msg：那是动作回执（点了什么、结果如何），清掉会让人以为没生效；
@@ -166,6 +241,23 @@ const SHUTDOWN_PAGE = [
   'document.getElementById("save").onclick=savePolicy;',
   'setInterval(poll,5000);',
   'setInterval(live,1000);',
+  /* 高度自适应：父页面按这条消息设 iframe 高度。
+     原来 iframe 写死 620px、内容实测 792px —— 底部"时段/冷静期/倒计时/保存"整行被切在切口外
+     （2026-10-16 用户截图正是这一行被切一半）。
+     取 body 的**自身高度**（body 没有被拉伸，height 由内容决定）：
+     body.scrollHeight 在内容比视口矮时会返回视口高度 → iframe 只涨不缩。 */
+  'function reportH(){',
+  '  try{',
+  '    if(parent===window)return;',
+  '    var b=document.body;if(!b)return;',
+  '    var h=Math.ceil(b.getBoundingClientRect().height);',
+  '    if(!h)h=Math.ceil(Math.max(b.scrollHeight,b.offsetHeight));',
+  '    parent.postMessage({source:"shutdown-page",type:"height",h:h},location.origin);',
+  '  }catch(e){}',
+  '}',
+  'if(window.ResizeObserver){try{new ResizeObserver(reportH).observe(document.body)}catch(e){}}',
+  'window.addEventListener("resize",reportH);',
+  'window.addEventListener("load",reportH);',
   '</script></body></html>',
 ].join('\n');
 import { isFixtureTask, splitFixtures } from './fixtures.ts';
@@ -173,6 +265,8 @@ import { findDuplicateTitles, readBatches, readRecentDuplicateParts } from './pu
 import type { ClipRecord, Stage, TaskRecord } from './types.ts';
 import { loadErrorReport, loadErrorReportOrEvent, readErrorEvents, renderErrorTimeline, listErrorReports, clearErrorEvents } from './errors.ts';
 import { resolveCover, validateDtime, describeDtimePlan, parseUserDtime } from './publish.ts';
+import { DTIME_MIN_MARGIN_SEC } from './config.ts';
+import { describeScheduleOverride, resolveClipPublishSchedule } from './config.ts';
 import { sanitizeTitle, sanitizeDesc, sanitizeTags, mapCategoryToTid, transcriptPreview } from './analyze.ts';
 import { PromptStore } from './analyze.ts';
 import { judgeDeletability } from './cleanup.ts';
@@ -186,9 +280,14 @@ import { buildMcpTools, checkMcpToken, generateMcpToken, handleMcpMessage, type 
 import { PREVIEW_DIR, cleanupPreviews, makePreviewClip, previewFileName } from './preview.ts';
 import { openInSystemPlayer } from './player.ts';
 import {ROOT_DIR, exists, fileSize, fmtBytes, fmtDuration, fmtLocal, nowIso, readJson, LOGS_DIR} from './util.ts';
+/* 热更新状态文件由监督进程写、这里只读（详见 src/hot-watch.ts 文件头） */
+import { isStateAlive, readState as readHotWatchState, stateFilePath } from './hot-watch.ts';
 
-/* 运行观测页用：上一次扫描到的文件大小，用来判断"文件还在不在长"（进程内、无需落盘） */
-const observeSizeCache = new Map<string, { bytes: number; at: number }>();
+/* ★ 2026-10-24：「有没有在录」的判据统一到 src/recording-signals.ts。
+   原先观测页与监控页各写一份扫描/新鲜度逻辑，而自动关机那边干脆只认 watcher 的 mp4 候选项
+   ⇒ 直播正在写 .ts 时自动关机页显示「0 场」（本次 Bug）。现在三处同一个函数、同一个常量，
+   采样缓存（"体积有没有变大"的基准）也跟着共用，于是两个页面的数字不可能再互相矛盾。 */
+import { pickLiveSegments, scanRecordingFiles, sessionKeyOf, summarizeRecorders } from './recording-signals.ts';
 import { log as globalLog } from './logger.ts';
 
 /* ============================================================================
@@ -395,6 +494,49 @@ export class UiServer {
   private monitorCache?: { at: number; data: Record<string, unknown> };  private static readonly MONITOR_CACHE_MS = 1200;
 
   /**
+   * `/api/observe` 的短缓存（P4）。
+   *
+   * 这一页要**读盘**：遍历录制目录（readdir + 逐文件 stat）、读每个 `.pre-transcribe.json`、
+   * 对每个分段 existsSync；而前端在「运行观测」页签上每 5 秒打一次。
+   * TTL 取 4.5 秒（略小于轮询周期）⇒ 同一轮询周期内的重复请求（多标签页、来回切页签、
+   * 手动刷新与定时刷新叠加）不再各自扫一遍盘，而界面新鲜度与轮询周期保持一致。
+   */
+  private observeCache?: { at: number; data: Record<string, unknown> };
+  private static readonly OBSERVE_CACHE_MS = 4500;
+
+  /**
+   * 任务详情里"大文件"的解析缓存（P7）。
+   *
+   * `/api/task/:id` 在「任务」页签可见时每 8 秒刷一次（`46-启动.js`），而详情要读
+   * summary.md / signals.json / transcript.json —— 长录播的转写文件可达数 MB，每 8 秒
+   * 重新整读 + parse 一遍纯属浪费。这三个文件一旦生成就不再变，按 (路径 + mtime + size) 缓存
+   * 几乎必命中；缓存的是**派生结果**（如转写只留 60 段预览），所以条目本身很小。
+   */
+  private detailFileCache = new Map<string, unknown>();
+  private static readonly DETAIL_CACHE_MAX = 8;
+
+  /** 读一次任务详情用的大文件并缓存派生结果；文件不存在 / 读失败一律返回 undefined（详情缺一块不报错） */
+  private cachedDetailFile<T>(p: string, parse: (p: string) => T): T | undefined {
+    let key: string;
+    try {
+      const st = fs.statSync(p);
+      key = `${p}|${st.mtimeMs}|${st.size}`;
+    } catch {
+      return undefined;
+    }
+    if (this.detailFileCache.has(key)) return this.detailFileCache.get(key) as T;
+    let v: T;
+    try {
+      v = parse(p);
+    } catch {
+      return undefined;
+    }
+    if (this.detailFileCache.size >= UiServer.DETAIL_CACHE_MAX) this.detailFileCache.clear();
+    this.detailFileCache.set(key, v);
+    return v;
+  }
+
+  /**
    * 任何**改动状态**的操作之后都要让监控面板的短缓存失效。
    *
    * 为什么必须显式做：面板是 5 秒轮询 + 1.2 秒缓存，用户点完「立即删除」如果立刻刷新，
@@ -403,6 +545,7 @@ export class UiServer {
    */
   private invalidateMonitor(): void {
     this.monitorCache = undefined;
+    this.observeCache = undefined;
     this.llcQueueCache = undefined;
     this.archivesCache = undefined;
   }
@@ -941,6 +1084,21 @@ export class UiServer {
       this.sendJson(res, 200, {
         csrf: this.csrfToken,
         version: APP_VERSION,
+        /* 构建指纹（2026-10-25）：`id` = 本进程正在跑的代码摘要，`diskId` = 磁盘上现在的，
+           `stale` = 两者不同 ⇒ 代码改了但没重启。顶栏徽章吃这个。
+           背景：配额限流那次修复已落盘、测试全绿，但进程没重启，用户点重投仍被旧逻辑撞死，
+           只能靠人翻进程启动时间才能发现 —— 现在一眼可见。 */
+        build: (() => {
+          const b = this.orch.buildInfo.status();
+          return { id: b.running.id, at: b.running.latestMtimeMs, stale: b.stale, diskId: b.disk.id, note: b.note };
+        })(),
+        /* 本进程 pid。
+           为什么暴露：热更新监督进程（src/hot-watch.ts）重载后要确认"应答这个端口的
+           就是我刚拉起的那个子进程"。只看 200 不够 —— 端口被别的进程（典型：上次遗留的
+           孤儿服务）占着时，新子进程会 bind 失败但仍存活（cli.ts 里 Web UI 启动失败只记
+           日志、继续跑），探测会拿到孤儿的 200 而误判"就绪"，于是新代码永不生效。
+           纯本地只读信息，无敏感性。 */
+        pid: process.pid,
         config: orch.store.safeSnapshot(),
         /* 配置内容版本号：界面保存时原样回传，服务端据此判断「表单是否已过期」。
            没有它，界面会拿旧快照静默覆盖外部刚改过的配置（实测丢过 llm.select.model）。 */
@@ -988,8 +1146,11 @@ export class UiServer {
         coveredStreamers: this.countCoveredStreamers(),
         platform: cfg.room.platform,
         seasonConfigured: cfg.publish.seasonId > 0,
-        // 排期预览：让界面能直接回答「首片什么时候发、最后一片什么时候发、
-        // 我指定的时间有没有被推迟」——这些不该让用户自己算。
+        /* 排期预览：让界面能直接回答「首片什么时候发、最后一片什么时候发、
+           我指定的时间有没有被推迟」——这些不该让用户自己算。
+           ★ 2026-10-16 加、2026-10-17 更正口径：`cfg.publish` 一并带进去，让预览按**生效口径**算 ——
+           「单独投稿」固定定时投稿，片间隔 / 抖动按设置里的值生效（间隔 300 秒保底、
+           抖动必须小于间隔）。 */
         dtimePlan: (() => {
           const plan = describeDtimePlan(Date.now(), cfg.publish, Math.max(1, cfg.clip.maxCandidates));
           return {
@@ -1002,7 +1163,19 @@ export class UiServer {
             earliestAllowed: plan.earliestAllowed,
             earliestAllowedText: fmtLocal(plan.earliestAllowed * 1000),
             configured: cfg.publish.firstPublishAt,
+            scheduled: plan.scheduled,
+            gapSec: plan.gapSec,
           };
+        })(),
+        /* 切片排期的**实际生效**口径（唯一判定在 src/config.ts 的 resolveClipPublishSchedule）。
+           为什么要在 bootstrap 里下发：界面上「错峰 X」出现在四处（本场详情 / 右栏排期 /
+           设置弹窗 / 排期预览），若各自读 config.publish.clipGapSec，那么「单独投稿固定 5 分钟」
+           这个规则就得在界面再写一遍 —— 本仓库踩过"同一口径两端各写一份"的坑。
+           顺带把「确实不参与 / 被抬被夹」的键名与原因给出来（`describeScheduleOverride`），
+           界面可以如实提示「你改的那个键实际跑成了多少」——改了没完全生效比完全不生效更容易让人抓狂。 */
+        publishSchedule: (() => {
+          const s = resolveClipPublishSchedule(liveCfg.publish);
+          return { ...s, ignored: describeScheduleOverride(liveCfg.publish) };
         })(),
       });
       return;
@@ -1339,6 +1512,35 @@ export class UiServer {
         return;
       }
 
+      /* ★ includeSubmitted 的**完整**重投语义（2026-10-18 实测修复）：
+         「重新投稿这一片」的目标是「提交过但 B站 侧没出现」的片。此前只有 approve 校验层放行
+         （DONE_STATUSES 不含 SUBMITTED），但 publishStageInner 调 publishClips 时既不带 indices
+         也不带 includeSubmitted —— publishClips 按状态拾取（CANDIDATE/PENDING_UPLOAD/FAILED），
+         SUBMITTED 不在列表 ⇒ 「没有需要投稿的切片」，即使拾起也会被幂等 1（本地指纹命中，
+         上次 submit 时注册的）直接跳过恢复状态。三道门全堵死：按钮返回 ok、实际零投递。
+         修复：这些片在重投前**清幂等指纹（不立碑）+ 复位 CANDIDATE**（清稿件字段、保留产物），
+         publishClips 就能正常拾起并投出 —— 与「对账清除」同一套安全语义。
+         ⚠️ 前提不变：调用方（UI 的二次确认弹窗）已让用户核实过稿件确实不在 B站。 */
+      if (body.includeSubmitted) {
+        const target = new Set(body.indices ?? []);
+        for (const c of clips) {
+          if (!target.has(c.index)) continue;
+          /* CUTTING/CUT 也要复位（2026-10-18 实测）：重投途中服务重启会把 waitTask 轮询协程
+             带走，切片永远卡在 CUTTING —— 而 biliLive-tools 侧往往已经切完、产物就在盘上。
+             复位成 CANDIDATE（保留 cutOutput）后 publishClips 拾起，产物在 ⇒ 直接复用投稿。 */
+          if (['SUBMITTED', 'SUBMITTING', 'CUTTING', 'CUT'].includes(c.status)) {
+            orch.ledger.clearFingerprintsFor([{ taskId: id, clipIndex: c.index }]);
+            orch.ledger.setClipStatus(id, c.index, 'CANDIDATE', {}, {
+              unset: ['bvid', 'publishedAt', 'dtime', 'submitTime', 'uploadTaskId'] as Array<keyof ClipRecord>,
+            });
+            orch.logger.info(
+              `重投复位：片段 #${c.index}「${c.title}」此前提交的稿件在 B站 侧未出现（状态 ${c.status}）—— 已清指纹并回退待投，重新投稿`,
+              { taskId: id, mod: 'server', data: { clipIndex: c.index } },
+            );
+          }
+        }
+      }
+
       const result = await orch.publishStage(id, orch.logger, {
         ...(body.includeSubmitted ? { includeSubmitted: true } : {}),
       });
@@ -1364,6 +1566,9 @@ export class UiServer {
 
       const body = (await this.readBody(req)) as Partial<ClipRecord> & { select?: boolean };
       const patch: Partial<ClipRecord> = {};
+      /* 时间范围被改动时置 true：连同 `cutOutput` 一起 unset（旧产物对应旧区间，
+         复用逻辑会把旧内容的片子投出去 —— 见下方改区间分支的注释）。 */
+      let clearCutOutput = false;
       const warnings: string[] = [];
 
       if (body.title !== undefined) {
@@ -1412,6 +1617,10 @@ export class UiServer {
         if (clip.status === 'FAILED' || clip.status === 'CUT' || clip.status === 'CUTTING' || clip.status === 'SUBMITTED') {
           patch.status = 'PENDING_UPLOAD';
         }
+        // ★ 必须连 `cutOutput` 一起清（2026-10-17）：
+        //   cutAndUploadClip 现在会**复用**已有产物（产物在就不重切）；
+        //   旧产物对应的是**旧区间**，不清的话改完区间重投会把旧内容的片子投出去。
+        clearCutOutput = true;
       }
       if (body.category !== undefined) {
         const cat = mapCategoryToTid(String(body.category), cfg.publish.tidWhitelist, cfg.publish.defaultCategory);
@@ -1424,7 +1633,7 @@ export class UiServer {
       }
       /* 逐片排期时间（用户在看板/排期栏里手动指定发布时间）。
          `dtime` 传字符串（`YYYY-MM-DDTHH:mm`）或秒级时间戳；`clearDtime:true` 清空回到自动排期。
-         ⚠️ 硬约束 #4：dtime 必须 > 提交时刻 + 7200 秒 —— 这里就拦住，
+         ⚠️ 硬约束 #4：dtime 必须 ≥ 提交时刻 + `DTIME_MIN_MARGIN_SEC` 秒（1200）—— 这里就拦住，
          不能等到投稿那一刻才失败（那时切片已经切完、额度也可能已经算上）。 */
       const clearDtime = (body as { clearDtime?: boolean }).clearDtime === true;
       const rawDtime = (body as { dtime?: unknown }).dtime;
@@ -1445,7 +1654,7 @@ export class UiServer {
             this.sendJson(res, 400, {
               error: `定时发布时间不满足硬约束 #4：${v.note}`,
               dtime: parsed,
-              earliestAllowed: Math.floor(base / 1000) + 7201,
+              earliestAllowed: Math.floor(base / 1000) + DTIME_MIN_MARGIN_SEC,
             });
             return;
           }
@@ -1457,6 +1666,7 @@ export class UiServer {
       patch.edited = true;
       const updated = orch.ledger.setClipStatus(id, idx, patch.status ?? clip.status, patch, {
         ...(unsetDtime ? { unset: ['dtime'] as Array<keyof ClipRecord> } : {}),
+        ...(clearCutOutput ? { unset: ['dtime', 'cutOutput'] as Array<keyof ClipRecord> } : {}),
       });
 
       // 更新 decisions.jsonl 的最终值（用户编辑后的字段，§8 WP4 步骤 8）
@@ -1612,6 +1822,25 @@ export class UiServer {
       }
       // 重跑前清错误态；从转写阶段之前重跑会复用缓存，不会重复付费
       orch.ledger.clearError(id);
+      /* 「重新切片与投稿」（fromStage=CLIPPED）的收口（2026-10-17 用户明确口径，当晚第二次迭代）：
+         **先把全部勾选候选重置到初始状态，再让流程自己去同步切片状态。**
+         具体机制：把所有非 CANDIDATE 的勾选候选复位成 CANDIDATE（bvid/fingerprint/dtime/cutOutput
+         全部保留），随后 publishClips 会把每一片重新过一遍三道幂等闸门：
+           ① 本地指纹命中 ⇒ 直接恢复 PUBLISHED/SUBMITTED（已投过的片**不会重投**，秒回）；
+           ② B站侧按标题反查命中 ⇒ 补记 PUBLISHED + bvid（指纹表丢失时的兜底）；
+           ③ 都没命中 ⇒ 这才是真漏的片：产物在就复用产物直接投，产物缺失就重切再投。
+         所以「已发布」在这个流程里不是终态保护，而是**可被重算的事实** —— 状态最终由
+         B站侧的真实情况决定，台账不再可能出现"本地说已发布、B站上没有"的漂移。
+         复位会触发一条「非法迁移」warn（PUBLISHED→CANDIDATE）：那是状态机对常规迁移的
+         例行提醒，这里是刻意的强制重置，属预期行为。 */
+      if (fromStage === 'CLIPPED') {
+        for (const c of orch.ledger.getClips(id)) {
+          if (!c.selected) continue;
+          if (c.status !== 'CANDIDATE') {
+            orch.ledger.setClipStatus(id, c.index, 'CANDIDATE');
+          }
+        }
+      }
       orch.ledger.setStatus(id, 'PENDING', { stage: fromStage });
       void orch.enqueue(id, fromStage);
       this.sendJson(res, 200, {
@@ -1620,7 +1849,9 @@ export class UiServer {
         note:
           fromStage === 'RECORDED'
             ? '将从源素材校验开始重跑（转写会复用本地缓存，已花的 ASR 费用不会重复产生）'
-            : `将从 ${fromStage} 阶段重跑`,
+            : fromStage === 'CLIPPED'
+              ? '已把切片状态重置并开始同步：已投过的片会自动核对回来（不重复投稿），只有 B站 上确实没有的片才会补投'
+              : `将从 ${fromStage} 阶段重跑`,
       });
       return;
     }
@@ -1658,7 +1889,15 @@ export class UiServer {
     /* ---------------- GET /api/health ---------------- */
     if (p === '/api/health' && method === 'GET') {
       const health = await orch.health();
-      this.sendJson(res, 200, { health, errors: readErrorEvents({ limit: 20 }) });
+      /* 代码热更新状态（2026-10-24）：由监督进程 `src/hot-watch.ts` 写在
+         data/hot-watch-state.json。没启用热更新时该文件不存在 ⇒ `hot: null`，
+         面板据此显示「未启用」，而不是显示一堆空字段让人猜。
+         读失败也只是 null：它是附加信息，绝不能把 /api/health 打成 500。 */
+      const hotState = readHotWatchState(stateFilePath(ROOT_DIR));
+      /* `alive` 用心跳判定：监督进程被强杀时来不及把 enabled 改 false，
+         只看 enabled 会让面板骗人（显示"已开启"但改代码毫无反应）。 */
+      const hot = hotState ? { ...hotState, alive: isStateAlive(hotState) } : null;
+      this.sendJson(res, 200, { health, errors: readErrorEvents({ limit: 20 }), hot });
       return;
     }
 
@@ -2737,7 +2976,7 @@ export class UiServer {
       const asc = url.searchParams.get('asc') === '1';
       const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') ?? 200) || 200));
       /* 播放/点赞：取表现数据里每个 bvid 的最新一行（与「稿件表现」页同源） */
-      const perf = new Map<string, { view?: number; like?: number; date?: string }>();
+      const perf = new Map<string, { view?: number; like?: number; date?: string; gone?: boolean }>();
       for (const row of orch.ledger.readPerformance({ sinceMs: Date.now() - 400 * 86400_000 }) as Array<Record<string, unknown>>) {
         const bvid = typeof row['bvid'] === 'string' ? row['bvid'] : '';
         if (!bvid) continue;
@@ -2747,6 +2986,7 @@ export class UiServer {
           perf.set(bvid, {
             ...(typeof row['view'] === 'number' ? { view: row['view'] } : {}),
             ...(typeof row['like'] === 'number' ? { like: row['like'] } : {}),
+            ...(row['gone'] === true ? { gone: true } : {}),
             date,
           });
         }
@@ -2760,6 +3000,9 @@ export class UiServer {
             if (!hay.includes(q)) continue;
           }
           const p = c.bvid ? perf.get(c.bvid) : undefined;
+          /* 稿件已不存在：两个来源都认 —— 表现数据里的 gone 记录，或切片自己记着的
+             archiveGoneAt（markPerformanceGone 两个都写；容错历史数据只写一边的情况） */
+          const clipGone = Boolean(p?.gone) || Boolean(c.archiveGoneAt);
           rows.push({
             taskId: t.id,
             taskTitle: t.title,
@@ -2777,6 +3020,7 @@ export class UiServer {
             ...(c.cutOutput && exists(c.cutOutput) ? { hasCut: true } : {}),
             ...(typeof p?.view === 'number' ? { view: p.view } : {}),
             ...(typeof p?.like === 'number' ? { like: p.like } : {}),
+            ...(clipGone ? { gone: true } : {}),
             ...(c.blockedByTombstone ? { tombstone: true } : {}),
             ...(c.degraded ? { degraded: true } : {}),
             fixture: isFixtureTask(t),
@@ -2803,9 +3047,58 @@ export class UiServer {
           submitted: rows.filter((r) => r['status'] === 'SUBMITTED').length,
           candidate: rows.filter((r) => r['status'] === 'CANDIDATE').length,
           failed: rows.filter((r) => r['status'] === 'FAILED').length,
+          gone: rows.filter((r) => r['gone'] === true).length,
         },
         note: '同一份台账的拉平视图：只读，点「试看」用系统播放器打开切片产物；「去这一场」跳到任务详情。',
       });
+      return;
+    }
+
+    /* ---------------- 构建指纹（2026-10-25） ----------------
+     *   GET /api/build → { running, disk, stale, note }
+     * 用户要的是"修复到底更新到没有"：`stale===true` 就代表代码更新了但进程没重启。
+     * 与 /api/bootstrap 里的 build 字段同源，这里多给 `onDisk` 的完整信息。 */
+    if (p === '/api/build' && method === 'GET') {
+      this.sendJson(res, 200, this.orch.buildInfo.status());
+      return;
+    }
+
+    /* ---------------- 账号受限闸门（2026-10-22） ----------------
+     *   GET  /api/publish/quota-guard        现在是"账号受限、暂停投稿"吗
+     *   POST /api/publish/quota-guard/clear  用户确认 B站 恢复后手动解除
+     *
+     * 为什么要有：这个状态是**跨批次**的（24h 内累计 2 次配额拒绝 ⇒ 暂停到当天 24:00）。
+     * 没有接口的话，用户只能看到"点投稿没反应"，既不知道为什么，也没法提前放行。 */
+    if (p === '/api/publish/quota-guard' && method === 'GET') {
+      const pub = orch.publisher as unknown as { quotaGuardStatus?: () => unknown };
+      const status =
+        typeof pub.quotaGuardStatus === 'function'
+          ? pub.quotaGuardStatus()
+          : { blocked: false, rejections: 0, note: '当前 publisher 不支持账号受限检测' };
+      this.sendJson(res, 200, status);
+      return;
+    }
+    if (p === '/api/publish/quota-guard/clear' && method === 'POST') {
+      const body = (await this.readBody(req)) as { reason?: string };
+      const pub = orch.publisher as unknown as { clearQuotaBlock?: (r: string) => unknown };
+      if (typeof pub.clearQuotaBlock !== 'function') throw new Error('当前 publisher 不支持账号受限检测');
+      const status = pub.clearQuotaBlock(String(body.reason || 'manual'));
+      this.sendJson(res, 200, { ok: true, status });
+      return;
+    }
+
+    /* ---------------- POST /api/clips/library/refresh（切片库：去 B站 对账刷新） ----------------
+     * 2026-10-17 用户要求：「切片库 增加一个刷新按钮 刷新时去B站 按当前的切片库的稿件去对账 然后刷新状态」。
+     * 四步口径见 daemon.reconcileClipLibrary 的注释：① 确认待确认切片 → ② 按 bvid 核对稿件还在不在
+     * → ③ 拉最新统计 → ④ **清除**已不存在稿件的切片（回退待投 + 删指纹，2026-10-17 用户口径：
+     * 「不管定时的，只要看不到就清除」）。
+     * 只读 B站；本地写台账/表现数据，不触发投稿（清除只回退状态，投稿仍由用户显式发起）。
+     * 为什么不复用 /api/performance/refresh：那个回答的是"统计该更新了"（近 N 天候选、按天去重、
+     * 跳过 gone）；这里回答的是"切片库现在 vs B站 差多少"—— 范围是切片库**全部**带 bvid 的稿件，
+     * 且必须包含「确认待确认切片」这一步（表现回流不做落地确认）。 */
+    if (p === '/api/clips/library/refresh' && method === 'POST') {
+      const r = await orch.reconcileClipLibrary();
+      this.sendJson(res, 200, r);
       return;
     }
 
@@ -3328,6 +3621,8 @@ export class UiServer {
    * 2026-10-13 加，起因：验证「边录边转」时只能靠命令行 grep 日志，界面上一片空白。
    */
   private async observeView(): Promise<Record<string, unknown>> {
+    const cachedObs = this.observeCache;
+    if (cachedObs && Date.now() - cachedObs.at < UiServer.OBSERVE_CACHE_MS) return cachedObs.data;
     const orch = this.orch;
     const now = Date.now();
     /* 目录来源必须与「实时监控」页同源（orch.watcher.status()）——
@@ -3341,59 +3636,35 @@ export class UiServer {
       /* 拿不到目录就只报台账与日志，不报错 */
     }
 
-    /* 走两层的目录扫描：录制文件通常在 <根>/<主播名>/ 下，且 biliLive-tools 会切成 -PART0NN.ts */
-    const files: Array<{ path: string; name: string; sizeBytes: number; ageSec: number }> = [];
-    const walk = (dir: string, depth: number): void => {
-      if (depth > 2) return;
-      let entries: fs.Dirent[] = [];
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
-        return;
-      }
-      for (const e of entries) {
-        const full = path.join(dir, e.name);
-        if (e.isDirectory()) {
-          walk(full, depth + 1);
-          continue;
-        }
-        if (!/\.(ts|flv|mp4|mkv|json)$/i.test(e.name)) continue;
-        try {
-          const st = fs.statSync(full);
-          files.push({ path: full, name: e.name, sizeBytes: st.size, ageSec: Math.round((now - st.mtimeMs) / 1000) });
-        } catch {
-          /* 单个文件读不到就跳过 */
-        }
-      }
-    };
-    for (const d of dirs) walk(d, 0);
+    /* 走两层的目录扫描：录制文件通常在 <根>/<主播名>/ 下，且 biliLive-tools 会切成 -PART0NN.ts。
+       ⚠️ 扫描与"还在不在长"的判定都在 `src/recording-signals.ts`（与监控页、自动关机 gate 同源）。 */
+    const files = scanRecordingFiles(dirs, { now });
 
-    /* 录制中：最近 5 分钟还在写的**视频**文件；是否"在长"用上次采样的大小对比 */
-    const recording = files
-      .filter((f) => /\.(ts|flv|mp4|mkv)$/i.test(f.name) && f.ageSec < 300)
+    /* 录制中：最近 5 分钟还在写的**视频**文件；是否"在长"用上次采样的大小对比。
+       采样缓存在 recording-signals 里（进程内、无需落盘），三处调用共用同一份基准 —— 否则
+       观测页与自动关机各采各的，就会出现"这一页说在长、那一页说没在长"。 */
+    const recording = pickLiveSegments(files, { now })
       .sort((a, b) => b.sizeBytes - a.sizeBytes)
       .slice(0, 8)
-      .map((f) => {
-        const prev = observeSizeCache.get(f.path);
-        observeSizeCache.set(f.path, { bytes: f.sizeBytes, at: now });
-        /* 速率用两次采样的差值算（面板 5 秒一刷，足够看出"在长多快"）。
-           第一次采样没有基准 ⇒ 如实给 null，让界面显示"—"而不是编一个数。 */
-        const rateMBps = prev && prev.at && f.sizeBytes > prev.bytes ? (f.sizeBytes - prev.bytes) / 1048576 / ((now - prev.at) / 1000) : null;
-        return {
-          name: f.name,
-          sizeBytes: f.sizeBytes,
-          ageSec: f.ageSec,
-          rateMBps: rateMBps === null ? null : Math.round(rateMBps * 100) / 100,
-          growing: prev !== undefined ? f.sizeBytes > prev.bytes : f.ageSec < 90,
-        };
-      });
+      .map((s) => ({
+        name: s.name,
+        sizeBytes: s.sizeBytes,
+        ageSec: s.ageSec,
+        rateMBps: s.rateMBps,
+        growing: s.growing,
+      }));
 
     /* 边录边转：读**按场次**存储的 v2 状态（键 = 分段清单指纹）。
        ⚠️ v1 是"一个录像目录一份 done 索引"，同目录 18-25 场录像共用 ⇒ 新录像被误判"第 0 段已转"，
        界面上的"已完成 N/M 段 / 更新于"也必然对不上是哪一场（用户 2026-10-13 就是问这个："是最新的吗"）。
        v1 数据无法归属到具体场次 ⇒ 界面**不显示**（宁可显示空，也不给错的信息）。 */
     type StateV2 = { version?: number; recordings?: Record<string, { done?: number[]; updatedAt?: string; mode?: string; segments?: string[] }> };
-    const preTranscribe: Array<Record<string, unknown>> = [];
+    /** 去掉 `-PARTnn` 与扩展名（v1 兼容） */
+    const baseOf = (p: string): string => path.basename(String(p)).replace(/-PART\d+/i, '').replace(/\.[a-z0-9]+$/i, '');
+    /** 去掉开头的 `2026-10-15 19-56-14-501 ` 时间戳，取**标题** —— 同一场直播的各分段共享标题，
+        是"这一场到底有几个分段"唯一可靠的归并键（分段的时间戳各不相同，按文件名根本归不到一起）。 */
+    const titleOf = (p: string): string => baseOf(p).replace(/^\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}-\d{3} /, '');
+    const rawRows: Array<Record<string, unknown> & { base: string; title: string; dirPath: string; segCount: number }> = [];
     for (const f of files) {
       if (f.name !== '.pre-transcribe.json') continue;
       const dir = path.dirname(f.path);
@@ -3404,24 +3675,64 @@ export class UiServer {
         continue;
       }
       if (j.version !== 2 || !j.recordings) continue;
-      const stillWriting = files.some((x) => path.dirname(x.path) === dir && x.ageSec < 120 && /\.(ts|flv|mp4)$/i.test(x.name));
       for (const [key, rec] of Object.entries(j.recordings)) {
         const segs = rec.segments ?? [];
-        const base = (segs[0] ?? '').replace(/-PART\d+/i, '').replace(/\.[a-z0-9]+$/i, '');
+        const base = segs[0] ? baseOf(segs[0]) : path.basename(dir);
+        const title = segs[0] ? titleOf(segs[0]) : path.basename(dir);
         const ageSec = rec.updatedAt ? Math.max(0, Math.round((now - Date.parse(rec.updatedAt)) / 1000)) : f.ageSec;
-        preTranscribe.push({
+        /* ★ 2026-10-15 修复用户报的「文件对不上」，三处一起改：
+           ①「仍在写」原来按**整个目录**判（同目录下任意媒体文件 mtime<120s ⇒ 该目录**所有**行都标"仍在写"），
+             于是 47 小时前那场也被新录制连坐。改成只看**本场次自己最后一个分段**的 mtime。
+           ② 同一场直播会因"分段清单指纹"变化留下**多条**记录（1 段时一条、2 段时又一条），
+             面板全列出来 ⇒ 看起来像"同一场好几行、段数还是旧的"。这里按标题归并，只留分段最多的那条。
+           ③ 进度记录的段数是**历史快照**，不等于磁盘现有段数 ⇒ 把磁盘实际段数一起报出来，
+             界面写「进度 1/1 段 · 磁盘现有 4 段」，而不是拿旧数字假装是现在。 */
+        let stillWriting = false;
+        let diskSegs = segs.length;
+        try {
+          if (segs.length > 0) {
+            const last = segs[segs.length - 1]!;
+            stillWriting = (now - fs.statSync(last).mtimeMs) / 1000 < 120;
+          }
+          const mine = fs
+            .readdirSync(dir)
+            .filter((n) => /\.(ts|flv|mp4)$/i.test(n) && !/-弹幕版\.mp4$/i.test(n) && titleOf(n) === title);
+          if (mine.length > 0) diskSegs = Math.max(diskSegs, mine.length);
+        } catch {
+          /* 目录/文件读不到就按记录里的数字，不编造 */
+        }
+        /* 已导入的**磁盘证据**：同目录存在该分段的「-弹幕版.mp4」（压制产物）—— 比台账可靠，
+           因为默认清理策略会把任务记录删掉，而磁盘产物还在（这正是"明明导入过却显示没导入"的原因）。 */
+        const importedByDisk = (() => {
+          try {
+            return segs.some((p) => fs.existsSync(path.join(dir, `${baseOf(p)}-弹幕版.mp4`)));
+          } catch {
+            return false;
+          }
+        })();
+        rawRows.push({
           name: base || path.basename(dir),
+          title,
           dir: path.basename(dir),
+          dirPath: dir,
+          base,
+          segCount: segs.length,
           done: (rec.done ?? []).length,
           total: Math.max(segs.length, 1),
           parts: segs.length,
+          diskSegs,
+          importedByDisk,
           stillWriting,
           /* ★ 这一场是否**已经导入过**（2026-10-14 用户两次问「没在录了为什么还有进度」）：
              面板读的是录像目录里的**进度文件**，录制结束、任务也被策略清理之后它仍然在，
              于是那一栏会永远挂着"N 场有进度"。带上这个标记，界面才能把
              "还在录 / 已导入 / 历史" 分开说清楚，而不是让人以为还有活在跑。
              判据：台账里有没有以这些分段为源的任务（路径大小写不敏感）。 */
-          imported: (() => {
+          imported:
+            /* ★ 2026-10-15：磁盘证据优先 —— 默认清理策略会删掉任务记录，但压制产物「-弹幕版.mp4」还在，
+               只认台账会把"明明导入过"的场次标成没导入（用户报的「文件对不上」里就有这一条）。 */
+            importedByDisk ||
+            (() => {
             try {
               const want = new Set(segs.map((p) => String(p).toLowerCase()));
               if (want.size === 0) return false;
@@ -3443,6 +3754,32 @@ export class UiServer {
         });
       }
     }
+    /* ★ 2026-10-15 修复（二）：同一场直播会因为"分段清单指纹"变化留下**多条**进度记录
+       （1 段时一条、2 段时又一条），面板原样全列 ⇒ 看起来像"同一场好几行、段数还是旧的 1/1"。
+       这里按「录像目录 + 标题」归并，只把**分段最多**（并列取更新）的那条当当前进度，
+       其余标记 superseded；已有导入痕迹且不在写的行再标 historical（界面默认折叠）。 */
+    const bestRow = new Map<string, (typeof rawRows)[number]>();
+    const supersededKeys = new Set<string>();
+    for (const r of rawRows) {
+      const groupKey = `${r.dirPath}||${r.title}`;
+      const cur = bestRow.get(groupKey);
+      if (!cur) {
+        bestRow.set(groupKey, r);
+        continue;
+      }
+      const better = r.segCount > cur.segCount || (r.segCount === cur.segCount && Number(r['ageSec']) < Number(cur['ageSec']));
+      supersededKeys.add(String((better ? cur : r)['key']));
+      if (better) bestRow.set(groupKey, r);
+    }
+    const preTranscribe: Array<Record<string, unknown>> = rawRows.map((r) => {
+      const superseded = supersededKeys.has(String(r['key']));
+      return {
+        ...r,
+        superseded,
+        historical: superseded || (r['imported'] === true && r.stillWriting === false),
+      };
+    });
+
     /* 最近更新的排最前 —— 用户问"是最新的吗"，那就让最新的一眼在最上面 */
     preTranscribe.sort((a, b) => Number(a['ageSec']) - Number(b['ageSec']));
 
@@ -3551,7 +3888,7 @@ export class UiServer {
       uptimeSec: Math.round(process.uptime()),
     };
 
-    return {
+    const view = {
       generatedAt: new Date().toISOString(),
       watchDirs: dirs,
       recording,
@@ -3564,6 +3901,8 @@ export class UiServer {
       /** biliLive-tools 自报的录制状态（真信号；ok=false 表示这次没问到） */
       recorder,
     };
+    this.observeCache = { at: Date.now(), data: view };
+    return view;
   }
 
   /**
@@ -3581,20 +3920,10 @@ export class UiServer {
     error?: string;
   }> {
     try {
-      const list = await this.orch.client.recorderList();
-      const recorders = list.map((r) => ({
-        channelId: String(r.channelId ?? ''),
-        owner: String(r.remarks ?? r.liveInfo?.owner ?? ''),
-        living: r.liveInfo?.living === true,
-        state: String(r.state ?? ''),
-        lastRecordSec: typeof r.extra?.lastRecordTime === 'number' ? Math.max(0, Math.round((Date.now() - r.extra.lastRecordTime) / 1000)) : null,
-      }));
-      return {
-        ok: true,
-        recording: recorders.filter((x) => /recording/i.test(x.state)).length,
-        live: recorders.filter((x) => x.living).length,
-        recorders,
-      };
+      /* 解析统一在 `recording-signals.summarizeRecorders`：自动关机 gate 也用同一份，
+         两边各写一遍就会出现"这一页说 recording、那一页说 idle"。 */
+      const sum = summarizeRecorders(await this.orch.client.recorderList());
+      return { ok: sum.ok, recording: sum.recording, live: sum.living, recorders: sum.recorders };
     } catch (e) {
       return { ok: false, recording: 0, live: 0, recorders: [], error: (e as Error).message };
     }
@@ -3764,6 +4093,8 @@ export class UiServer {
      *      · `pendingFiles`：本场另有分段在写，而当前这一段已经进队列了。
      *    后者要如实说明"这段已导入、那些还在写"，否则用户会以为系统漏了文件。 */
     const recordingNow: Array<{ fileName: string; title: string; sizeMB: number; note: string }> = [];
+    /** 已经列出来的场次（归并键）—— 新增的"原始分段在写"要和它们去重，同一场只出现一次 */
+    const recordingNowKeys = new Set<string>();
     for (const o of outcomes) {
       const pending = Array.isArray(o['pendingFiles']) ? (o['pendingFiles'] as Array<{ fileName: string; sizeMB: number }>) : [];
       if (o['possiblyRecording'] === true) {
@@ -3773,6 +4104,7 @@ export class UiServer {
           sizeMB: Number(o['sizeMB'] ?? 0),
           note: typeof o['skipped'] === 'string' ? String(o['skipped']) : '仍在写入',
         });
+        if (typeof o['videoPath'] === 'string') recordingNowKeys.add(sessionKeyOf(String(o['videoPath'])));
         continue;
       }
       for (const p of pending) {
@@ -3788,7 +4120,36 @@ export class UiServer {
             o['taskId'] ? `（任务 ${String(o['taskId'])}）` : ''
           }，本段写稳后会自动进来`,
         });
+        if (typeof o['videoPath'] === 'string') recordingNowKeys.add(sessionKeyOf(String(o['videoPath'])));
       }
+    }
+    /* ★ 2026-10-24 修复（用户截图就是这一条）：上面两路只来自 watcher 的 **mp4 候选项**，
+       而 biliLive-tools 的分段录制写的是 `.ts`（`…-PART007.ts`）—— watcher 从不把它当候选，
+       于是这里永远是空的，而同一时刻运行观测页明明写着「正在录制的文件 1 个、0.76 MB/s、最后写入 0 秒前」。
+       两个页面自相矛盾，用户当然不信。
+       现在把「录制目录里还在长的原始分段」也列出来（与观测页、自动关机 gate **同一个函数**），
+       并把 note 说清是"原始分段仍在写入（正在录制）"。同一场（房间目录 + 开录时间戳）只列一次。 */
+    try {
+      /* 复用上面已经取到的 `watch`（别再调一次 watcher.status()：同一次请求里读两遍，
+         两遍之间目录刚好变的话会自相矛盾） */
+      const dirs = Array.isArray(watch['dirs']) ? (watch['dirs'] as string[]) : [];
+      for (const s of pickLiveSegments(scanRecordingFiles(dirs, { now }), { now })) {
+        if (!s.growing) continue; // 早已停写的历史 .ts 不算（否则"正在录制"永远挂着昨天的文件）
+        const key = sessionKeyOf(s.path);
+        if (recordingNowKeys.has(key)) continue; // 同一场已被 watcher 那一路列过
+        recordingNowKeys.add(key);
+        recordingNow.push({
+          fileName: s.name,
+          title: s.title,
+          sizeMB: Number((s.sizeBytes / 1024 ** 2).toFixed(1)),
+          note: s.product
+            ? '压制产物仍在写入（画面已烧弹幕 / 纯享版，属于压制而非录制）'
+            : `原始分段仍在写入（正在录制）${s.rateMBps === null ? '' : `，约 ${s.rateMBps} MB/s`}；` +
+              `最后写入 ${s.ageSec} 秒前${s.stamp ? `，开录于 ${s.stamp}` : ''}`,
+        });
+      }
+    } catch {
+      /* 目录扫不到不影响其它块：上面 watcher 那一路已经列了它知道的 */
     }
 
     /* ---- 4. 待删清单 ---- */
@@ -3860,6 +4221,12 @@ export class UiServer {
       now: nowIso(),
       uptimeSec: Math.round(process.uptime()),
       version: APP_VERSION,
+      /* 构建指纹（2026-10-25）：`id` = 正在跑的代码；`stale` = 磁盘已更新但没重启。
+         顶栏那颗"版本徽章"就吃这个 —— 用户不用再靠进程启动时间猜"修复有没有生效"。 */
+      build: (() => {
+        const b = this.orch.buildInfo.status();
+        return { id: b.running.id, at: b.running.latestMtimeMs, stale: b.stale, diskId: b.disk.id, note: b.note };
+      })(),
       roomId: cfg.room.roomId,
       platform: cfg.room.platform,
       mode: health?.mode ?? {
@@ -4155,24 +4522,12 @@ export class UiServer {
     const stages = this.stageStates(t);
 
     let summary: string | undefined;
-    if (t.summaryPath && exists(t.summaryPath)) {
-      summary = fs.readFileSync(t.summaryPath, 'utf8');
-    }
+    if (t.summaryPath) summary = this.cachedDetailFile(t.summaryPath, (p) => fs.readFileSync(p, 'utf8'));
     let signals: unknown;
-    if (t.signalsPath && exists(t.signalsPath)) {
-      try {
-        signals = readJson(t.signalsPath);
-      } catch {
-        /* ignore */
-      }
-    }
+    if (t.signalsPath) signals = this.cachedDetailFile(t.signalsPath, (p) => readJson(p));
     let transcriptPreviewOut: Array<{ time: string; text: string }> | undefined;
-    if (t.transcriptPath && exists(t.transcriptPath)) {
-      try {
-        transcriptPreviewOut = transcriptPreview(readJson(t.transcriptPath), 60);
-      } catch {
-        /* ignore */
-      }
+    if (t.transcriptPath) {
+      transcriptPreviewOut = this.cachedDetailFile(t.transcriptPath, (p) => transcriptPreview(readJson(p), 60));
     }
 
     const rawBytes = t.source.rawFiles.reduce((a, f) => a + fileSize(f), 0);
@@ -4452,18 +4807,55 @@ export class UiServer {
       const avg = items.length ? items.reduce((a, r) => a + Number(r['view'] ?? 0), 0) / items.length : 0;
       return { bucket: b.name, count: items.length, avgView: Math.round(avg) };
     });
+    /* ★ 2026-10-24 实测修复（用户报「为什么只能获取 2 个」）：这里原来是
+       `[...scored, ...未拉取的].slice(0, 100)`，而 `scored` 是**按播放降序**的 ——
+       等价于「截断掉播放最低的稿件」。当天新投的 8 个切片里只有播放 88/94/69 的三个进了前 100，
+       另外 5 个（14/7/18/13/19）连行都没有，前端再怎么按发布时间排序也变不出来；
+       更糟的是前端头部的「N 个在库稿件」是用**返回行数**算的 —— 271 个稿件被显示成 100 个，
+       计数口径跟着一起失真（用户看到的自相矛盾就是这么来的）。
+       教训：**列表接口不能按"热度"截断**。热度是动态量，新数据天生垫底，按热度截断
+       等于"永远只显示旧稿件"。现在默认返回全量（本机单机应用，几百行只有几十 KB，
+       前端本来就只渲染 20 条），只留一个足够大的安全上限；万一真触发上限，
+       截断顺序按**发布时间降序**（保最新的），并且响应里如实给 `truncated: true` + 真实 `archiveTotal`，
+       绝不静默。 */
+    const MAX_PERF_ROWS = 5000;
+    /* 已经拉到数据的按播放降序；还没拉到的（未拉取/不可用）排在后面也一样可见 —— 空页面最没用 */
+    const ordered = [...scored, ...rows.filter((r) => typeof r['view'] !== 'number')];
+    let visible = ordered;
+    if (ordered.length > MAX_PERF_ROWS) {
+      const timeOf = (r: Record<string, unknown>): number => {
+        const ms = typeof r['publishedAt'] === 'string' ? Date.parse(r['publishedAt']) : NaN;
+        return Number.isFinite(ms) ? ms : 0;
+      };
+      /* 排序键是发布时间（不是播放）：新稿件必须优先保留，缺发布时间（无法判断新旧）的排最后 */
+      visible = [...ordered].sort((a, b) => timeOf(b) - timeOf(a)).slice(0, MAX_PERF_ROWS);
+    }
+    const truncated = visible.length < ordered.length;
+    /* 「在库」口径 = 排除 B站 上已不存在的稿件；计数**在服务端按全量算**，
+       不依赖"前端拿到的行"（一旦将来加过滤/截断，前端求和就会跟着失真）。 */
+    const liveRows = rows.filter((r) => !r['gone']);
     return {
-      /* 已经拉到数据的按播放降序；还没拉到的（未拉取/不可用）排在后面也一样可见 —— 空页面最没用 */
-      rows: [...scored, ...rows.filter((r) => typeof r['view'] !== 'number')].slice(0, 100),
+      rows: visible,
+      /** true = 行数超过安全上限被截断（按发布时间保留最新的），前端应如实说明 */
+      truncated,
       correlation,
       note:
         'LLM 评分是内容侧的判断，实际表现还受标题、发布时间、封面与推送影响 —— 本页只呈现相关性，不做因果结论。' +
         '数据每日回流一次（performance.jsonl）。' +
         '多分P 模式下同一稿件的各分P 共享该稿件的总播放，所以这里**按稿件（bvid）去重**，' +
         '评分取该稿件内最高分的那一P；「稿件数」因此是稿件数而非分P 数。' +
-        '「已锁定 / 仅自己可见」的稿件 B站 不公开统计，本页如实标注而不写 0。',
+        '「已锁定 / 仅自己可见」的稿件 B站 不公开统计，本页如实标注而不写 0。' +
+        (truncated
+          ? `列表超过 ${MAX_PERF_ROWS} 行上限：这里按**发布时间**保留最新的 ${visible.length} 行（不按播放，避免新稿件被切掉）。`
+          : ''),
+      /* 分P 总数按**全量行**求和：不能对"返回行"求和，否则一旦过滤/截断就和真实口径不一致 */
       partTotal: rows.reduce((a, r) => a + Number(r['partCount'] ?? 1), 0),
+      /** 真实在库稿件数（含 B站 上已不存在的行；全量口径，不受返回行数影响） */
       archiveTotal: rows.length,
+      /** 「在库」稿件的真实数量（排除已删除/下架）——前端头部计数用它，不用返回行数 */
+      liveTotal: liveRows.length,
+      /** 「在库」稿件的分P 总数（全量口径，同样不依赖返回行） */
+      livePartTotal: liveRows.reduce((a, r) => a + Number(r['partCount'] ?? 1), 0),
       pulledTotal: scored.length,
     };
   }

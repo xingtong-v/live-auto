@@ -243,7 +243,13 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
   await orch.start({ polling: true });
   console.log(`\n${C.green}服务已启动，正在轮询录制历史（每 ${cfg.room.pollIntervalSec} 秒）。按 Ctrl+C 退出。${C.reset}\n`);
 
+  /* 停止只允许发生一次（见 shutdown 里的说明） */
+  let stopping = false;
   const shutdown = async (sig: string): Promise<void> => {
+    /* 幂等：Ctrl+C 与热更新监督进程的 IPC shutdown 可能同时到达（用户正好在保存代码并关窗口），
+       重复跑一遍 stop() 会把「已停止」刷两次、甚至第二个 process.exit 抢在刷盘前。 */
+    if (stopping) return;
+    stopping = true;
     console.log(`\n${C.dim}收到 ${sig}，正在停止…${C.reset}`);
     try {
       orch.stop();
@@ -256,6 +262,17 @@ async function cmdRun(args: ParsedArgs): Promise<void> {
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
+
+  /* 代码热更新（2026-10-24）：监督进程 `src/hot-watch.ts` 通过 IPC 发 `{type:'shutdown'}`，
+     让本进程先走 orch.stop() + ui.stop() 再退出，随后它用新代码重新拉起。
+     为什么不靠 SIGTERM：Windows 上 Node 对 SIGTERM 是**硬杀**（TerminateProcess），
+     台账/产物的收尾写盘来不及做，重启后会留下半截现场。 */
+  if (typeof process.send === 'function') {
+    process.on('message', (m: unknown) => {
+      const type = (m as { type?: unknown } | null)?.type;
+      if (type === 'shutdown') void shutdown('hot-reload');
+    });
+  }
 }
 
 async function cmdOnce(args: ParsedArgs): Promise<void> {

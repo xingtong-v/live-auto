@@ -5,6 +5,33 @@
  * 发现某一片不想要、或时间不合适时，就在原地处理，不必先去左侧切到那一场。
  * ========================================================================== */
 function bindScheduleActions() {
+  /* ★ 2026-10-16（UI 评审 IA-4）：行内「⋯」菜单的开合。
+     菜单里的按钮仍带 data-sched-act，由下面那段统一绑事件 —— 这里只管显隐。 */
+  const closeAllMenus = () => {
+    $$('#schedule .slot-menu').forEach((m) => { m.hidden = true; });
+    $$('#schedule [data-slot-more]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
+  };
+  $$('#schedule [data-slot-more]').forEach((btn) => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      const menu = btn.parentElement.querySelector('.slot-menu');
+      const willOpen = menu.hidden;
+      closeAllMenus();
+      if (willOpen) { menu.hidden = false; btn.setAttribute('aria-expanded', 'true'); }
+    };
+  });
+  /* 点外面 / 按 Esc 收起。挂在 document 上，每次渲染会重复注册 ——
+     所以先移除上一次的（用具名函数引用存在窗口上，避免监听器越堆越多）。 */
+  if (window.__schedMenuOff) window.__schedMenuOff();
+  const onDocClick = () => closeAllMenus();
+  const onEsc = (ev) => { if (ev.key === 'Escape') closeAllMenus(); };
+  document.addEventListener('click', onDocClick, true);
+  document.addEventListener('keydown', onEsc);
+  window.__schedMenuOff = () => {
+    document.removeEventListener('click', onDocClick, true);
+    document.removeEventListener('keydown', onEsc);
+  };
+
   $$('#schedule [data-sched-act]').forEach((btn) => {
     btn.onclick = async (ev) => {
       ev.stopPropagation();
@@ -19,6 +46,7 @@ function bindScheduleActions() {
         toast('已切到该场，可在右侧切片卡片里编辑');
         return;
       }
+      closeAllMenus();
       if (act === 'time') return openDtimeEditor(taskId, idx);
       if (act === 'del') return deleteClipFromSchedule(taskId, idx);
     };

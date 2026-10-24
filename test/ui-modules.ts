@@ -41,7 +41,22 @@ ok('每个模块都有说明名（不是空标签）', man.parts.every((p) => p.
 const missing = man.parts.filter((p) => !fs.existsSync(path.join(ROOT_DIR, 'web', 'src', p.file)));
 ok('清单里每个文件都在磁盘上', missing.length === 0, missing.map((m) => m.file).join(','));
 ok('★ 按序拼接 === public/ui.html（逐字节）', assembled === html, `模块拼出 ${assembled.length} 字节 / 产物 ${html.length} 字节`);
-ok('产物里只有一份 <script>（拼接没切坏标签）', (html.match(/<script>/g) ?? []).length === 1, String((html.match(/<script>/g) ?? []).length));
+/* 2026-10-16 起产物里**故意**有两段 <script>：
+ *   ① head 里的「主题引导」—— 必须在首屏渲染前设好 data-theme，否则深色下会闪一下白底；
+ *   ② 主体单文件脚本（各模块拼出来的那一段）。
+ * 所以这里不能只数成 1，而要断言"恰好多出来的那一段就是引导脚本、且主脚本仍然完整"。
+ * 顺带守住它：tools/ui-modules.ts 的 --split 必须从 </style> 之后找主脚本，
+ * 否则会切到引导脚本上（这是一个会让拆分直接损坏产物的坑）。 */
+const scriptBlocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1] ?? '');
+ok('产物里的 <script> 恰好两段：主题引导 + 主体脚本', scriptBlocks.length === 2, String(scriptBlocks.length));
+ok(
+  '★ 第一段是主题引导（含 liveauto.theme，且在 </style> 之前）',
+  scriptBlocks.length === 2 && scriptBlocks[0]!.includes('liveauto.theme') && html.indexOf('<script>') < html.indexOf('<style>'),
+);
+ok(
+  '★ 第二段是主体脚本（不是被引导脚本顶掉的外壳）',
+  scriptBlocks.length === 2 && scriptBlocks[1]!.includes('function switchView'),
+);
 ok('产物里只有一份 <style>', (html.match(/<style>/g) ?? []).length === 1);
 
 const tool = fs.readFileSync(path.join(ROOT_DIR, 'tools', 'ui-modules.ts'), 'utf8');

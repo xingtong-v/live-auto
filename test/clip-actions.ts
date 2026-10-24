@@ -7,7 +7,7 @@
  * 本测试锁住四条语义（每条都对应一个会真出事的坑）：
  *   1. 删掉一条切片**不能重排其它切片的 index** —— index 是台账/decisions/幂等指纹共用的稳定标识；
  *   2. 删掉切片要**连带清掉它的幂等指纹** —— 不清的话重新分析出同一区间会被判成"已投过"而静默跳过；
- *   3. 逐片指定的发布时间必须过硬约束 #4（> 提交时刻 + 7200 秒），不合法就拒绝而不是照投；
+ *   3. 逐片指定的发布时间必须过硬约束 #4（≥ 提交时刻 + 1200 秒），不合法就拒绝而不是照投；
  *   4. `parseUserDtime` 认 `YYYY-MM-DDTHH:mm` / `YYYY-MM-DD HH:mm` / 秒级 / 毫秒级时间戳。
  *
  * 纯本地：真台账（临时目录）+ 纯函数，不联网、不投稿。
@@ -144,14 +144,14 @@ section('④ 逐片发布时间：解析 + 硬约束 #4 校验');
   eq('乱填 → undefined（不猜）', parseUserDtime('明天早上'), undefined);
   eq('对象 → undefined', parseUserDtime({ a: 1 }), undefined);
 
-  const tooEarly = Math.floor(base / 1000) + 3600; // 只留 1 小时
+  const tooEarly = Math.floor(base / 1000) + 300; // 只留 5 分钟（贴着平台底线，不给过）
   const vBad = validateDtime(tooEarly, base);
-  eq('只留 1 小时 → 不合法（硬约束 #4）', vBad.ok, false);
-  ok('给出人话原因', vBad.note.includes('7200'), vBad.note);
+  eq('只留 300 秒 → 不合法（硬约束 #4）', vBad.ok, false);
+  ok('给出人话原因', vBad.note.includes('1200'), vBad.note);
 
-  const okTime = Math.floor(base / 1000) + 7300;
-  ok('留 7300 秒 → 合法', validateDtime(okTime, base).ok);
-  eq('边界 7200 秒整 → **不合法**（要求 > 7200）', validateDtime(Math.floor(base / 1000) + 7200, base).ok, false);
+  const okTime = Math.floor(base / 1000) + 1300;
+  ok('留 1300 秒 → 合法', validateDtime(okTime, base).ok);
+  eq('边界 1200 秒整 → **合法**（要求 ≥ 1200，含等号）', validateDtime(Math.floor(base / 1000) + 1200, base).ok, true);
 }
 
 console.log('\n' + '─'.repeat(74));

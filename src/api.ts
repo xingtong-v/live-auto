@@ -28,6 +28,86 @@ import type {
 import type { AppConfig } from './config.ts';
 import type { ErrorType, RequestContext, RetryAttempt } from './types.ts';
 import { backoffMs, sleep, truncate } from './util.ts';
+
+/** /bili/archives 响应里的服务端分页元信息（B站 原样透传，biliLive-tools 不加工） */
+export interface ArchivePageMeta {
+  pn?: number;
+  /** 服务端**实际**采用的页大小 —— 请求 100 可能被降级成 10，完整性判断必须看它/看 count */
+  ps?: number;
+  /** 我的稿件总数 —— 「列表已拿全」的唯一可靠判据：**累计条数 >= count** */
+  count?: number;
+}
+
+/** 一页稿件列表 + 它的分页元信息 */
+export interface ArchiveListPage {
+  items: ArchiveItem[];
+  page?: ArchivePageMeta;
+}
+
+/**
+ * 按 count **循环翻页**取全我的稿件列表。
+ *
+ * ★ 2026-10-17 事故修复：`/bili/archives` 单页请求的条数**不可信**（超上限的 pageSize 被
+ *   服务端静默降级，100 → 10），只取第 1 页再拿「返回条数 < pageSize」当完整性判据，
+ *   会把 61 个稿件只看到 10 个还以为拿全了 —— 这是 18 条墓碑被误自动解除的根因。
+ *
+ * 完整性判据（宁可保守）：
+ *  - 响应带 `page.count`：**累计去重条数 >= count** 才算拿全；翻页翻不出新条目时停下，
+ *    没拿够 count 就如实报 `complete: false`（调用方据此保留墓碑 / 不判「已删」）；
+ *  - 没有 count：退回「短页」判据 —— 返回条数 < 服务端实际 ps（没有 ps 就退回请求的 pageSize）；
+ *  - 页与页之间无新条目（服务端忽略 page 参数等异常）：立即停，拿没拿全如实报告。
+ *
+ * @param opts.fetchPage 取一页的函数（注入式，便于测试与两处调用方复用）
+ * @param opts.pageSize   请求的页大小（没有服务端 ps 时的短页判据兜底）
+ * @param opts.maxPages   安全上限，默认 20（61 个稿件 / 10 条页 = 7 页，20 页余量足够）
+ */
+export async function fetchAllArchivePages(opts: {
+  fetchPage: (page: number) => Promise<ArchiveListPage>;
+  pageSize: number;
+  maxPages?: number;
+}): Promise<{ items: ArchiveItem[]; complete: boolean; pages: number; notes: string[] }> {
+  const maxPages = opts.maxPages ?? 20;
+  const notes: string[] = [];
+  const items: ArchiveItem[] = [];
+  const seen = new Set<string>();
+  let complete = false;
+  let pages = 0;
+  for (let page = 1; page <= maxPages; page++) {
+    const p = await opts.fetchPage(page);
+    pages = page;
+    let fresh = 0;
+    for (const a of p.items) {
+      const bvid = String((a as { bvid?: string }).bvid ?? '').trim();
+      if (!bvid || seen.has(bvid)) continue;
+      seen.add(bvid);
+      items.push(a);
+      fresh++;
+    }
+    const count = typeof p.page?.count === 'number' && p.page.count > 0 ? p.page.count : undefined;
+    if (count !== undefined) {
+      if (items.length >= count) {
+        complete = true;
+        break;
+      }
+      if (page > 1 && fresh === 0) {
+        /* 服务端开始重复给同一页（page 参数没生效等异常）：翻不动了，没拿够 count 如实报告 */
+        notes.push(`翻到第 ${page} 页没有新条目（服务端 count=${count}，已取 ${items.length} 个）—— 列表未取全`);
+        break;
+      }
+      continue;
+    }
+    /* 没有 count 元信息：退回「短页」判据（ps 用服务端实际值，没有再用请求值兜底） */
+    const serverPs = typeof p.page?.ps === 'number' && p.page.ps > 0 ? p.page.ps : opts.pageSize;
+    if (p.items.length < serverPs || (page > 1 && fresh === 0)) {
+      complete = true;
+      break;
+    }
+  }
+  if (!complete && pages >= maxPages) {
+    notes.push(`翻页达到安全上限 ${maxPages} 页仍未取全（已取 ${items.length} 个）—— 列表未取全`);
+  }
+  return { items, complete, pages, notes };
+}
 import { log as globalLog, type Logger } from './logger.ts';
 
 /* ============================================================================
@@ -710,17 +790,18 @@ export class BiliLiveClient {
   }
 
   /**
-   * GET /bili/archives —— 已投稿件列表。
-   * 这是**幂等校验与 bvid 反查的唯一可靠来源**（一查三用，§8 WP5 步骤 1）。
+   * GET /bili/archives —— 带**服务端分页元信息**的版本（`biliArchives` 的完整形态）。
    *
-   * ⚠️ 实测（v3.21.0）：稿件列表在 **`arc_audits[].Archive`**，而不是 `list` / `data` / `archives`
-   * （`archives` 字段实际是 `null`）。每个元素形如：
-   *   `{ Archive: { aid, bvid, title, cover, state, ... }, stat: {...}, ... }`
-   * 只按 `list`/`data` 找会**静默拿到空数组**，导致幂等失效、bvid 永远反查不到。
+   * ★ 2026-10-17 事故修复：实测响应里带 `page = { pn, ps, count }`（B站 原样透传），
+   *   旧版把它整个丢掉，调用方只能拿「请求的 pageSize」和「返回条数」比 —— 而服务端会把
+   *   超上限的 pageSize **静默降级**（请求 ps=100 实际只回 10 条），于是「10 < 100」恒成立，
+   *   调用方误以为列表已拿全（61 个稿件只看得见 10 个），进而把「不在列表里」当成了
+   *   「稿件已删」—— 18 条防重复墓碑就是这么被误解除的（见 docs/待修问题-墓碑误解除与分页判据-2026-10-17.md）。
+   *   现在把 `page` 元信息透出来，调用方必须用 **count** 判断完整性（见 `fetchAllArchivePages`）。
    */
-  async biliArchives(
+  async biliArchivesPage(
     params: { page?: number; pageSize?: number; uid?: number | string; keyword?: string; timeoutMs?: number } = {},
-  ): Promise<ArchiveItem[]> {
+  ): Promise<ArchiveListPage> {
     const res = await this.request<
       | ArchiveItem[]
       | {
@@ -728,6 +809,7 @@ export class BiliLiveClient {
           data?: ArchiveItem[] | { list?: ArchiveItem[] };
           archives?: ArchiveItem[] | null;
           arc_audits?: Array<{ Archive?: ArchiveItem }>;
+          page?: ArchivePageMeta;
         }
     >('/bili/archives', {
       query: {
@@ -744,25 +826,43 @@ export class BiliLiveClient {
       ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
     });
 
-    if (Array.isArray(res)) return res;
+    const pageMeta = (!Array.isArray(res) && (res as { page?: ArchivePageMeta })?.page) || undefined;
     const r = res as {
       list?: ArchiveItem[];
       data?: ArchiveItem[] | { list?: ArchiveItem[] };
       archives?: ArchiveItem[] | null;
       arc_audits?: Array<{ Archive?: ArchiveItem }>;
     };
-
+    let items: ArchiveItem[] = [];
     // ★ 首要路径：arc_audits[].Archive（实测结构）
     if (Array.isArray(r?.arc_audits)) {
-      return r.arc_audits
+      items = r.arc_audits
         .map((x) => x?.Archive)
         .filter((a): a is ArchiveItem => Boolean(a && (a.bvid || a.title)));
-    }
-    if (Array.isArray(r?.list)) return r.list;
-    if (Array.isArray(r?.archives)) return r.archives;
-    if (Array.isArray(r?.data)) return r.data;
-    if (r?.data && Array.isArray((r.data as { list?: ArchiveItem[] }).list)) return (r.data as { list: ArchiveItem[] }).list;
-    return [];
+    } else if (Array.isArray(r?.list)) items = r.list;
+    else if (Array.isArray(r?.archives)) items = r.archives;
+    else if (Array.isArray(r?.data)) items = r.data;
+    else if (r?.data && Array.isArray((r.data as { list?: ArchiveItem[] }).list)) items = (r.data as { list: ArchiveItem[] }).list;
+    return { items, ...(pageMeta ? { page: pageMeta } : {}) };
+  }
+
+  /**
+   * GET /bili/archives —— 已投稿件列表（只返回条目，不要分页元信息）。
+   * 这是**幂等校验与 bvid 反查的唯一可靠来源**（一查三用，§8 WP5 步骤 1）。
+   *
+   * ⚠️ 实测（v3.21.0）：稿件列表在 **`arc_audits[].Archive`**，而不是 `list` / `data` / `archives`
+   * （`archives` 字段实际是 `null`）。每个元素形如：
+   *   `{ Archive: { aid, bvid, title, cover, state, ... }, stat: {...}, ... }`
+   * 只按 `list`/`data` 找会**静默拿到空数组**，导致幂等失效、bvid 永远反查不到。
+   *
+   * ⚠️ 单页请求的条数**不可信**：服务端会把超上限的 pageSize 静默降级（100 → 10），
+   *    需要「全量列表」的调用方请用 `fetchAllArchivePages`（按 count 循环翻页），
+   *    不要自己拿「返回条数 < pageSize」当「已拿全」的判据。
+   */
+  async biliArchives(
+    params: { page?: number; pageSize?: number; uid?: number | string; keyword?: string; timeoutMs?: number } = {},
+  ): Promise<ArchiveItem[]> {
+    return (await this.biliArchivesPage(params)).items;
   }
 
   /**
@@ -770,11 +870,14 @@ export class BiliLiveClient {
    *
    * `retry` 可显式设为 0：体检这类"查不到就算了"的场景不需要退避重试，
    * 否则「定时发布未到点」的稿件会让接口连试 3 次、整体耗时 30 秒以上。
+   *
+   * `tag` 由**调用方**传入（默认 'perf'）：2026-10-17 排查发现墓碑核对发出的请求在日志里
+   * 也写成 `[perf]`，把「表现数据回流」与「墓碑核对」两条链路混成一条，排查时被带偏。
    */
-  async biliArchiveDetail(bvid: string, opts: { retry?: number } = {}): Promise<ArchiveDetail> {
+  async biliArchiveDetail(bvid: string, opts: { retry?: number; tag?: string } = {}): Promise<ArchiveDetail> {
     const res = await this.request<ArchiveDetail | { data?: ArchiveDetail }>(`/bili/user/archive/${encodeURIComponent(bvid)}`, {
       purpose: '稿件表现数据回流',
-      tag: 'perf',
+      tag: opts.tag ?? 'perf',
       ...(opts.retry !== undefined ? { retry: opts.retry } : {}),
     });
     return ((res as { data?: ArchiveDetail })?.data ?? (res as ArchiveDetail)) ?? {};
@@ -832,6 +935,48 @@ export class BiliLiveClient {
     });
     const arr = (res?.payload?.data ?? res?.data ?? []) as unknown;
     return Array.isArray(arr) ? (arr as Array<Record<string, unknown>>).map((x) => x as never) : [];
+  }
+
+  /**
+   * 用直播间房间号反查主播 B站 信息（公开接口，无需登录）：`uid` + 昵称 `name`。
+   *
+   * 用途：简介模板的 `{{anchorUid}}` / `{{anchorName}}` 要标「这场是谁的直播」——
+   * UID 稳定、房间号会变（B站 换房/停播后房间号可能被别人占用），所以投稿前
+   * 用房间号查一次存进任务。昵称来自 `card` 接口，**失败不影响 uid**
+   * （@不上名字时至少还有空间链接）。
+   *
+   * ⚠️ 这里是 B站 公开 API，**不走 `request()`**（`request` 面向 biliLive-tools 网关，
+   * 会拼 `baseUrl` 并带 passKey）。查不到（房间号失效 / 网络问题）返回空对象、绝不抛错，
+   * 简介里那一项留空即可，不能因为一个可选字段把投稿整个挡下来。
+   */
+  async anchorInfoByRoom(roomId: string): Promise<{ uid?: string; name?: string }> {
+    if (!roomId) return {};
+    try {
+      const res = await fetch(`https://api.live.bilibili.com/room/v1/Room/room_init?id=${encodeURIComponent(roomId)}`, {
+        signal: AbortSignal.timeout(5000),
+        headers: { 'User-Agent': 'Mozilla/5.0 (live-auto)', Accept: 'application/json' },
+      });
+      if (!res.ok) return {};
+      const j = (await res.json()) as { code?: number; data?: { uid?: number | string } };
+      if (j?.code !== 0 || !j.data?.uid) return {};
+      const uid = String(j.data.uid);
+      try {
+        const c = await fetch(`https://api.bilibili.com/x/web-interface/card?mid=${encodeURIComponent(uid)}`, {
+          signal: AbortSignal.timeout(5000),
+          headers: { 'User-Agent': 'Mozilla/5.0 (live-auto)', Accept: 'application/json' },
+        });
+        if (c.ok) {
+          const cj = (await c.json()) as { code?: number; data?: { card?: { name?: string } } };
+          const name = cj?.code === 0 ? cj.data?.card?.name : undefined;
+          if (name) return { uid, name };
+        }
+      } catch {
+        /* 昵称失败不影响 uid */
+      }
+      return { uid };
+    } catch {
+      return {};
+    }
   }
 
   /** 取投稿用 uid（取第一个账号） */

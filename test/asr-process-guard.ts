@@ -214,8 +214,15 @@ section('4. 静态接线：这三道闸必须挂在"放弃任务"的每条路上
   ok('修复接口会如实回报"跳过了几个在跑的"', /skipped/.test(server) && /正在转写中/.test(server));
   ok('修复接口只在真卡住时才收尸（不是无脑杀）', /st\.live \? orch\.cancelTranscription\(t\.id\) : false/.test(server));
 
-  ok('★ 预转写支持"让路"门控', /shouldWork\?:/.test(tick) && /本轮让路/.test(tick));
-  ok('★ 守护进程在流水线忙时让预转写让路', /shouldWork: \(\) =>[\s\S]{0,200}?this\.busy/.test(daemon));
+  ok('★ 预转写支持"让路"门控', /shouldWork\?:/.test(tick) && /summary\.yielded = gate\.reason/.test(tick));
+  /* 让路不能每轮都刷一行（2026-10-13 用户截图：面板里连着四行一模一样的「让路」）：
+     原因进 summary.yielded（不进 notes），由 daemon 限频后再记。 */
+  ok('★ 让路原因不进 notes（否则每 2 分钟刷一行）', !/notes\.push\(`本轮让路/.test(tick));
+  ok('★ 让路日志限频：同一原因 10 分钟内不重复记', /lastPreTranscribeYieldReason/.test(daemon) && /10 \* 60 \* 1000/.test(daemon));
+  ok(
+    '★ 守护进程在流水线忙时让预转写让路',
+    /shouldWork: \(\) =>[\s\S]{0,600}?(this\.busy|this\.currentTaskId)/.test(daemon),
+  );
   ok('预转写让路时连 discover 都不做（省一次读盘）', tick.indexOf('本轮让路') < tick.indexOf('deps.discoverSegments(c.videoPath)'));
 }
 

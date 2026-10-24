@@ -96,6 +96,11 @@
       "fast": false
     },
     {
+      "name": "clip-tags-test",
+      "cmd": "npm run clip-tags-test",
+      "fast": true
+    },
+    {
       "name": "delete-test",
       "cmd": "npm run delete-test",
       "fast": false
@@ -151,6 +156,21 @@
       "fast": false
     },
     {
+      "name": "hot-watch-test",
+      "cmd": "npm run hot-watch-test",
+      "fast": false
+    },
+    {
+      "name": "hot-watch-qa-test",
+      "cmd": "npm run hot-watch-qa-test",
+      "fast": false
+    },
+    {
+      "name": "p-series-perf-test",
+      "cmd": "npm run p-series-perf-test",
+      "fast": false
+    },
+    {
       "name": "error-report-test",
       "cmd": "npm run error-report-test",
       "fast": false
@@ -171,6 +191,11 @@
       "fast": false
     },
     {
+      "name": "dtime-schedule-test",
+      "cmd": "npm run dtime-schedule-test",
+      "fast": false
+    },
+    {
       "name": "import-source-test",
       "cmd": "npm run import-source-test",
       "fast": false
@@ -184,6 +209,21 @@
       "name": "multipart-routing-test",
       "cmd": "npm run multipart-routing-test",
       "fast": true
+    },
+    {
+      "name": "clip-publish-mode-test",
+      "cmd": "npm run clip-publish-mode-test",
+      "fast": true
+    },
+    {
+      "name": "standalone-schedule-test",
+      "cmd": "npm run standalone-schedule-test",
+      "fast": true
+    },
+    {
+      "name": "clip-reuse-test",
+      "fast": true,
+      "cmd": "npm run clip-reuse-test"
     },
     {
       "name": "confirm-append-test",
@@ -216,6 +256,16 @@
       "fast": true
     },
     {
+      "name": "upload-ratelimit-test",
+      "cmd": "npm run upload-ratelimit-test",
+      "fast": true
+    },
+    {
+      "name": "upload-ratelimit-qa-test",
+      "cmd": "npm run upload-ratelimit-qa-test",
+      "fast": true
+    },
+    {
       "name": "cover-test",
       "cmd": "npm run cover-test",
       "fast": true
@@ -228,6 +278,16 @@
     {
       "name": "recording-health-test",
       "cmd": "npm run recording-health-test",
+      "fast": true
+    },
+    {
+      "name": "recording-gate-test",
+      "cmd": "npm run recording-gate-test",
+      "fast": true
+    },
+    {
+      "name": "auto-shutdown-test",
+      "cmd": "npm run auto-shutdown-test",
       "fast": true
     },
     {

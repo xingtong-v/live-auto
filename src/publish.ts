@@ -14,24 +14,51 @@
  */
 import fs from 'node:fs';
 import { extractCover, pickCoverSource } from './cover.ts';
-import { describeVerdict, shouldAutoRetry } from './failure-class.ts';
+import { QuotaGuard, type QuotaGuardStatus } from './quota-guard.ts';
+import {
+  RATE_LIMIT_DEFAULT_WAIT_SEC,
+  UPLOAD_QUOTA_RETRY_AFTER_MIN,
+  classifySubmitLimit,
+  describeVerdict,
+  isUploadRateLimited,
+  parseRateLimitWaitSec,
+  shouldAutoRetry,
+} from './failure-class.ts';
+import type { Alerter } from './alert.ts';
 import path from 'node:path';
 import type {
   ArchiveItem,
+  BiliUploadResponse,
   BiliUser,
   ClipRecord,
   ErrorType,
   FfmpegPreset,
+  RetryAttempt,
   TaskRecord,
   Transcript,
   TranscriptSegment,
 } from './types.ts';
-import type { AppConfig } from './config.ts';
-import { resolveDataPath } from './config.ts';
+import type { AppConfig, ClipPublishMode } from './config.ts';
+import {
+  DTIME_MIN_MARGIN_SEC,
+  describeScheduleOverride,
+  effectiveJitterSec,
+  resolveClipPublishMode,
+  resolveClipPublishSchedule,
+  resolveDataPath,
+} from './config.ts';
 import { BiliLiveClient, ApiError } from './api.ts';
 import type { Ledger } from './ledger.ts';
 import { clipFingerprint } from './ledger.ts';
-import { sanitizeDesc, sanitizeTags, sanitizeTitle } from './analyze.ts';
+import {
+  fillDefaultTags,
+  mergeIdentityTags,
+  resolveIdentityTags,
+  sanitizeDesc,
+  sanitizeTags,
+  sanitizeTitle,
+  TAG_LIMIT,
+} from './analyze.ts';
 import { convertDanmakuToAss, findDanmakuFactory } from './danmaku-ass.ts';
 import { buildBurnAss, buildCues } from './subtitle-ass.ts';
 import { ensureAvSync } from './av-sync.ts';
@@ -56,6 +83,52 @@ import { writeErrorReport } from './errors.ts';
 import { findDuplicateTitles, readOpenBatches, recordBatchOutcome, recordBatchSubmit, recordDuplicateParts, type Batch } from './publish-batches.ts';
 
 /* ============================================================================
+ * 投稿提交闸门与「限流」安全重试（2026-10-17 线上事故）
+ *
+ * 事故：任务 `auto-20261017112152-ap05` 的片段 #1 报
+ *   `BiliResponseError: 您投稿的频率过快，请稍等2秒`
+ * 并被我们判成 FAILED + 写错误报告，需要人工重投。当时日志显示同一进程里
+ * **两个任务在并行投稿**，两次 `upload task end` 只差 1.1 秒 —— B站 的限流是**按账号**的，
+ * 而原有的 `publish.minSubmitIntervalSec` 抖动只管「本批第 2 片起」（条件是 `i > 0`），
+ * 两个批次的**首片**几乎同时提交，谁也拦不住谁。
+ *
+ * 两条防线（都刻意做成常量而不是配置键，避免配置面扩散 —— 这几个数不是业务偏好，
+ * 而是"B站 说请稍等 2 秒"的直接翻译）：
+ *   1. {@link UPLOAD_SUBMIT_MIN_GAP_MS}：进程级**串行**提交闸门，任意两次提交之间至少隔 3 秒；
+ *   2. 限流拒绝（提交被拒、B站 侧什么都没创建）时按对方给的秒数等待并重试，最多 3 次。
+ *      这与 `shouldAutoRetry` 的「upload-failed 绝不自动重试」**不冲突**：那条守卫防的是
+ *      「已经发起过上传、可能已经落地」的重复分P；限流拒绝恰恰是"明确没落地"，可以安全重试。
+ * ========================================================================== */
+
+/** 投稿提交闸门：任意两次 `biliUpload` 提交之间的最小间隔（毫秒）。3 秒覆盖 B站 的「请稍等2秒」。 */
+export const UPLOAD_SUBMIT_MIN_GAP_MS = 3000;
+/** 被限流时最多尝试几次提交（含首次）。耗尽后按失败处理，failReason 里写明重试次数。 */
+export const UPLOAD_RATE_LIMIT_MAX_ATTEMPTS = 3;
+/** 单次限流等待的**上限**（秒）：对方说 2 秒就等 2 秒，说 600 秒也最多等 30 秒然后按失败处理。 */
+export const UPLOAD_RATE_LIMIT_WAIT_CAP_SEC = 30;
+
+/* ============================================================================
+ * 配额级限流（账号级投稿配额打满）—— 2026-10-21 线上事故
+ *
+ * 事故：任务 `auto-20261021030839-l3ti`，切片 #3 在 11:41:31 报
+ *   `BiliResponseError: 投稿过于频繁，请稍后再试`（**没有秒数**）。
+ * 台账当天 94 分钟提交了 18 次、间隔都 ≥143 秒（`minSubmitIntervalSec=120` 是生效的），
+ * 说明撞的不是"两次提交太近"，而是**账号当天的投稿配额**。
+ * 当时的行为（publish-log 里 submit 与 fail 落在同一毫秒）：
+ *   · 这句话不匹配任何秒级限流措辞 ⇒ 被当成永久失败 ⇒ 这一片直接 FAILED；
+ *   · 本批剩下的 #4/#5/#6 继续按 143 秒间隔逐片往上撞 ⇒ 一片不落全撞死；
+ *   · 用户要人工逐片重投，而这时配额其实还没恢复。
+ *
+ * 修法（只动限流这一条路径）：
+ *   1. 识别 quota 级（{@link classifySubmitLimit} === 'quota'）⇒ **fail-fast**，
+ *      不在同一轮里连撞（配额不可能在 10 秒内恢复，重试只是白挨拒绝）；
+ *   2. 该片写 **CANDIDATE（待投）** 而不是 FAILED —— 它是"可重投"，不是"永久失败"，
+ *      failReason 里写明原因、今日已投数量与建议重试时间；
+ *   3. 本批**立即收手**：后续没投的切片直接跳过（日志记明剩余几片），并走 alerter 发一条 warn。
+ * 与秒级限流（`请稍等2秒`）的关系：带秒数的一律仍走原来的短退避重试，**行为不变**。
+ * ========================================================================== */
+
+/* ============================================================================
  * 工具：路径、预设、封面、dtime
  * ========================================================================== */
 
@@ -75,18 +148,37 @@ function resolvePresetCover(p: string): string {
   return exists(candidate) ? candidate : p;
 }
 
+/** dtime 距提交时刻的安全余量（秒）：见 `config.ts` 中 `DTIME_MIN_MARGIN_SEC` 的口径说明（1200）。 */
+
+
+/**
+ * 抖动上限的**有效值**：必须严格小于片间隔。
+ *
+ * ★ 2026-10-17：实现已搬到 `config.ts`（`resolveClipPublishSchedule()` 的单独投稿分支也要用同一道
+ * 夹子，而 `publish.ts` 已经 import 了 `config.ts` —— 反过来 import 会成环）。
+ * 这里**保留同名导出**，因为测试与外部工具（`test/dtime-schedule.ts`、`tools/verify-*.ts`）
+ * 一直是 `from '../src/publish.ts'` 取它；签名与语义一字未改，只是搬了个家。
+ */
+export { effectiveJitterSec };
+
 /**
  * dtime 排期公式（硬约束 #4）：
- *   `dtime = submitTime + 7800 + (N - 1) × 7500 + random(0, 1800)`，N 从 1 开始
+ *   `dtime = submitTime + submitGapSec + (N - 1) × clipGapSec + random(0, 有效抖动)`，N 从 1 开始
+ *   （`有效抖动` = `effectiveJitterSec(jitterSec, clipGapSec)`，见上）
  *
- * ⚠️ 依据说明（别把它误传成平台规则）：B站的硬限制是 **`dtime` 必须晚于「该稿件自身的提交时间」7200 秒**，
- * 这是相对提交时刻的约束，**不是相对上一个切片**。同一次流程里提交的多个切片，
- * 各自满足「大于提交时间 + 7200」即全部合法，相邻间隔多少并不受额外限制。
- * 取 7500 只是留冗余。
+ * ⚠️ 依据说明（别把它误传成平台规则）：B站的硬限制是 **`dtime` 必须晚于「当前时间」300 秒**
+ * （投稿页口径「定时发布 ≥5 分钟、≤15 天」），这是相对**提交时刻**的约束，
+ * **不是相对上一个切片**。同一次流程里提交的多个切片，
+ * 各自满足「大于自己的提交时间 + 300」即全部合法，**相邻间隔多少并不受额外限制** ——
+ * 也就是说 `clipGapSec` 是**我们自己的**错峰值（线上 300 秒 = 每片 5 分钟），
+ * 调大调小都不违反平台规则，唯一要守的是「抖动 < 间隔」这个顺序不变量。
+ *
+ * ⚠️ **关于 7200 / DTIME_MIN_MARGIN_SEC**：本项目一度把余量卡在「提交后 7200 秒」并称之为 B站硬限，
+ * 两处都错（见 `config.ts` 中 `DTIME_MIN_MARGIN_SEC` 的口径修正）。现在是「平台底线 300 + 自律余量 = 1200」。
  *
  * @param submitTimeMs 该稿件的提交时刻（毫秒）
  * @param n 从 1 开始计数的序号
- * @param opts `daytimeOnly` 为 true 时用 `N × 7500`，让全部切片延后到白天发布
+ * @param opts `daytimeOnly` 为 true 时用 `N × clipGapSec`，让全部切片延后到白天发布
  */
 export function computeDtime(
   submitTimeMs: number,
@@ -99,7 +191,7 @@ export function computeDtime(
     rng?: () => number;
     /**
      * 该片的「不早于」时刻（秒级时间戳）。
-     * 用于用户显式指定的首片发布时间 —— B站要求 dtime 距**本稿件的提交时刻** >7200 秒，
+     * 用于用户显式指定的首片发布时间 —— dtime 距**本稿件的提交时刻**至少要有 1200 秒，
      * 所以指定时间比这更早时只能推迟到最早合法时间（调用方记录原因）。
      */
     notBeforeSec?: number;
@@ -107,23 +199,62 @@ export function computeDtime(
 ): number {
   const rng = opts.rng ?? Math.random;
   const base = opts.submitGapSec + (opts.daytimeOnly ? n : Math.max(0, n - 1)) * opts.clipGapSec;
-  const jitter = opts.jitterSec > 0 ? Math.floor(rng() * opts.jitterSec) : 0;
+  const jitterCap = effectiveJitterSec(opts.jitterSec, opts.clipGapSec);
+  const jitter = jitterCap > 0 ? Math.floor(rng() * jitterCap) : 0;
   const auto = Math.floor(submitTimeMs / 1000) + base + jitter;
   // 用户指定了发布时间：取「自动值」与「指定值」的较大者，
-  // 既尊重用户意图，又不会突破 B站的 7200 秒下限。
+  // 既尊重用户意图，又不会突破余量下限。
   return opts.notBeforeSec ? Math.max(auto, opts.notBeforeSec) : auto;
 }
 
-/** 校验 dtime 是否满足硬约束（供 UI 实时校验与投稿前自检） */
+/**
+ * 校验 dtime 是否满足硬约束（供 UI 实时校验与投稿前自检）
+ *
+ * 判据：距提交时刻 ≥ `DTIME_MIN_MARGIN_SEC`（1200 秒）。
+ * B站平台的底线是 ≥ 300 秒；1200 是「平台底线 + 900 秒自律余量」。
+ */
 export function validateDtime(dtimeSec: number, submitTimeMs: number): { ok: boolean; marginSec: number; note: string } {
   const marginSec = dtimeSec - Math.floor(submitTimeMs / 1000);
-  if (marginSec > 7200) {
-    return { ok: true, marginSec, note: `距提交时刻 ${marginSec} 秒（> 7200 秒，合规）` };
+  if (marginSec >= DTIME_MIN_MARGIN_SEC) {
+    return { ok: true, marginSec, note: `距提交时刻 ${marginSec} 秒（≥ ${DTIME_MIN_MARGIN_SEC} 秒，合规）` };
   }
   return {
     ok: false,
     marginSec,
-    note: `dtime 距提交时刻仅 ${marginSec} 秒，**不满足** B站「必须晚于提交时间 7200 秒」的要求，投稿会被拒（陷阱 #12）`,
+    note: `dtime 距提交时刻仅 ${marginSec} 秒，**不满足**本项目硬约束 #4 的「≥ ${DTIME_MIN_MARGIN_SEC} 秒」（B站平台底线是 300 秒），此值投出去会被拒（陷阱 #12）`,
+  };
+}
+
+/**
+ * 提交前的**最后一道合规自检**（硬约束 #4 是按「该稿件**自己的**提交时刻」算的）。
+ *
+ * 为什么需要它：排期是拿**批次开始时刻**当基准算的（`computeDtime(batchStartMs, n, …)`，
+ * 整批共用一个基准，N 片之间才是等距的）；但真正调 B站 接口的时刻是**逐片往后推**的
+ * （每片要等切片完成 + 上传，还有 `minSubmitIntervalSec` 的风控间隔）。
+ * 上传一慢，靠后的切片就可能出现「它自己的 dtime − 它自己的提交时刻 < 1200」⇒ B站 直接拒稿，
+ * 而那时候的报错信息完全看不出是排期问题。
+ *
+ * 所以提交那一刻再核一次：不够就把发布时间抬到「现在 + 1200」，并把原因写进 warnings。
+ * 正常情况（首片 1200 余量 + 逐片 300 秒间隔）永远不会触发 —— 触发即说明提交比排期慢得多。
+ */
+export function clampDtimeForSubmit(
+  dtimeSec: number,
+  submitTimeMs: number,
+): { dtime: number; bumped: boolean; marginSec: number; note: string } {
+  const submitSec = Math.floor(submitTimeMs / 1000);
+  const marginSec = dtimeSec - submitSec;
+  if (marginSec >= DTIME_MIN_MARGIN_SEC) {
+    return { dtime: dtimeSec, bumped: false, marginSec, note: `dtime 距提交时刻 ${marginSec} 秒（≥ ${DTIME_MIN_MARGIN_SEC} 秒，合规）` };
+  }
+  const floor = submitSec + DTIME_MIN_MARGIN_SEC;
+  return {
+    dtime: floor,
+    bumped: true,
+    marginSec,
+    note:
+      `这一片排的 ${fmtLocal(dtimeSec * 1000)} 距本次提交只剩 ${marginSec} 秒，` +
+      `不满足本项目硬约束 #4「dtime 距本稿件提交时刻 ≥ ${DTIME_MIN_MARGIN_SEC} 秒」⇒ 已自动推迟到 ${fmtLocal(floor * 1000)}` +
+      `（提交比排期慢：上传/切片耗时把后面的片挤到了下限以内）`,
   };
 }
 
@@ -307,44 +438,90 @@ export function parseFirstPublishAt(s: string | undefined | null): number | unde
 }
 
 /**
+ * 秒数 → 人话（`300 ⇒ 5 分钟`、`470 ⇒ 7 分 50 秒`）。
+ *
+ * 只用于排期文案：`Math.round(gapSec / 60)` 在 470 秒时会说成「8 分钟」（实际 7 分 50 秒），
+ * 而排期文案里的数字是用户拿来核对 dtime 的，宁可比"整分钟"啰嗦一点，也不能四舍五入骗人。
+ */
+function fmtSpanShort(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  const m = Math.floor(s / 60);
+  const rest = s % 60;
+  if (m === 0) return `${rest} 秒`;
+  return rest === 0 ? `${m} 分钟` : `${m} 分 ${rest} 秒`;
+}
+
+/**
  * 把排期意图翻成人话，供日志与 UI 使用。
  * 能明确回答「首片什么时候发、最后一片什么时候发、我指定的时间是否被推迟了」。
+ *
+ * ★ 2026-10-16：可选的模式三件套（`clipPublishMode` / `multiPart` / `immediatePublish`）
+ *   一旦给出，就按 `resolveClipPublishSchedule()` 的**生效口径**算 ——
+ *   否则界面会拿 config 里那个（可能被抬/被夹的）`clipGapSec` / `jitterSec` 预览出一份
+ *   与实际排期不同的时间表。不给这三个键时行为逐字不变
+ *   （纯函数测试与老调用点都走这条）。
  */
 export function describeDtimePlan(
   submitTimeMs: number,
-  cfg: { submitGapSec: number; clipGapSec: number; jitterSec: number; firstPublishAt: string },
+  cfg: {
+    submitGapSec: number;
+    clipGapSec: number;
+    jitterSec: number;
+    firstPublishAt: string;
+    clipPublishMode?: ClipPublishMode;
+    multiPart?: boolean;
+    immediatePublish?: boolean;
+  },
   clipCount: number,
-): { first: number; last: number; note: string; userSpecified: boolean; earliestAllowed: number } {
+): { first: number; last: number; note: string; userSpecified: boolean; earliestAllowed: number; scheduled: boolean; gapSec: number } {
+  const hasMode = cfg.clipPublishMode !== undefined || cfg.multiPart !== undefined || cfg.immediatePublish !== undefined;
+  const sched = hasMode
+    ? resolveClipPublishSchedule({
+        ...(cfg.clipPublishMode !== undefined ? { clipPublishMode: cfg.clipPublishMode } : {}),
+        multiPart: cfg.multiPart === true,
+        immediatePublish: cfg.immediatePublish === true,
+        clipGapSec: cfg.clipGapSec,
+        jitterSec: cfg.jitterSec,
+      })
+    : undefined;
+  const gapSec = sched ? sched.gapSec : cfg.clipGapSec;
+  const jitterSec = sched ? sched.jitterSec : cfg.jitterSec;
   const want = parseFirstPublishAt(cfg.firstPublishAt);
   const mk = (n: number): number =>
     computeDtime(submitTimeMs, n, {
       submitGapSec: cfg.submitGapSec,
-      clipGapSec: cfg.clipGapSec,
-      jitterSec: cfg.jitterSec,
+      clipGapSec: gapSec,
+      jitterSec,
       ...(want !== undefined ? { notBeforeSec: want } : {}),
     });
   const first = mk(1);
   const last = mk(Math.max(1, clipCount));
-  // B站下限：提交时刻 + 7200 秒（留 10 分钟余量便于展示）
-  const earliestAllowed = Math.floor(submitTimeMs / 1000) + 7200 + 600;
-  let note = '按公式自动排期（错峰发布）';
+  // 余量下限：提交时刻 + 1200 秒（= 平台底线 300 + 自律余量 900）
+  const earliestAllowed = Math.floor(submitTimeMs / 1000) + DTIME_MIN_MARGIN_SEC;
+  const scheduled = sched ? sched.scheduled : true;
+  let note = sched && !scheduled
+    ? '当前是「立即发布」（不传 dtime）：这几个时间**不会**被使用，稿件过审即公开'
+    : sched && sched.mode === 'standalone'
+      ? `单独投稿：每片一稿，固定定时投稿、每片相隔 ${gapSec} 秒（${fmtSpanShort(gapSec)}）` +
+        (jitterSec > 0 ? `，每片再加 0~${jitterSec} 秒随机抖动` : '等距')
+      : '按公式自动排期（错峰发布）';
   if (want !== undefined) {
-    const hardFloor = Math.floor(submitTimeMs / 1000) + 7200;
+    const hardFloor = Math.floor(submitTimeMs / 1000) + DTIME_MIN_MARGIN_SEC;
     if (want >= hardFloor) {
       note =
         want >= earliestAllowed
           ? '按你指定的首片时间发布'
-          : '你指定的时间距提交不足 7800 秒（B站硬限是 7200 秒），已保留但余量偏小，建议再晚一些';
+          : `你指定的时间距提交不足 ${DTIME_MIN_MARGIN_SEC} 秒（项目自律下限，平台底线是 300 秒），已保留但余量偏小，建议再晚一些`;
     } else {
-      // 比 B站硬限还早：只能推迟，并明确告知实际会用的时间
+      // 比下限还早：只能推迟，并明确告知实际会用的时间
       note =
         '你指定的 ' +
         new Date(want * 1000).toLocaleString('zh-CN') +
-        ' 早于 B站下限（提交后须 >7200 秒），已自动推迟到 ' +
+        ` 早于本项目下限（提交后须 ≥${DTIME_MIN_MARGIN_SEC} 秒），已自动推迟到 ` +
         new Date(Math.max(first, earliestAllowed) * 1000).toLocaleString('zh-CN');
     }
   }
-  return { first, last, note, userSpecified: want !== undefined, earliestAllowed };
+  return { first, last, note, userSpecified: want !== undefined, earliestAllowed, scheduled, gapSec };
 }
 /* ============================================================================
  * 稿件反查（一查三用：完整版完成确认 / bvid 来源 / 切片幂等）
@@ -363,6 +540,21 @@ export function normalizeTitleForMatch(title: string): string {
     )
     .replace(/[Ａ-Ｚａ-ｚ０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
     .toLowerCase();
+}
+
+/**
+ * 主播名归一化（用于「这一场是谁」的房间匹配）。
+ *
+ * 为什么要归一：目录名常带平台后缀（`乙主播`），而配置里/接口返回的名字可能写成
+ * `乙主播`、`乙主播Official`、`乙主播 official` —— 直接全等会漏配，漏配的代价是简介里挂上**别人的**
+ * UP 主（2026-10-17 实测：乙主播的场次写成了 @甲主播）。
+ */
+export function normStreamerName(name: unknown): string {
+  return String(name ?? '')
+    .toLowerCase()
+    .replace(/[_\-·.\s\u3000]/g, '')
+    .replace(/official$/, '')
+    .trim();
 }
 
 export interface ArchiveMatch {
@@ -472,6 +664,25 @@ export function isArchiveGoneError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? '');
   if (!msg) return false;
   return /稿件不可见|稿件不存在|已删除|不存在或已被删除|啥都木有|archive not found|-404\b/i.test(msg);
+}
+
+/**
+ * 「稿件已不存在」的**强证据**：错误文案本身就指明稿件没了。
+ *
+ * ★ 2026-10-17 事故修复（见 docs/待修问题-墓碑误解除与分页判据-2026-10-17.md）：
+ *   `啥都木有` 是 biliLive-tools 的通用「上游没数据」—— 未发布（待审核 arc_audits）、
+ *   仅自己可见、接口异常都会返回它，**不能单独作为「已删除」的证据**。
+ *   实测它把一个 `state=-1 待发布`、明明还在稿件列表里的稿件判成了已删，
+ *   连锁导致 18 条防重复墓碑被误自动解除。
+ *   因此**不可逆的自动动作**（墓碑自动解除）只认强证据：
+ *   `稿件不可见 / 稿件不存在 / 已删除 / archive not found / -404`；
+ *   弱证据（含 `啥都木有`）一律按「说不清」保留待下次（墓碑 7 天后还有 prune 兜底，不会堆积）。
+ */
+export function isStrongArchiveGoneError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  if (!msg) return false;
+  if (/啥都木有/.test(msg)) return false;
+  return /稿件不可见|稿件不存在|已删除|不存在或已被删除|archive not found|-404\b/i.test(msg);
 }
 
 /**
@@ -788,8 +999,32 @@ export function buildBiliupConfig(input: BiliupConfigInput): { config: Record<st
   }
 
   // 简介：LLM 的 desc + 模板段落（模板含 {date} / {liveTitle} / {roomUrl} / {startText} / {endText} / {desc}）
-  const roomUrl = `https://live.bilibili.com/${task.roomId}`;
-  const dateText = task.liveStartTime ? fmtLocal(task.liveStartTime * 1000).slice(0, 10) : fmtLocal().slice(0, 10);
+  const roomUrl = `https://live.bilibili.com/${task.anchorRoomId ?? task.roomId}`;
+  /* ★ 2026-10-17 修复：手动导入的录播没有 liveStartTime，标题也常是纯直播标题（无日期），
+     只靠 liveStartTime 会退化成「今天」——跨零点后日期错一天。真实日期在**录制文件名**
+     前缀（`2026-10-16 22-52-18-237 …`）里。优先级：标题日期 → 文件名日期 → 开播时间 → 今天，
+     与 daemon.ts 的 resumeDateText 同一口径。 */
+  const dateText =
+    extractTitleDate(task.title) ??
+    extractTitleDate(path.basename(task.source?.segments?.[0]?.path ?? task.source?.rawFiles?.[0] ?? '')) ??
+    (task.liveStartTime ? fmtLocal(task.liveStartTime * 1000).slice(0, 10) : fmtLocal().slice(0, 10));
+  /* ★ 2026-10-17：时间点显示**录制时的真实时刻**（如 22:52:30），不再是相对偏移（00:00:12）。
+     基准 = 录制开始墙钟（recordStartTime 毫秒，最准）→ 开播时间（liveStartTime 秒）→ 都没有就回退相对时长。
+     clip.start/end 是整场录像的全局秒偏移，加上基准即真实时刻；跨零点在尾部标「（+N天）」。 */
+  const clockBaseMs = task.recordStartTime ?? (task.liveStartTime !== undefined ? task.liveStartTime * 1000 : undefined);
+  const clockText = (sec: number): string => {
+    if (clockBaseMs === undefined) return fmtDuration(sec);
+    const at = new Date(clockBaseMs + sec * 1000);
+    const hm = fmtLocal(at).slice(11);
+    /* 跨天按**日历日期**比较（本地零点对齐），不能用总时长整除 24h ——
+       22:52 开始、次日 00:15 的切片只隔 1.4 小时，但确实跨了零点，必须标注。 */
+    const startDay = new Date(clockBaseMs);
+    startDay.setHours(0, 0, 0, 0);
+    const atDay = new Date(at);
+    atDay.setHours(0, 0, 0, 0);
+    const days = Math.round((atDay.getTime() - startDay.getTime()) / 86_400_000);
+    return days > 0 ? `${hm}（+${days}天）` : hm;
+  };
   let desc: string;
   if (input.overrideDesc !== undefined) {
     desc = input.overrideDesc;
@@ -797,10 +1032,15 @@ export function buildBiliupConfig(input: BiliupConfigInput): { config: Record<st
     const tpl = cfg.publish.descTemplate || '{{desc}}';
     desc = tpl
       .split('{{date}}').join(dateText)
-      .split('{{liveTitle}}').join(task.title || '直播回放')
+      /* ★ 2026-10-17 修复：{{liveTitle}} 之前直接填 task.title（含录制时间戳前缀的场次原始标题），
+         投出去的简介里"直播间"一栏带着 `2026-10-15 21-03-45 ` 这类前缀。分P稿件标题、
+         多分P 主标题（本文件 2265/2528 行）都先过 cleanLiveTitle 清洗，这里对齐同一口径。 */
+      .split('{{liveTitle}}').join(cleanLiveTitle(task.title) || task.title || '直播回放')
+      .split('{{anchorUid}}').join(task.anchorUid || '')
+      .split('{{anchorName}}').join(task.anchorName || '')
       .split('{{roomUrl}}').join(roomUrl)
-      .split('{{startText}}').join(fmtDuration(clip.start))
-      .split('{{endText}}').join(fmtDuration(clip.end))
+      .split('{{startText}}').join(clockText(clip.start))
+      .split('{{endText}}').join(clockText(clip.end))
       .split('{{desc}}').join(clip.desc ?? '');
   }
   /* AI 声明：**必须最后拼、且不参与正文截断**。
@@ -826,29 +1066,54 @@ export function buildBiliupConfig(input: BiliupConfigInput): { config: Record<st
     desc = sanitizeDesc(desc, 250).desc;
   }
 
-  // 标签：**不追加 defaultTags**。切片标签是「选片阶段 LLM 按内容生成的」+「用户在界面上
-  // 手动加的」两类，一旦在这里再拼上全局默认标签，所有稿件的标签就会长得一模一样。
-  // 这里只做清理（去重/截断/敏感词）与上限约束（硬约束 #3）。
+  /* ★ 标签四层（2026-10-17 用户规格后定的最终口径，与 analyze.ts 里 sanitizeClips 同源）：
+     ① 必带标签（`config.publish.identityTags`，`{主播}` 占位符 → 本场主播名）：永远在最前、占位优先；
+     ② 内容标签（选片 LLM 生成 + 界面手改）：按顺序补满剩余名额，与①去重（大小写不敏感）；
+     ③ 默认标签（`defaultTags`）：①② 都空时兜底，否则只补它们用不完的空位；
+     ④ 上限 `TAG_LIMIT`=10，超出部分丢弃（必带优先，代价写进 warning）。
+     这里再做一次是刻意的：`clips.json` 是**存量数据**（本轮改动之前落的库），重新投稿、手改标签、
+     或走 append/多P 分支时都不经过 `sanitizeClips`，必须在这道最终关口再套一次。
+     历史（三次反复，别再来回改）：无条件前置追加 → 只兜底 → 内容词在前+默认词补位 → 现在这条。 */
+  const identity = resolveIdentityTags(cfg.publish.identityTags, task.streamer, cfg.publish.tagSensitiveWords);
+  if (identity.skipped.length) warnings.push(`必带标签跳过：${identity.skipped.join('、')}`);
   const tagRes = sanitizeTags(input.overrideTags ?? clip.tags, {
     sensitive: cfg.publish.tagSensitiveWords,
   });
   if (tagRes.removed.length) warnings.push(`标签被移除：${tagRes.removed.join('、')}`);
-  let tags = tagRes.tags;
+  const tagMerge = mergeIdentityTags(identity.tags, tagRes.tags, TAG_LIMIT);
+  if (tagMerge.dropped.length) {
+    warnings.push(`标签超过 ${TAG_LIMIT} 个上限：必带标签优先，已丢弃内容词 ${tagMerge.dropped.join('、')}`);
+  }
+  let tags = tagMerge.tags;
   if (tags.length === 0) {
     tags = cfg.publish.defaultTags.length ? [...cfg.publish.defaultTags] : ['直播切片'];
     warnings.push(`清理后没有可用标签，已用默认标签兜底：${tags.join('、')}`);
+  } else {
+    const filled = fillDefaultTags(tags, cfg.publish.defaultTags, cfg.publish.tagSensitiveWords);
+    if (filled.length > tags.length) {
+      warnings.push(`已用默认标签补位：${filled.slice(tags.length).join('、')}`);
+      tags = filled;
+    }
   }
-  if (tags.length > 10) {
-    warnings.push(`标签 ${tags.length} 个超过上限 10，已截断`);
-    tags = tags.slice(0, 10);
+  if (tags.length > TAG_LIMIT) {
+    warnings.push(`标签 ${tags.length} 个超过上限 ${TAG_LIMIT}，已截断`);
+    tags = tags.slice(0, TAG_LIMIT);
   }
 
   // tid：只接受白名单里的值（硬约束 #16）
   const wl = cfg.publish.tidWhitelist;
   let tid = wl[clip.category];
   if (tid === undefined) {
-    const byValue = Object.values(wl).includes(21) ? 21 : Object.values(wl)[0];
-    warnings.push(`分区「${clip.category}」不在白名单，回退默认分区 tid=${byValue}`);
+    /* 回退口径要和选片那条路（analyze.ts 的 mapCategoryToTid）**一致**：都用 `defaultCategory`。
+       这里以前写成「白名单里有 21 就用 21，否则用第一项」——那是把「生活/日常」当隐式默认，
+       于是配置里换了默认分区、存量 clips.json（分区名可能已经不在白名单里）却还是悄悄投到 21。
+       实测 2026-10-17 就撞上：白名单改版后 13 个存量切片的分区名「虚拟主播/虚拟主播」失效，
+       按旧口径全会落到生活/日常，而不是配置里的默认分区。 */
+    const fallbackName = Object.prototype.hasOwnProperty.call(wl, cfg.publish.defaultCategory)
+      ? cfg.publish.defaultCategory
+      : Object.keys(wl)[0];
+    const byValue = fallbackName === undefined ? 21 : wl[fallbackName];
+    warnings.push(`分区「${clip.category}」不在白名单，回退默认分区「${fallbackName ?? '—'}」tid=${byValue}`);
     tid = byValue ?? 21;
   }
 
@@ -861,7 +1126,7 @@ export function buildBiliupConfig(input: BiliupConfigInput): { config: Record<st
     copyright: cfg.publish.copyright,
     // ★ 立即发布：**完全不传 dtime**。
     //   传 `dtime: 0` / `null` 都不算「立即」—— B站只在「传了 dtime」时才校验
-    //   「必须 ≥ 提交后 2 小时」，所以不传这个键才是真正的立即发布。
+    //   「必须 ≥ 提交后 5 分钟」，所以不传这个键才是真正的立即发布。
     //   默认走定时发布（硬约束 #4），由 publish.immediatePublish 显式开启才绕过。
     ...(immediate ? {} : { dtime }),
     is_only_self: cfg.publish.isOnlySelf,
@@ -881,7 +1146,7 @@ export function buildBiliupConfig(input: BiliupConfigInput): { config: Record<st
   if (immediate) {
     warnings.push(
       '已启用「立即发布」（immediatePublish=true）：本次投稿**不传 dtime**，稿件过审后直接公开，' +
-        '不再满足任务书硬约束 #4 的「> 提交时刻 + 7200 秒」。该约束是防风控的自律措施、非 B站规则。',
+        `不再满足本项目硬约束 #4 的「> 提交时刻 + ${DTIME_MIN_MARGIN_SEC} 秒」。该约束是防风控的自律措施、非 B站规则（平台底线仅 300 秒）。`,
     );
   } else {
     // dtime 自检（硬约束 #4）
@@ -1021,6 +1286,50 @@ export interface PublishDeps {
   config: AppConfig;
   ledger: Ledger;
   logger?: Logger;
+  /**
+   * 提交闸门的最小间隔（毫秒），默认 {@link UPLOAD_SUBMIT_MIN_GAP_MS}。
+   * 只为**测试**留口子（真等 3 秒会拖慢套件），生产不要传。
+   */
+  submitGateMs?: number;
+  /** 限流重试的最大尝试次数（含首次），默认 {@link UPLOAD_RATE_LIMIT_MAX_ATTEMPTS}。仅供测试注入。 */
+  rateLimitMaxAttempts?: number;
+  /** 限流等待的实现（毫秒 → Promise），默认 `sleep`。仅供测试注入（避免真睡 2 秒 × N）。 */
+  rateLimitWaiter?: (waitMs: number) => Promise<void>;
+  /** 账号受限闸门（默认按台账同目录的 quota-block.json 建）。仅供测试注入。 */
+  quotaGuard?: QuotaGuard;
+  /**
+   * 告警器（可选）。只用于「配额级限流」这一种情形 —— 它不是失败，但用户必须知道
+   * "别重投了，等 30 分钟"。测试不传即为空实现（不发任何通知）。
+   */
+  alerter?: Pick<Alerter, 'publishQuotaLimited'>;
+}
+
+/**
+ * 「账号级投稿配额限流」的诊断信息（2026-10-21）。
+ *
+ * 三处共用同一个形状（单切片结果 / 多分P 结果 / 告警），避免各写一份再对不上——
+ * 曾经多分P 那条只写了 message+retryAfterMin，daemon 透传时类型对不上。
+ */
+export interface QuotaLimitedInfo {
+  /** B站 的原话 */
+  message: string;
+  /** 被限时"今日已提交"多少个（判断是不是配额打满的直接依据） */
+  todaySubmitted: number;
+  /** 建议多少分钟后重试 */
+  retryAfterMin: number;
+}
+
+/**
+ * 账号受限闸门（2026-10-22）：24h 内累计多次配额拒绝 ⇒ 暂停投稿到某个时刻。
+ * 与 {@link QuotaLimitedInfo} 的区别：那个是"这一批被拒了"，这个是"**整个账号现在不该再投**"。
+ */
+export interface QuotaBlockInfo {
+  /** 解除时间（ISO） */
+  until: string;
+  /** 24h 内的拒绝次数 */
+  rejections: number;
+  /** 给人看的一句话（UI 直接显示） */
+  note: string;
 }
 
 export interface CutAndUploadResult {
@@ -1035,6 +1344,13 @@ export interface CutAndUploadResult {
   dtime?: number;
   error?: { type: string; message: string };
   warnings: string[];
+  /**
+   * 命中「账号级投稿配额限流」时带上（2026-10-21 事故）。
+   *
+   * 有它就意味着：这一片**什么都没投出去**（B站 拒绝受理）、状态是 CANDIDATE（待投），
+   * 且本轮**不应该再投任何一片** —— `publishClips` 据此立即收手并告警。
+   */
+  quotaLimited?: QuotaLimitedInfo;
 }
 
 export interface CutAndUploadOptions {
@@ -1051,6 +1367,20 @@ export interface CutAndUploadOptions {
   uid: number | string;
   /** 每个切片提交时刻的基准（同一批共用，便于错峰公式连续） */
   submitTimeMs?: number;
+  /**
+   * 这一片是**本场第几片**（1 起），供错峰公式 `dtime = 基准 + submitGapSec + (N-1)×间隔` 使用。
+   *
+   * 为什么必须由调用方给（2026-10-17 线上实测踩到）：这个 N 原先是在 `cutAndUploadClip` 里
+   * 用「近 24 小时的投稿条数 + 1」近似的，而那个窗口**跨批次** —— 前一晚投过的切片会一起被数进来。
+   * 实测：00:16 开批时 N=28（前 24h 里正好 27 条 submit，全来自 10-16 凌晨那四批切片），
+   * 于是整批被推后 (28-1)×300 = 8100 秒，首片从「提交 + 2h10m」的 02:26 变成 **04:41**，
+   * 与界面预览（按 N=1 算）差 2 小时 15 分；同一天里 N 还会随**当天提交量**滑动
+   * （同一份日志里 10-16 00:00 那一刻 N 高达 59 ⇒ 首片会被排到 7 小时后）。
+   *
+   * 谁传：`publishClips` 的逐片循环传 `idx + 1`（切片在本场里的序号，重投/断点续投也稳定，
+   * 不会让后面的片排到前面的片之前）。
+   */
+  clipOrdinal?: number;
   /** 完整版源文件（用于推导 coverSource=fullVideo） */
   fullVideoBvid?: string;
   archiveCache?: ArchiveItem[];
@@ -1075,6 +1405,21 @@ export class Publisher {
   /** 术语表（标题体检用）：懒加载，改文件即生效 */
   private glossaryStore?: GlossaryStore;
 
+  /** 提交闸门：任意两次 `biliUpload` 的最小间隔（毫秒）。见 {@link withSubmitGate}。 */
+  private readonly submitGateMs: number;
+  /** 限流重试的最大尝试次数（含首次） */
+  private readonly rateLimitMaxAttempts: number;
+  /** 限流等待的实现（测试可注入，避免真睡） */
+  private readonly rateLimitWaiter: (waitMs: number) => Promise<void>;
+  /** 告警器（可选）：只在「配额级限流」时用，见 {@link finishQuotaLimited} */
+  private readonly alerter?: Pick<Alerter, 'publishQuotaLimited'>;
+  /** 提交闸门的排队链：后一笔等前一笔 `release()` 后才计算间隔 */
+  private submitChain: Promise<void> = Promise.resolve();
+  /** 上一次投稿提交的发起时刻（毫秒）；0 = 本进程还没投过 */
+  private lastSubmitAtMs = 0;
+  /** 账号受限闸门：跨批次、跨进程的"暂停投稿"状态 */
+  private readonly quotaGuard: QuotaGuard;
+
   /** 取术语表（体检用）。文件坏掉/不存在时返回空表，不影响投稿。 */
   private glossaryForCheck(): Glossary {
     try {
@@ -1090,6 +1435,228 @@ export class Publisher {
     this.cfg = deps.config;
     this.ledger = deps.ledger;
     this.logger = (deps.logger ?? globalLog).child({ mod: 'publish' });
+    this.submitGateMs = Math.max(0, deps.submitGateMs ?? UPLOAD_SUBMIT_MIN_GAP_MS);
+    this.rateLimitMaxAttempts = Math.max(1, deps.rateLimitMaxAttempts ?? UPLOAD_RATE_LIMIT_MAX_ATTEMPTS);
+    this.rateLimitWaiter = deps.rateLimitWaiter ?? ((waitMs: number) => sleep(waitMs));
+    this.quotaGuard =
+      deps.quotaGuard ??
+      new QuotaGuard({ path: QuotaGuard.pathFor(deps.ledger.publishLogPath), logger: this.logger });
+    if (deps.alerter) this.alerter = deps.alerter;
+  }
+
+  /* ------------------------------------------------------------------------
+   * 投稿提交：进程级串行闸门 + 限流安全重试
+   * ---------------------------------------------------------------------- */
+
+  /**
+   * 串行化一次「投稿提交」：并发调用会在这里排队，且任意两次之间至少隔 `submitGateMs`。
+   *
+   * 为什么需要它（2026-10-17 线上事故）：`publishClips` 的批内间隔用 `i > 0` 判首片豁免，
+   * 而同一进程里**两个任务的循环各跑各的** —— 两个首片几乎同时提交，直接撞 B站 限流。
+   * 频率限制是**按账号**的，所以闸门必须是**进程级**（挂在 Publisher 实例上：一个进程只有一个
+   * Publisher），而不是循环内局部变量。
+   *
+   * 语义边界：闸门只决定**什么时候发**，不改请求内容、不改重试策略，因此不影响幂等性。
+   */
+  private async withSubmitGate<T>(task: () => Promise<T>): Promise<T> {
+    /* 排队：把当前闸门状态串成一条 Promise 链。前一笔失败也**不能**卡死后面的提交
+       （用 catch 吞掉链上的拒绝，否则一次 500 就让整个进程再也投不出去）。 */
+    const prev = this.submitChain;
+    let release: () => void = () => {};
+    this.submitChain = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await prev.catch(() => undefined);
+    try {
+      if (this.lastSubmitAtMs > 0) {
+        const wait = this.submitGateMs - (Date.now() - this.lastSubmitAtMs);
+        if (wait > 0) await sleep(wait);
+      }
+      /* 时间戳在**发请求之前**取：衡量的是两次提交的间隔，而不是两次上传结束的间隔
+         （上传可能耗时几十分钟，若按结束后计时，闸门形同虚设）。 */
+      this.lastSubmitAtMs = Date.now();
+      return await task();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * 所有投稿提交的**唯一出口**（三个调用点：完整版 / 单切片 / 多分P 追加）。
+   * 统一走闸门，保证「任意两次提交至少隔 `UPLOAD_SUBMIT_MIN_GAP_MS`」。
+   */
+  private async submitUpload(
+    params: Parameters<BiliLiveClient['biliUpload']>[0],
+    log: Logger,
+    purpose: string,
+  ): Promise<BiliUploadResponse> {
+    return this.withSubmitGate(async () => {
+      log.debug(`提交投稿请求（${purpose}）`);
+      return this.client.biliUpload(params);
+    });
+  }
+
+  /**
+   * 被限流时的等待：按对方给的秒数等（+1~2 秒抖动），并夹一个上限。
+   *
+   * 为什么要抖动：两个任务可能同时被限流、同时等 2 秒、然后同时再撞一次
+   * （同一次事故里就是"同时提交"引起的）。抖动把它们的重试错开。
+   */
+  private async waitForRateLimit(message: string, attempt: number, log: Logger): Promise<number> {
+    const asked = parseRateLimitWaitSec(message) ?? RATE_LIMIT_DEFAULT_WAIT_SEC;
+    const capped = Math.min(UPLOAD_RATE_LIMIT_WAIT_CAP_SEC, Math.max(1, asked));
+    const waitMs = capped * 1000 + randomInt(1000, 2000);
+    log.warn(
+      `B站 限流：第 ${attempt}/${this.rateLimitMaxAttempts} 次提交被拒（${message.slice(0, 120)}）` +
+        `—— 等 ${(waitMs / 1000).toFixed(1)} 秒后重试${capped < asked ? `（对方要求 ${asked} 秒，超过上限 ${UPLOAD_RATE_LIMIT_WAIT_CAP_SEC} 秒，只等到上限）` : ''}`,
+    );
+    await this.rateLimitWaiter(waitMs);
+    return waitMs;
+  }
+
+  /**
+   * 收尾「账号级投稿配额限流」（2026-10-21 线上事故）。
+   *
+   * 三件事，顺序都不重要但一件都不能少：
+   *   ① 台账写 **CANDIDATE（待投）**，不写 FAILED —— 配额限流是"现在不行"，不是"这片坏了"，
+   *      写成 FAILED 会让界面显示成永久失败、把用户往"重投"甚至"查代码"上带；
+   *   ② failReason 写成一句**能照着做**的话：原因 + 今日已投几个 + 建议多久后重试；
+   *   ③ 返回值带上 `quotaLimited`，让调用方（publishClips）立即收手，别继续撞后面的片。
+   *
+   * 刻意**不写错误报告**（`reportClipFailure`）：错误报告是给"需要人修的问题"用的，
+   * 配额限流不是 bug，写进去只会在「错误报告」列表里堆噪音；它该走的是告警频道（alerter）。
+   */
+  private finishQuotaLimited(input: {
+    task: TaskRecord;
+    clipIndex: number;
+    clip: ClipRecord;
+    msg: string;
+    log: Logger;
+    cutOutput?: string;
+    warnings: string[];
+  }): CutAndUploadResult {
+    const todaySubmitted = this.ledger.todayPublishedCount();
+    const reason =
+      `B站 投稿配额限流（今日已提交 ${todaySubmitted} 个），建议 ${UPLOAD_QUOTA_RETRY_AFTER_MIN} 分钟后重试` +
+      `｜原始错误：${input.msg.slice(0, 160)}`;
+    input.log.warn(
+      `片段 #${input.clipIndex} 命中**账号级投稿配额**限流，本轮不再重试：${input.msg.slice(0, 160)}` +
+        `（今日已提交 ${todaySubmitted} 个，建议 ${UPLOAD_QUOTA_RETRY_AFTER_MIN} 分钟后重试；` +
+        `配额不可能在几秒内恢复，原地重试只是白挨拒绝）`,
+      { data: { clipIndex: input.clipIndex, todaySubmitted } },
+    );
+    /* 状态用 CANDIDATE 而不是 FAILED：与"可重投"的既有口径一致（CANDIDATE/PENDING_UPLOAD/FAILED
+       三者都会被 publishClips 重新捡起，但只有 CANDIDATE 在界面上不会被当成失败）。 */
+    this.ledger.setClipStatus(input.task.id, input.clipIndex, 'CANDIDATE', {
+      failReason: reason,
+      ...(input.cutOutput ? { cutOutput: input.cutOutput } : {}),
+    }, {
+      /* 与 daemon 复位「待投」同一口径（QA 2026-10-21 指出口径不一致）：
+         分支 B 走到这里时台账已经被写成 SUBMITTED + uploadTaskId，可那次提交实际没被受理，
+         留着这些字段就是留着一次"并不存在的提交"（人工核对时又要多绕一圈）。 */
+      unset: ['bvid', 'publishedAt', 'dtime', 'submitTime', 'uploadTaskId'] as Array<keyof ClipRecord>,
+    });
+    input.warnings.push(reason);
+    /* 记一笔「账号级拒绝」：24h 内累计到阈值就进入"暂停投稿"（跨批次、跨进程生效）。
+       这一步放在返回之前，保证无论调用方怎么处理，闸门都记得住。 */
+    const guard = this.quotaGuard.recordRejection(input.msg);
+    if (guard.blocked && guard.until) input.warnings.push(guard.note);
+    return {
+      clipIndex: input.clipIndex,
+      ok: false,
+      ...(input.cutOutput ? { output: input.cutOutput } : {}),
+      error: { type: 'upload-failed', message: reason },
+      warnings: input.warnings,
+      quotaLimited: { message: input.msg, todaySubmitted, retryAfterMin: UPLOAD_QUOTA_RETRY_AFTER_MIN },
+    };
+  }
+
+  /** 配额限流告警：一批只发一条（`publishClips` 在 break 前调用）。永不抛异常。 */  private async alertQuotaLimited(info: {
+    task: TaskRecord;
+    submitted: number;
+    remaining: number;
+    reason: string;
+  }): Promise<void> {
+    if (!this.alerter) return;
+    try {
+      await this.alerter.publishQuotaLimited({
+        taskId: info.task.id,
+        title: info.task.title,
+        submitted: info.submitted,
+        remaining: info.remaining,
+        retryAfterMin: UPLOAD_QUOTA_RETRY_AFTER_MIN,
+        reason: info.reason,
+      });
+    } catch (e) {
+      this.logger.warn(`配额限流告警发送失败（不影响台账）：${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * 账号受限闸门的状态（给 UI / 接口用）。
+   * 与 `publishClips` 里的早退判定是**同一个来源**，不会出现"界面说没受限、投稿却被拦"的矛盾。
+   */
+  quotaGuardStatus(): QuotaGuardStatus {
+    return this.quotaGuard.status();
+  }
+
+  /** 用户确认 B站 已恢复时手动解除（保留 24h 拒绝计数作参考）。 */
+  clearQuotaBlock(reason = 'manual'): QuotaGuardStatus {
+    return this.quotaGuard.clear(reason);
+  }
+
+  /**
+   * 投稿批次账（`src/publish-batches.ts`）的落盘路径 —— **必须跟随台账目录**。
+   *
+   * 为什么（QA 2026-10-21 实测）：`recordBatchSubmit/recordBatchOutcome` 不传 `logPath` 时会落到
+   * `DATA_DIR/publish-log.jsonl`，也就是**生产日志**。于是任何跑到"多分P 提交/落地"的测试都会
+   * 往生产 publish-log 里写 `batch-submit`/`batch-landed` 行（实测复跑一次套件多 2 行，
+   * taskId 还是测试的 `ratelimit-append-01`）。这不影响每日额度（额度只数 submit/confirm），
+   * 但污染生产日志、也让"跑完日志行数不变"这条验收永远不可能成立。
+   * 台账本身就是按自己的目录算 `publishLogPath` 的（测试用临时目录），跟着它走即可。
+   */
+  private batchLog(): { logPath: string } {
+    return { logPath: this.ledger.publishLogPath };
+  }
+
+  /**
+   * 续传（追加分P）重试前的「到底落没落地」探针。
+   *
+   * 硬要求：追加分P 是往**已有稿件**里加内容，万一上一次"被限流拒绝"的提交其实已经写进去了，
+   * 再投一次就是**同一个分P 出现两次**（本项目最不能犯的错）。
+   * 所以重试前**必须**用 fresh 的分P 列表核对标题（与 `confirmPublished` 同一套 `norm()` 比较）。
+   *
+   * 返回值三态刻意分开：
+   *   · `landed`   ⇒ 全部标题都已在 ⇒ 视为已落地，**不要再投**；
+   *   · `partial`  ⇒ 一部分已在 ⇒ 既不能重投（会重复）也不能当成功（会漏片），按失败交给人；
+   *   · `absent`   ⇒ 确认一个都不在 ⇒ 安全重试；
+   *   · `unknown`  ⇒ 列表查不到（接口失败/没有分P 字段）⇒ **不重试**（保守，按原逻辑 FAILED）。
+   */
+  private async probeAppendLanded(
+    aid: string,
+    wantTitles: string[],
+    log: Logger,
+  ): Promise<'landed' | 'partial' | 'absent' | 'unknown'> {
+    const norm = (s: string): string => s.replace(/\s+/g, '').trim();
+    const want = Array.from(new Set(wantTitles.map(norm).filter((s) => s.length > 0)));
+    if (want.length === 0) return 'landed';
+    /* fresh: true —— 必须看到**最新**分P 列表，缓存里的快照正是"提交前"的，用来判断落地毫无意义 */
+    const existing = await this.fetchExistingPartTitles(aid, log, { fresh: true });
+    if (!existing) {
+      log.warn('限流重试前核对目标分P 失败（查不到分P 列表）—— 为避免重复分P，本次不重试');
+      return 'unknown';
+    }
+    const have = new Set(existing.map(norm));
+    const landedCount = want.filter((t) => have.has(t)).length;
+    if (landedCount === want.length) return 'landed';
+    if (landedCount > 0) {
+      log.warn(
+        `限流重试前核对：${landedCount}/${want.length} 个标题已在目标稿件的分P 列表里 —— ` +
+          `重投会让已在的那几P 再出现一次，因此不重试（交给人工核对）`,
+      );
+      return 'partial';
+    }
+    return 'absent';
   }
 
   /**
@@ -1102,6 +1669,10 @@ export class Publisher {
    *
    * 报告写失败不影响主流程：`writeErrorReport` 内部对写盘失败只降级（只留 errors.jsonl 那行），
    * 且这里的整段又包了一层 try —— 诊断能力再重要，也不能反过来把投稿搞挂。
+   *
+   * `retries`（2026-10-17 QA 复核发现）：限流重试耗尽后，台账 `failReason` 写了
+   * 「（限流重试 3 次仍失败）」但报告里 `retries: []`，人工点开报告看不出"到底重试过没有、
+   * 每次是什么时候被拒的"。所以调用方把每次被限流拒绝的记录传进来，这里透传给 `writeErrorReport`。
    */
   private reportClipFailure(input: {
     taskId: string;
@@ -1111,6 +1682,8 @@ export class Publisher {
     error: unknown;
     type: ErrorType;
     cutOutput?: string;
+    /** 每次尝试的记录（进报告的 `retries` 字段） */
+    retries?: RetryAttempt[];
   }): void {
     try {
       const failReason =
@@ -1122,6 +1695,7 @@ export class Publisher {
         // 包一层：报告标题/时间线里要一眼看出是**第几个片段**，否则"切片失败"无从定位
         error: new Error(`片段 #${input.clipIndex} ${input.stage} 失败：${failReason}`),
         type: input.type,
+        ...(input.retries && input.retries.length > 0 ? { retries: input.retries } : {}),
         client: this.client,
         ledgerEntries: {
           clipIndex: input.clipIndex,
@@ -1162,6 +1736,85 @@ export class Publisher {
    * ⚠️ 无论哪条路径，**都不得阻塞切片流程**：切片的前置条件只有「源文件存在且可用」。
    * 台账记录上传状态的唯一用途是判断「源 mp4 何时可以删」（§7.3）。
    */
+  /**
+   * 投稿前补全主播 UID（简介模板 `{{anchorUid}}` 用）。
+   *
+   * 为什么放在投稿入口而不是任务创建时：历史任务、手动导入、以及任何漏网的任务
+   * 都没有这个字段，投稿时兜底查一次最稳；查到了回写 ledger，下次投稿不再查。
+   * 查不到（房间号失效 / 断网）也照常投稿，简介里那一项留空 —— 可选字段绝不挡投稿。
+   *
+   * ⚠️ 2026-10-17 修：**房间号变了必须重查**。
+   *   目录轮询导入的场次不知道房间号，创建时按 `cfg.room.roomId` 兜底 —— 而配置主房间
+   *   不一定是这一场的主播（实测：乙主播的场次兜底成甲主播的房间 23456789，简介写成
+   *   「@甲主播」+ 原文链接指向甲主播的直播间，等于给别人的空间导流）。
+   *   现在先用 `streamer` 在配置的所有房间里挑出真正的房间（写进 `anchorRoomId`），
+   *   且**只有「当初按哪个房间查的」和现在一致时才复用缓存**，否则重查。
+   */
+  private async ensureAnchorUid(task: TaskRecord): Promise<void> {
+    const prevRoom = task.anchorRoomId;
+    const roomId = await this.resolveAnchorRoomId(task);
+    if (roomId && roomId !== prevRoom) {
+      task.anchorRoomId = roomId;
+      try {
+        this.ledger.updateTask(task.id, { anchorRoomId: roomId });
+      } catch {
+        /* 回写失败不阻塞投稿 */
+      }
+    }
+    // 同一个房间已经查过 → 复用（批量投稿时每片都会走到这里）
+    if (task.anchorUid && prevRoom === roomId) return;
+    const info = await this.anchorOf(roomId || task.roomId);
+    if (info.uid) {
+      task.anchorUid = info.uid;
+      if (info.name) task.anchorName = info.name;
+      try {
+        this.ledger.updateTask(task.id, {
+          anchorUid: info.uid,
+          ...(info.name ? { anchorName: info.name } : {}),
+          anchorRoomId: roomId || task.roomId,
+        });
+      } catch {
+        /* 回写失败不阻塞投稿 */
+      }
+    }
+  }
+
+  /** 房间号 → 主播信息（会话内缓存：同一批投稿会反复问同一个房间） */
+  private readonly anchorRoomCache = new Map<string, { uid?: string; name?: string }>();
+
+  private async anchorOf(roomId: string): Promise<{ uid?: string; name?: string }> {
+    const key = String(roomId ?? '').trim();
+    if (!key) return {};
+    const hit = this.anchorRoomCache.get(key);
+    if (hit) return hit;
+    const info = await this.client.anchorInfoByRoom(key);
+    this.anchorRoomCache.set(key, info);
+    return info;
+  }
+
+  /**
+   * 决定「这一场属于哪个房间」：拿 `task.streamer` 去配置的房间里逐个对名字。
+   *
+   * 顺序：① roomId 本身就对得上 → 用它（最常见）；② 配置里的其它房间（含「添加直播」加的）
+   * 哪个对得上 → 用它；③ 都对不上 → **不猜**，保持 roomId。
+   * 名字比对做归一化（去 `_Official` 后缀、忽略大小写与分隔符），因为
+   * 目录名是 `乙主播` 而配置里的备注可能写 `乙主播`。
+   */
+  private async resolveAnchorRoomId(task: TaskRecord): Promise<string> {
+    const want = normStreamerName(task.streamer);
+    const own = String(task.roomId ?? '').trim();
+    if (!want) return own;
+    const candidates = [...new Set([own, this.cfg.room.roomId, ...(this.cfg.room.roomIds ?? [])].map((x) => String(x ?? '').trim()).filter(Boolean))];
+    if (candidates.length === 0) return own;
+    if (own && normStreamerName((await this.anchorOf(own)).name) === want) return own;
+    for (const room of candidates) {
+      if (room === own) continue;
+      const info = await this.anchorOf(room);
+      if (normStreamerName(info.name) === want) return room;
+    }
+    return own;
+  }
+
   async ensureFullVideoUpload(opts: {
     task: TaskRecord;
     uid: number | string;
@@ -1182,6 +1835,7 @@ export class Publisher {
     note: string;
   }> {
     const { task, uid, videoPath } = opts;
+    await this.ensureAnchorUid(task);
     const expectedTitle = opts.expectedTitle ?? task.title;
     const log = this.logger.child({ taskId: task.id });
 
@@ -1248,7 +1902,7 @@ export class Publisher {
       task,
       cfg: this.cfg,
       uid,
-      // 完整版同样受 >7200 秒约束
+      // 完整版同样受 ≥1200 秒约束
       dtime: computeDtime(Date.now(), 1, {
         submitGapSec: this.cfg.publish.submitGapSec,
         clipGapSec: this.cfg.publish.clipGapSec,
@@ -1260,7 +1914,9 @@ export class Publisher {
       ...(coverRes.cover ? { cover: coverRes.cover } : {}),
     });
     try {
-      const res = await this.client.biliUpload({ uid, videos: [videoPath], config });
+      /* 走提交闸门：完整版与切片可能在同一进程里交替提交，B站 的频率限制是**按账号**的，
+         所以「谁先谁后」必须由同一个进程级闸门排队（见 {@link withSubmitGate}）。 */
+      const res = await this.submitUpload({ uid, videos: [videoPath], config }, log, '完整版');
       this.ledger.logPublish({ taskId: task.id, clipIndex: -1, action: 'submit', uploadTaskId: res.taskId, title: expectedTitle });
       log.info(`已由本服务提交完整版上传，taskId=${res.taskId}（完成仍以 archives 反查为准）`);
       return { status: 'UPLOADING', taskId: res.taskId, note: '本服务已提交完整版上传' };
@@ -1403,9 +2059,32 @@ export class Publisher {
       return { clipIndex, ok: true, skipped: note, bvid: m.bvid, warnings };
     }
 
-    // ---- 源文件校验 ----
-    const sourcePath = pickSourceForCut(task, cfg);
-    if (!sourcePath) {
+    // ---- 幂等 3：切片产物已存在 → **不重切**，直接投稿 ----
+    //
+    // 这是「重新切片与投稿」按钮的语义收口（2026-10-17 用户明确口径）：
+    //   · 产物在   ⇒ 重新**投稿**（不再提交一次 ffmpeg——既浪费几分钟又覆盖已有文件）；
+    //   · 产物不在 ⇒ 重新**切片**再投稿（走下面的正常切割流程）。
+    // 为什么可以放心复用：用户改过时间范围的候选不会误入这里 ——
+    // `PATCH /api/task/:id/clip/:idx` 改区间时会把 `cutOutput` 一并 unset，
+    // 所以「cutOutput 有值且文件确实存在」⇒ 产物与当前切片区间一致。
+    // 已发布的候选到不了这个函数（publishClips 的状态过滤已把它们挡掉），
+    // 显式指定重投（approve + includeSubmitted）的场景同样受益：产物在就不重切。
+    const reuseOutput =
+      typeof clip.cutOutput === 'string' && clip.cutOutput !== '' && exists(clip.cutOutput)
+        ? clip.cutOutput
+        : undefined;
+    let taskOutput: string | undefined;
+    if (reuseOutput) {
+      taskOutput = reuseOutput;
+      log.info(
+        `复用已有切片产物（不重切，直接投稿）：${path.basename(reuseOutput)}（${(fileSize(reuseOutput) / 1024 / 1024).toFixed(1)} MB）`,
+        { data: { clipIndex } },
+      );
+    }
+
+    // ---- 源文件校验（复用产物时不需要源文件，跳过）----
+    const sourcePath: string = reuseOutput ? '' : (pickSourceForCut(task, cfg) ?? '');
+    if (!reuseOutput && !sourcePath) {
       const msg = `找不到可用于切片的源文件。source.rawFiles 与 fullVideoPath 都不可用，无法切片`;
       log.error(msg);
       this.ledger.setClipStatus(task.id, clipIndex, 'FAILED', { failReason: msg });
@@ -1421,8 +2100,9 @@ export class Publisher {
     }
 
     // ---- 弹幕烧录：源版本决定是否传 ASS（陷阱 #8、硬约束 #12）----
+    // （复用已有产物时整段跳过：那些 ASS 是**切割时**烧进画面的，现在重建也没人用）
     let assPath: string | undefined;
-    if (cfg.clip.burnDanmaku) {
+    if (!reuseOutput && cfg.clip.burnDanmaku) {
       if (task.source.fullVideoHasDanmaku) {
         warnings.push('源文件已烧弹幕（fullVideoHasDanmaku=true），不再传 assFilePath，避免叠双层弹幕');
       } else if (task.source.danmaAssPath && exists(task.source.danmaAssPath)) {
@@ -1473,7 +2153,7 @@ export class Publisher {
      *
      * 为什么值得做：转写已经花过 ASR 的钱，不烧字幕等于白花；
      * 静音刷视频和竖屏分发两个场景都离不开字幕。 */
-    if (cfg.clip.burnSubtitles) {
+    if (!reuseOutput && cfg.clip.burnSubtitles) {
       const segments = this.transcriptOf(task);
       if (segments.length === 0) {
         warnings.push('没有转写内容（transcript.json 缺失或为空），本片只烧弹幕、不烧字幕');
@@ -1543,9 +2223,11 @@ export class Publisher {
     // ---- 提交前写 SUBMITTING（崩溃恢复的判定点）----
     this.ledger.setClipStatus(task.id, clipIndex, 'SUBMITTING', { fingerprint: fp });
 
-    // ---- 第一步：切片 ----
-    let cutTaskId: string;
-    try {
+    // ---- 第一步：切片（产物已复用时整段跳过）----
+    let cutTaskId: string | undefined;
+    if (reuseOutput) cutTaskId = '(reused)';
+    else
+      try {
       /* ⚠️ 三个路径**全部**必须绝对路径（陷阱 #6）。
          实测事故（2026-09-23，真实录播验证时抓到）：
            `assFilePath` 漏了 absPath，于是把 `data/tasks/<id>/burn-xxx.ass` 这样的
@@ -1590,14 +2272,15 @@ export class Publisher {
     }
 
     // ---- 第二步：轮询到 completed，取服务端返回的真实产出路径 ----
-    let taskOutput: string | undefined;
-    try {
-      const detail = await this.waitTask(cutTaskId, {
-        timeoutSec: cfg.clip.cutTimeoutSec,
-        ...(opts.signal ? { signal: opts.signal } : {}),
-        onPoll: (d) => log.debug(`切片任务 ${cutTaskId} 状态：${d.status ?? 'unknown'}`),
-      });
-      taskOutput = typeof detail.output === 'string' && detail.output ? detail.output : output;
+    // （产物已复用时整段跳过 —— 文件已经在了，没有任务可轮询）
+    if (!reuseOutput)
+      try {
+        const detail = await this.waitTask(cutTaskId, {
+          timeoutSec: cfg.clip.cutTimeoutSec,
+          ...(opts.signal ? { signal: opts.signal } : {}),
+          onPoll: (d) => log.debug(`切片任务 ${cutTaskId} 状态：${d.status ?? 'unknown'}`),
+        });
+        taskOutput = typeof detail.output === 'string' && detail.output ? detail.output : output;
       if (taskOutput !== output) {
         log.info(`服务端返回的产出路径与预期不同，以服务端为准：${String(detail.output)}`);
       }
@@ -1634,27 +2317,43 @@ export class Publisher {
     // ---- 多分P模式：只切片，投稿由 publishAsMultiPart 统一完成 ----
     if (opts.skipUpload) {
       const note = `已切片，等待与完整版一起投进同一稿件（多分P模式，不单独投稿）`;
-      this.ledger.setClipStatus(task.id, clipIndex, 'CUT', { cutOutput: taskOutput, fingerprint: fp });
-      log.info(note, { data: { clipIndex, output: path.basename(taskOutput) } });
-      return { clipIndex, ok: true, skipped: note, cutTaskId, output: taskOutput, warnings };
+      /* taskOutput 到这里必有值：要么来自产物复用，要么来自轮询产出（失败已在上面 return） */
+      const cutFile = taskOutput as string;
+      this.ledger.setClipStatus(task.id, clipIndex, 'CUT', { cutOutput: cutFile, fingerprint: fp });
+      log.info(note, { data: { clipIndex, output: path.basename(cutFile) } });
+      return { clipIndex, ok: true, skipped: note, cutTaskId, output: cutFile, warnings };
     }
 
     // ---- 第三步：投稿 ----
     const submitTimeMs = opts.submitTimeMs ?? Date.now();
-    // 序号 N：同一批里的第几片（用已提交数 + 1）
-    const n = this.ledger.readPublishLog({ sinceMs: submitTimeMs - 86400_000 }).filter((r) => r['action'] === 'submit').length + 1;
+    /* 序号 N：**本场第几片**（1 起），由调用方 `publishClips` 传下来（`clipOrdinal: idx + 1`）。
+       这里原先自己数：「近 24 小时的 submit 条数 + 1」—— 那个口径**跨批次**，前一晚投过的切片
+       会把本批的 N 抬高，整批被推后 (N-1)×间隔（线上实测 2026-10-17：N=28 ⇒ 首片 02:26 变 04:41，
+       详见 `CutAndUploadOptions.clipOrdinal`）。缺省 1 = 把这一片当本批首片 ——
+       直接调本函数的单片路径（人工重投等）不该再被那个跨批次的近似值推到几小时后。 */
+    const n =
+      opts.clipOrdinal !== undefined && Number.isFinite(opts.clipOrdinal) && opts.clipOrdinal >= 1
+        ? Math.floor(opts.clipOrdinal)
+        : 1;
     // 首片允许用户显式指定发布时间；其余按 clipGapSec 递进
     const wantFirst = n === 1 ? parseFirstPublishAt(cfg.publish.firstPublishAt) : undefined;
     if (n === 1 && cfg.publish.firstPublishAt && wantFirst === undefined) {
       warnings.push('publish.firstPublishAt 无法解析或已过期，已回退为自动排期（正确格式如 2026-09-23T08:00）');
     }
-    /* 立即发布：与 buildBiliupConfig 用**同一个**判定，避免「payload 不带 dtime、
-       日志却写定时发布」这种自相矛盾（实测踩过）。 */
-    let immediate = cfg.publish.immediatePublish === true;
+    /* 立即发布 / 片间隔：与 buildBiliupConfig 用**同一个**判定，避免「payload 不带 dtime、
+       日志却写定时发布」这种自相矛盾（实测踩过）。
+
+       ★ 这里的口径由 `resolveClipPublishSchedule()` 统一给出（2026-10-16 定，2026-10-17 改口径）：
+         「单独投稿」⇒ 固定定时投稿 + 「设置里的相邻切片间隔 / 随机抖动」（间隔 300 秒保底、
+         抖动受「必须小于间隔」夹取）。`immediatePublish` 仍不参与切片（立即发布不传 dtime）。
+         「追加切片投稿」⇒ 逐字沿用 config（这条路径通常不走到这里：它带 skipUpload，
+         切完就返回、由 publishAsMultiPart 统一投）。 */
+    const sched = resolveClipPublishSchedule(cfg.publish);
+    let immediate = !sched.scheduled;
     let dtime = computeDtime(submitTimeMs, n, {
       submitGapSec: cfg.publish.submitGapSec,
-      clipGapSec: cfg.publish.clipGapSec,
-      jitterSec: cfg.publish.jitterSec,
+      clipGapSec: sched.gapSec,
+      jitterSec: sched.jitterSec,
       ...(wantFirst !== undefined ? { notBeforeSec: wantFirst } : {}),
     });
     /* 用户给**这一片**手动指定的发布时间优先于自动排期（`PATCH /api/task/:id/clip/:idx {dtime}`）。
@@ -1676,6 +2375,16 @@ export class Publisher {
         );
       }
     }
+    /* 提交前的最后一道复核：dtime 是与**批次开始时刻**对齐排的，但真正调接口是现在
+       —— 上传慢的时候靠后的片会被挤到「提交后不足 1200 秒」而被 B站 拒稿（见函数注释）。 */
+    if (!immediate) {
+      const gate = clampDtimeForSubmit(dtime, Date.now());
+      if (gate.bumped) {
+        warnings.push(gate.note);
+        log.warn(`第 ${n} 片发布时间被合规修正：${gate.note}`);
+      }
+      dtime = gate.dtime;
+    }
     const coverRes = resolveCover(this.cfg, {}, log);
     if (coverRes.attempts.length) {
       log.debug(`封面回退过程：${coverRes.attempts.map((a) => `${a.source}(${a.reason})`).join(' → ')}`);
@@ -1694,15 +2403,117 @@ export class Publisher {
     });
     warnings.push(...cfgWarnings);
 
+    /* taskOutput 到这里必有值（复用或轮询二选一），但 TS 推不出来 —— 显式守卫，
+       宁可抛内部错误也不把 undefined 塞进投稿载荷（会出现 videos:[undefined] 的 400） */
+    if (!taskOutput) {
+      throw new Error('内部错误：走到投稿却没有切片产物路径（复用与轮询都没给出 output）');
+    }
+
+    /* ---- 第三步：投稿（含「限流」安全重试）----
+       B站 的「您投稿的频率过快，请稍等2秒」是**提交被拒**（没有任何稿件/分P 被创建），
+       等几秒重交是安全的 —— 见文件顶部 `UPLOAD_RATE_LIMIT_*` 的说明与 2026-10-17 线上事故。
+       重试**只发生在提交动作这一层**：`shouldAutoRetry`（publishClips 层）对 upload-failed
+       仍然一律不重试，那条守卫防的是"已经上传过、可能已落地"的重复分P，与这里不冲突。
+
+       ★ 2026-10-21：限流分两类，判据统一走 `classifySubmitLimit`，**必须先问 quota**：
+           · `quota`（`投稿过于频繁，请稍后再试`，无秒数）⇒ 立刻收手，不重试（见文件顶部说明）；
+           · `short`（带秒数）            ⇒ 等对方给的秒数后重交，行为与以前完全一致。 */
+    let rateLimitRetries = 0;
+    /* 每次"被限流拒绝"的记录，进错误报告（QA 复核要求：人工要知道重试了几次、各在何时） */
+    const rateLimitAttempts: RetryAttempt[] = [];
+    /** 命中账号级配额限流时的原始错误；非空 ⇒ 跳过后面所有的重试/失败逻辑，统一收尾 */
+    let quotaLimitedMsg = '';
     try {
-      const res = await this.client.biliUpload({ uid, videos: [taskOutput], config });
-      this.ledger.setClipStatus(task.id, clipIndex, 'SUBMITTED', {
-        uploadTaskId: res.taskId,
-        submitTime: submitTimeMs,
-        dtime,
-      });
-      this.ledger.registerFingerprint(fp, { taskId: task.id, clipIndex });
-      this.ledger.rememberPublishedTitle(clip.title);
+      let res: BiliUploadResponse | undefined;
+      let uploadOutcome: { status: string; error?: string } | undefined;
+      for (let attempt = 1; attempt <= this.rateLimitMaxAttempts; attempt++) {
+        try {
+          res = await this.submitUpload({ uid, videos: [taskOutput], config }, log, `片段 #${clipIndex}`);
+        } catch (e) {
+          /* 分支 A：`/bili/upload` 同步抛错（提交被拒） */
+          const msg = e instanceof Error ? e.message : String(e);
+          const limitKind = classifySubmitLimit(msg);
+          /* 配额级：不可能在几秒内恢复，原地重试只是白挨拒绝 ⇒ 立即收手 */
+          if (limitKind === 'quota') {
+            quotaLimitedMsg = msg;
+            break;
+          }
+          /* 秒级：等对方给的秒数再交（既有行为） */
+          if (limitKind === 'short' && attempt < this.rateLimitMaxAttempts) {
+            rateLimitRetries += 1;
+            rateLimitAttempts.push({ attempt, at: nowIso(), type: 'upload-failed', message: msg });
+            await this.waitForRateLimit(msg, attempt, log);
+            continue;
+          }
+          throw e;
+        }
+        /* 提交已受理：SUBMITTED 是**崩溃恢复的判定点**，必须立刻落盘（与旧行为一致）。
+           若下面发现这次其实被 B站 限流拒了，这个状态会被下一次尝试的新 taskId 覆盖 —— 无害。 */
+        const submittedTaskId = res.taskId;
+        this.ledger.setClipStatus(task.id, clipIndex, 'SUBMITTED', {
+          uploadTaskId: submittedTaskId,
+          submitTime: submitTimeMs,
+          dtime,
+        });
+        this.ledger.registerFingerprint(fp, { taskId: task.id, clipIndex });
+        this.ledger.rememberPublishedTitle(clip.title);
+
+        // ---- 第四步（可选但重要）：确认上传任务的最终结果 ----
+        // `/bili/upload` 只返回 taskId（陷阱 #11），而任务状态才是「投稿到底成没成」的直接证据。
+        // 不做这一步的话，上传失败要等到若干天后的 bvid 反查才暴露 —— 期间台账一直显示「已提交」。
+        // 注意：**bvid 仍然只能靠 /bili/archives 反查**（任务队列在内存中、重启即丢）。
+        uploadOutcome = await this.waitUploadTask(submittedTaskId, {
+          timeoutSec: cfg.publish.autoCutTimeoutSec,
+          ...(opts.signal ? { signal: opts.signal } : {}),
+          onPoll: (d) => log.debug(`上传任务 ${submittedTaskId} 状态：${d.status ?? 'unknown'}`),
+        });
+        /* 分支 B：任务终态 error。同样是"提交被拒"，但两类限流的处置相反：
+           · 线上事故那一支（`您投稿的频率过快，请稍等2秒`）⇒ 秒级，等 N 秒重交；
+           · 2026-10-21 那一支（`投稿过于频繁，请稍后再试`）⇒ 配额级，立刻收手。 */
+        if (uploadOutcome.status === 'error') {
+          const kind = classifySubmitLimit(uploadOutcome.error);
+          if (kind === 'quota') {
+            quotaLimitedMsg = uploadOutcome.error ?? '投稿过于频繁，请稍后再试';
+            break;
+          }
+          if (kind === 'short' && attempt < this.rateLimitMaxAttempts) {
+            rateLimitRetries += 1;
+            rateLimitAttempts.push({
+              attempt,
+              at: nowIso(),
+              type: 'upload-failed',
+              message: uploadOutcome.error ?? '',
+            });
+            await this.waitForRateLimit(uploadOutcome.error ?? '', attempt, log);
+            continue;
+          }
+        }
+        break;
+      }
+      /* ---- 配额级限流：本片按「待投」收尾，本轮到此为止 ----
+         ⚠️ 必须放在写 `submit` 行**之前**：被配额拒的那一次**什么都没创建**，
+            记一条 submit 会让 `todayPublishedCount()` 把额度凭空吃掉（与限流重试同一条理由）。
+         ⚠️ 还要清掉刚才登记的指纹：那条指纹是"投出去了"的**假证据**，
+            留着的话「重跑投稿阶段」时幂等 1 会命中并把它当成已投过（转成 SUBMITTED），
+            于是这一片永远投不出去、也没有任何报错。 */
+      if (quotaLimitedMsg) {
+        if (!clip.bvid) {
+          this.ledger.clearFingerprintsFor([{ taskId: task.id, clipIndex }]);
+        }
+        return this.finishQuotaLimited({
+          task,
+          clipIndex,
+          clip,
+          msg: quotaLimitedMsg,
+          log,
+          cutOutput: taskOutput,
+          warnings,
+        });
+      }
+      if (!res) throw new Error('内部错误：投稿重试循环结束却没有提交结果');
+
+      /* submit 行只写**一次**（放在循环外）：限流被拒的那几次什么都没创建，不该算进
+         「今日已投稿」的额度统计，否则重试会把一天的额度凭空吃掉。 */
       this.ledger.logPublish({
         taskId: task.id,
         clipIndex,
@@ -1718,24 +2529,21 @@ export class Publisher {
       log.info(
         `已提交投稿：${clip.title}（uploadTaskId=${res.taskId}，` +
           (immediate ? '**立即发布**（未传 dtime，过审即公开）' : `定时发布 ${fmtLocal(dtime * 1000)}`) +
-          `，${cfg.publish.isOnlySelf === 1 ? '仅自己可见' : '公开'}）`,
+          `，${cfg.publish.isOnlySelf === 1 ? '仅自己可见' : '公开'}` +
+          `${rateLimitRetries > 0 ? `；此前被限流拒绝 ${rateLimitRetries} 次，等待后重试成功` : ''}）`,
         { stage: 'PUBLISHED' },
       );
-
-      // ---- 第四步（可选但重要）：确认上传任务的最终结果 ----
-      // `/bili/upload` 只返回 taskId（陷阱 #11），而任务状态才是「投稿到底成没成」的直接证据。
-      // 不做这一步的话，上传失败要等到若干天后的 bvid 反查才暴露 —— 期间台账一直显示「已提交」。
-      // 注意：**bvid 仍然只能靠 /bili/archives 反查**（任务队列在内存中、重启即丢）。
-      const uploadOutcome = await this.waitUploadTask(res.taskId, {
-        timeoutSec: cfg.publish.autoCutTimeoutSec,
-        ...(opts.signal ? { signal: opts.signal } : {}),
-        onPoll: (d) => log.debug(`上传任务 ${res.taskId} 状态：${d.status ?? 'unknown'}`),
-      });
-      if (uploadOutcome.status === 'error') {
+      if (uploadOutcome && uploadOutcome.status === 'error') {
         const msg = uploadOutcome.error ?? '（对方未提供错误信息，请看 /common/getLogContent 的日志片段）';
-        log.error(`投稿任务失败：${msg} —— 切片产物已保留，可单独重投`, undefined, { data: { clipIndex } });
+        /* 耗尽重试仍是限流 ⇒ failReason 必须写清"重试过几次"，否则人工重投前无从判断
+           是"B站 真不接受"还是"我们没重试"。 */
+        const limitedNote =
+          rateLimitRetries > 0 && isUploadRateLimited(msg)
+            ? `（限流重试 ${this.rateLimitMaxAttempts} 次仍失败）`
+            : '';
+        log.error(`投稿任务失败：${msg}${limitedNote} —— 切片产物已保留，可单独重投`, undefined, { data: { clipIndex } });
         this.ledger.setClipStatus(task.id, clipIndex, 'FAILED', {
-          failReason: `投稿任务失败：${msg}`,
+          failReason: `投稿任务失败：${msg}${limitedNote}`,
           uploadTaskId: res.taskId,
           cutOutput: taskOutput,
         });
@@ -1745,30 +2553,43 @@ export class Publisher {
           taskTitle: task.title,
           clipIndex,
           stage: 'PUBLISHED',
-          error: new Error(msg),
+          error: new Error(`${msg}${limitedNote}`),
           type: 'upload-failed',
           cutOutput: taskOutput,
+          ...(rateLimitAttempts.length > 0 ? { retries: rateLimitAttempts } : {}),
         });
-        return { clipIndex, ok: false, cutTaskId, output: taskOutput, uploadTaskId: res.taskId, error: { type: 'upload-failed', message: msg }, warnings };
+        return { clipIndex, ok: false, cutTaskId, output: taskOutput, uploadTaskId: res.taskId, error: { type: 'upload-failed', message: `${msg}${limitedNote}` }, warnings };
       }
-      log.debug(`上传任务 ${res.taskId} 已完成（${uploadOutcome.status}），bvid 待 /bili/archives 反查确认`);
+      log.debug(`上传任务 ${res.taskId} 已完成（${uploadOutcome?.status ?? 'unknown'}），bvid 待 /bili/archives 反查确认`);
 
+      if (rateLimitRetries > 0) {
+        warnings.push(`投稿被 B站 限流拒绝 ${rateLimitRetries} 次，等待后重试成功`);
+      }
       return { clipIndex, ok: true, cutTaskId, output: taskOutput, uploadTaskId: res.taskId, dtime, warnings };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      log.error(`投稿失败（片段 #${clipIndex}）—— 切片产物已保留，可单独重投`, e);
-      this.ledger.setClipStatus(task.id, clipIndex, 'FAILED', { failReason: `投稿失败：${msg}`, cutOutput: taskOutput });
+      /* 分支 A 耗尽（最后一次仍是同步限流错）也要把次数写进 failReason */
+      const limitedNote =
+        rateLimitRetries > 0 && isUploadRateLimited(msg)
+          ? `（限流重试 ${this.rateLimitMaxAttempts} 次仍失败）`
+          : '';
+      log.error(`投稿失败（片段 #${clipIndex}）${limitedNote}—— 切片产物已保留，可单独重投`, e);
+      this.ledger.setClipStatus(task.id, clipIndex, 'FAILED', { failReason: `投稿失败：${msg}${limitedNote}`, cutOutput: taskOutput });
       this.ledger.logPublish({ taskId: task.id, clipIndex, action: 'fail', error: msg, title: clip.title });
       this.reportClipFailure({
         taskId: task.id,
         taskTitle: task.title,
         clipIndex,
         stage: 'PUBLISHED',
-        error: e,
+        /* ★ 2026-10-17 QA 复核：这里原来传的是原始错误 `e`，于是「同步抛限流」这一支
+           （线上事故那一支）的报告里**一个字都没提重试次数**，与上面 waitUploadTask 那一支
+           不一致。统一成 `${msg}${limitedNote}`，报告里也能看到「限流重试 3 次仍失败」。 */
+        error: new Error(`${msg}${limitedNote}`),
         type: e instanceof ApiError ? e.type : 'upload-failed',
         cutOutput: taskOutput,
+        ...(rateLimitAttempts.length > 0 ? { retries: rateLimitAttempts } : {}),
       });
-      return { clipIndex, ok: false, cutTaskId, output: taskOutput, error: { type: 'upload-failed', message: msg }, warnings };
+      return { clipIndex, ok: false, cutTaskId, output: taskOutput, error: { type: 'upload-failed', message: `${msg}${limitedNote}` }, warnings };
     }
   }
 
@@ -1780,8 +2601,23 @@ export class Publisher {
     failed: number;
     /** 每日额度诊断（便于 UI 与测试解释「为什么本批没投」） */
     quota: { todayCount: number; remain: number; requested: number };
+    /**
+     * 本批**一片都没投出去、且原因是"外部条件没满足"**（今日额度用完）。
+     *
+     * 为什么要有这个位（QA 2026-10-21 实测）：额度用完时原来只回 `results: []`，
+     * 调用方（daemon）拿不到任何信号 ⇒ 本场状态回退成 `ANALYZED`，而切片产物明明都在盘上
+     * （界面显示"待分析"，用户点「重新分析」会把已切好的片再切一遍）。
+     * 语义与多分P 路径的 `stuck` 一致：**停在"已切片 · 待发布"等条件恢复**，不是失败。
+     */
+    stuck?: boolean;
+    /**
+     * 账号受限闸门（2026-10-22）：命中时本批 **0 次提交**，切片原样待投。
+     * 与 `stuck` 同时为真 —— 调用方按"已切片·待发布"收，不要当失败。
+     */
+    quotaBlocked?: QuotaBlockInfo;
   }> {
     const { task } = opts;
+    await this.ensureAnchorUid(task);
     const log = this.logger.child({ taskId: task.id, stage: 'PUBLISHING' });
     const all = this.ledger.getClips(task.id);
     const indices =
@@ -1791,11 +2627,49 @@ export class Publisher {
         .map((c) => c.index);
 
     if (indices.length === 0) {
-      log.info('没有需要投稿的切片（未勾选或已全部处理）');
+      /* 「重新切片与投稿」点了却"什么都没发生"的实测教训（2026-10-17）：
+         对已全部发布的任务重跑，原来只留一句"没有需要投稿的切片（未勾选或已全部处理）"，
+         用户看不出是幂等保护还是坏了。按场景说人话：
+         · 全部已发布 ⇒ 明说"不会重投、为什么"（防止重复稿件是刻意设计）；
+         · 有勾选但状态是 SUBMITTED/SUBMITTING 等 ⇒ 指路 stuckClips 的核对路径；
+         · 真没勾选 ⇒ 保持原话。 */
+      const sel = all.filter((c) => c.selected);
+      const publishedCount = sel.filter((c) => c.status === 'PUBLISHED').length;
+      const inFlight = sel.filter((c) => ['SUBMITTED', 'SUBMITTING'].includes(c.status)).length;
+      let why: string;
+      if (sel.length > 0 && publishedCount === sel.length) {
+        why = `本场 ${sel.length} 个切片**已全部发布**，没有需要补投的 —— 已发布的稿件不会被重投（防止 B站 上出现重复稿件）。` +
+          `确有一片没在 B站 上时，去「切片库 → 稿件体检」对那一篇点「重新投稿这一片」`;
+      } else if (inFlight > 0) {
+        why = `没有可投的切片：${inFlight} 个已提交、等待 B站 侧确认（稍后自动反查 bvid）—— 若长时间停在这里，看「监控」页的待办核对`;
+      } else {
+        why = '没有需要投稿的切片（未勾选或已全部处理）';
+      }
+      log.info(why);
       return { results: [], submitted: 0, skipped: 0, failed: 0, quota: { todayCount: this.ledger.todayPublishedCount(), remain: -1, requested: 0 } };
     }
 
     const dryRun = opts.dryRun ?? false;
+
+    /* 账号受限闸门（2026-10-22 用户报「今天 0 次投稿还是被拒」后加）：
+       24h 内累计多次配额拒绝 ⇒ 本批 **0 次提交**、切片原样待投。
+       为什么放在"每日额度"检查之前：每日额度是我们自己的闸，账号受限是 B站 的闸；
+       后者更硬 —— 这时连一次试探都不该发（每次拒绝都在继续给账号扣分）。 */
+    if (!dryRun) {
+      const guard = this.quotaGuard.status();
+      if (guard.blocked && guard.until) {
+        log.warn(`${guard.note} —— 本批 0 次提交（切片原样待投；确认 B站 恢复后可手动解除）`);
+        return {
+          results: [],
+          submitted: 0,
+          skipped: 0,
+          failed: 0,
+          quota: { todayCount: this.ledger.todayPublishedCount(), remain: -1, requested: indices.length },
+          stuck: true,
+          quotaBlocked: { until: guard.until, rejections: guard.rejections, note: guard.note },
+        };
+      }
+    }
 
     // 每日投稿上限（§8 WP5 步骤 6）。
     // ★ dry-run 只切片、不投稿，因此**不受每日额度限制** ——
@@ -1808,7 +2682,15 @@ export class Publisher {
       const left = Math.max(0, this.cfg.publish.dailyLimit - today);
       if (left <= 0) {
         log.warn(`今日已投稿 ${today} 个，达到每日上限 ${this.cfg.publish.dailyLimit}，本批暂停（切片产物保留，可明日继续）`);
-        return { results: [], submitted: 0, skipped: 0, failed: 0, quota: { todayCount: today, remain: 0, requested: indices.length } };
+        return {
+          results: [],
+          submitted: 0,
+          skipped: 0,
+          failed: 0,
+          quota: { todayCount: today, remain: 0, requested: indices.length },
+          /* 一片都没投 + 原因是额度 ⇒ 调用方应按「已切片·待发布」收，不要回退成待分析 */
+          stuck: true,
+        };
       }
       if (queue.length > left) {
         log.warn(`本批 ${queue.length} 个切片，但今日剩余额度 ${left} 个，只处理前 ${left} 个（其余保留待明日）`);
@@ -1827,15 +2709,27 @@ export class Publisher {
     const submitBase = opts.submitTimeMs ?? Date.now();
     const archives = await this.client.biliArchives({ page: 1, pageSize: 100 }).catch(() => undefined);
 
-    /* ★ 切片阶段并发（P0-1，2026-10-13）：多分P 模式下这个循环**只切片** ——
+    /* 排期口径**一次说清**（不是每片重复一遍）：用户在 config 里改过、但当前模式下不生效的
+       那几个键，必须在这里如实点名 —— 否则「改了 clipGapSec 怎么没反应」又要靠猜。 */
+    {
+      const sched = resolveClipPublishSchedule(this.cfg.publish);
+      log.info(`本批切片投稿排期：${sched.note}`);
+      const override = describeScheduleOverride(this.cfg.publish);
+      if (override) log.info(override);
+    }
+
+    /* ★ 切片阶段并发（P0-1，2026-10-13）：**追加切片投稿**模式下这个循环只切片 ——
        cutAndUploadClip 切完就返回（见其内部「已切片，等待与完整版一起投进同一稿件」那条），
        真正的上传发生在后面的 publishMultiPart 里、且保持串行与风控抖动。
        所以这里先把切片**并发**跑掉是安全的：只并行 ffmpeg，不并行投稿。
-       ⚠️ 刻意只在 multiPart 模式放开：单P 模式下这个循环内含上传，
+       ⚠️ 刻意只在「追加」模式放开：单独投稿模式下这个循环**内含上传**，
           并发会绕过 minSubmitIntervalSec 的风控抖动（那条约束就是为投稿频率设的）。
+          判据用 resolveClipPublishMode 而不是直接读 multiPart —— 手改 config.json 时
+          `clipPublishMode='standalone'` 可能与残留的 `multiPart=true` 并存，那时必须按前者走
+          （否则会把"含上传的循环"误判成"只切片的循环"而并发上传）。
        实现上刻意复用同一个 cutAndUploadClip（不是第二套实现），结果按 queue 顺序回填，
        下面的顺序、抖动、额度、自动重试逻辑**一律保持原样**。 */
-    const cutK = this.cfg.publish.multiPart
+    const cutK = resolveClipPublishMode(this.cfg.publish) === 'append'
       ? Math.max(
           1,
           Math.min(
@@ -1859,7 +2753,7 @@ export class Publisher {
           const idx = queue[i]!;
           opts.onProgress?.({ current: i, total: queue.length, label: `切片中 ${i}/${queue.length}（并发 ${cutK}）` });
           pre[i] = await this.cutAndUploadClip(
-            { ...opts, submitTimeMs: submitBase, ...(archives ? { archiveCache: archives } : {}) },
+            { ...opts, submitTimeMs: submitBase, clipOrdinal: idx + 1, ...(archives ? { archiveCache: archives } : {}) },
             idx,
           );
         }
@@ -1888,6 +2782,10 @@ export class Publisher {
           {
             ...opts,
             submitTimeMs: submitBase,
+            /* 本场第几片（1 起）——错峰公式的 N，见 CutAndUploadOptions.clipOrdinal。
+               用切片下标而不是循环序号 i：重投/断点续投时队列是子集，
+               按下标算能保证「后面的片不会排到前面的片之前」。 */
+            clipOrdinal: idx + 1,
             ...(archives ? { archiveCache: archives } : {}),
           },
           idx,
@@ -1909,6 +2807,8 @@ export class Publisher {
           {
             ...opts,
             submitTimeMs: submitBase,
+            /* 重试必须沿用**同一个** N：否则第二次会排到另一片的位置上（见 clipOrdinal 注释） */
+            clipOrdinal: idx + 1,
             ...(archives ? { archiveCache: archives } : {}),
           },
           idx,
@@ -1923,6 +2823,33 @@ export class Publisher {
       }
       results.push(r);
       for (const w of r.warnings) log.debug(`片段 #${idx}：${w}`);
+
+      /* ★ 配额级限流 ⇒ **本轮立即收手**（2026-10-21 事故）。
+         为什么不能"继续投下一片"：配额是**账号级**的，后面的片现在投也只会挨同一句拒绝 ——
+         事故里 #4/#5/#6 就是这么一片不落地全撞死，三次拒绝除了把日志写花没有任何用处，
+         还把本来"等 30 分钟就能投"的切片写成了 FAILED。
+         这里不改任何切片状态：没投的片保持 CANDIDATE/PENDING_UPLOAD（就是"待投"），
+         切片产物也在，等配额恢复后重跑投稿阶段即可。 */
+      if (r.quotaLimited) {
+        const doneOk = results.filter((x) => x.ok && !x.skipped).length;
+        /* ⚠️ 用 `indices`（**未被每日额度截断**的原始队列）而不是 `queue`（QA 2026-10-21 实测）：
+           dailyLimit 小于勾选数时 `queue` 是前缀，拿它算剩余会把"因额度没轮到的那几片"漏掉 ——
+           告警就会少报（实测 dailyLimit=2、3 片、首片被拒 ⇒ 报"剩余 1 片"，真实待投 2 片）。 */
+        const remaining = indices.length - (i + 1);
+        if (remaining > 0) {
+          log.warn(
+            `因配额限流暂停本轮投稿，剩余 ${remaining} 片待投（本批已成功 ${doneOk} 片）` +
+              `—— 建议 ${r.quotaLimited.retryAfterMin} 分钟后重试；现在继续投只会被同一句限流拒绝`,
+          );
+        }
+        await this.alertQuotaLimited({
+          task,
+          submitted: doneOk,
+          remaining,
+          reason: r.quotaLimited.message,
+        });
+        break;
+      }
     }
     opts.onProgress?.({ current: queue.length, total: queue.length, label: '投稿完成' });
 
@@ -2048,11 +2975,21 @@ export class Publisher {
      * 调用方据此应把它当"待确认"而不是"已确认成功"。
      */
     appendUnconfirmed?: boolean;
+    /**
+     * 命中「账号级投稿配额限流」（2026-10-21）。
+     *
+     * ⚠️ **调用方必须透传这个标记**（曾经漏了，QA 2026-10-21 实测）：`publishMultiPartStage`
+     * 只看 `ok === false` 就会把它当普通失败 —— 于是 ① 本场状态回退成 ANALYZED（切片明明还在
+     * 待投，界面显示"待分析"，用户点「重新分析」会把已切好的片再切一遍）；② 对每条结果补发
+     * 「投稿失败」error 告警，与 Publisher 已发的 warn（"等 30 分钟"）自相矛盾。
+     */
+    quotaLimited?: QuotaLimitedInfo;
   }> {
     const cfg = this.cfg;
     const log = (opts.logger ?? this.logger).child({ taskId: opts.task.id, mod: 'multipart' });
     const warnings: string[] = [];
     const { task, uid, clips } = opts;
+    await this.ensureAnchorUid(task);
 
     // 先拉一次稿件列表：既用于「推断主播名」（分P标题要用），也用于随后的幂等反查。
     // 只查一次，避免重复请求。
@@ -2417,24 +3354,23 @@ export class Publisher {
       return { ok: true, skipped: note, mainTitle, parts: titled, warnings };
     }
 
-    /* ---- 4. dtime（多P稿件只有一个发布时间）---- */
+    /* ---- 4. dtime（多P稿件只有一个发布时间）----
+       注意：多P 模式下**所有分P 共用这一个 dtime**，所以「相邻切片间隔 clipGapSec」
+       在这里根本不生效（一场直播只有一次发布时刻）。要每片各按 5 分钟错峰，
+       必须用「单独投稿」（clipPublishMode='standalone' / multiPart=false）。 */
     const submitTimeMs = Date.now();
     const immediate = cfg.publish.immediatePublish === true;
     /* 立即发布时**根本没有 dtime 这个字段**。
        早先这里用「提交时刻」当占位值返回，结果日志写成「定时发布 <刚提交的时间>」，
        读起来像排期错乱（实测误导过一次排查）。所以立即发布时干脆不产出这个值，
        由调用方按 undefined 走「立即发布」文案。 */
-    const dtime = immediate
+    let dtime = immediate
       ? undefined
       : computeDtime(submitTimeMs, 1, {
           submitGapSec: cfg.publish.submitGapSec,
           clipGapSec: cfg.publish.clipGapSec,
           jitterSec: cfg.publish.jitterSec,
         });
-    if (!immediate && dtime !== undefined) {
-      const dt = validateDtime(dtime, submitTimeMs);
-      if (!dt.ok) warnings.push(dt.note);
-    }
 
     /* ---- 5. 投稿配置 ---- */
     /* 封面（P2）：coverFrom='frame' 时从**本场评分最高的切片**抽一帧当封面。
@@ -2486,6 +3422,18 @@ export class Publisher {
         degraded: false,
       } as ClipRecord);
 
+    /* 提交前复核（硬约束 #4）：dtime 是**本函数开头**算的，而真正调接口是在这里 ——
+       大文件上传可能耗时几十分钟，靠后的分P 会被挤到「提交后不足 1200 秒」而被拒稿。
+       多P 稿件只有一个发布时刻，所以这里只核一次。 */
+    if (!immediate && dtime !== undefined) {
+      const gate = clampDtimeForSubmit(dtime, Date.now());
+      if (gate.bumped) {
+        warnings.push(gate.note);
+        log.warn(`多P稿件发布时间被合规修正：${gate.note}`);
+      }
+      dtime = gate.dtime;
+    }
+
     const { config: biliConfig, warnings: cfgWarnings } = buildBiliupConfig({
       clip: fakeClip,
       task,
@@ -2517,15 +3465,174 @@ export class Publisher {
         this.ledger.setClipStatus(task.id, p.clipIndex, 'SUBMITTING', {});
       }
     }
+    /* 限流重试计数**提到 try 外面**：catch 里的 failReason 也要写清"重试过几次" */
+    let multipartLimitedRetries = 0;
+    /** 每次"被限流拒绝"的记录，随错误报告落盘（人工据此判断是否值得重投） */
+    const multipartRateLimitAttempts: RetryAttempt[] = [];
     try {
-      const res = await this.client.biliUpload({
-        uid,
-        videos,
-        config: biliConfig,
-        /* ★ 有续传目标就带 vid：biliLive-tools 收到 vid 走 editMedia（追加分P），
-           没有则走 addMedia（新建稿件）。这一行就是「切片接进 biliLive-tools 那个稿件」的关键。 */
-        ...(resumeAid ? { vid: resumeAid } : {}),
-      });
+      /* ---- 提交（含「限流」安全重试）----
+         B站 的「您投稿的频率过快，请稍等2秒」= **提交被拒**（稿件/分P 都没创建），
+         等几秒重交是安全的（2026-10-17 线上事故，见文件顶部 UPLOAD_RATE_LIMIT_* 说明）。
+         ★ 追加分P（resumeAid 已知）额外守一道：重试前先 fresh 核对目标稿件的分P 标题 ——
+           已在 ⇒ 视为已落地、**绝不再投**（重复分P 是本项目最不能犯的错）；查不到 ⇒ 不重试。 */
+      let res: BiliUploadResponse | undefined;
+      let lastLimitedMsg = '';
+      let alreadyLanded = false;
+      let st0Status: string | undefined;
+      let st0Error: string | undefined;
+      let stateText = '';
+      for (let attempt = 1; attempt <= this.rateLimitMaxAttempts; attempt++) {
+        try {
+          res = await this.submitUpload(
+            {
+              uid,
+              videos,
+              config: biliConfig,
+              /* ★ 有续传目标就带 vid：biliLive-tools 收到 vid 走 editMedia（追加分P），
+                 没有则走 addMedia（新建稿件）。这一行就是「切片接进 biliLive-tools 那个稿件」的关键。 */
+              ...(resumeAid ? { vid: resumeAid } : {}),
+            },
+            log,
+            `${resumeAid ? '续传追加' : '新建稿件'} ${videos.length} 个分P`,
+          );
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          const limitKind = classifySubmitLimit(msg);
+          /* ★ 配额级限流（`投稿过于频繁，请稍后再试`）⇒ **不重试**，直接抛给外层按「待投」收尾。
+             顺序必须在 `isUploadRateLimited` 之前：那句措辞现在两边都算"限流"，
+             若先走秒级分支就会连撞 3 次（10-21 事故的形态）。 */
+          if (limitKind === 'quota') throw e;
+          if (limitKind !== 'short') throw e;
+          lastLimitedMsg = msg;
+          multipartRateLimitAttempts.push({ attempt, at: nowIso(), type: 'upload-failed', message: msg });
+          if (attempt >= this.rateLimitMaxAttempts) throw e;
+          const probe = resumeAid
+            ? await this.probeAppendLanded(resumeAid, titled.map((p) => p.title), log)
+            : 'absent';
+          if (probe === 'landed') {
+            alreadyLanded = true;
+            multipartLimitedRetries += 1;
+            break;
+          }
+          /* 查不到分P 列表 / 只落了一部分 ⇒ 不重试（重复分P 的代价远大于重投一次） */
+          if (probe === 'unknown' || probe === 'partial') throw e;
+          multipartLimitedRetries += 1;
+          await this.waitForRateLimit(msg, attempt, log);
+          continue;
+        }
+
+        /* ★ 先**当场问一次** biliLive-tools 的状态（不等待：确认窗口本身已经够长了）。两个作用：
+             ① `error` ⇒ 这次追加**真失败**，立刻标 FAILED 返回，不必再花 90 秒等分P 出现
+                （旧代码不看这个字段：成功/失败/还在跑都写"任务已完成、B站 侧还没查到"，
+                 实测那条真失败的追加就是这么被写成「已提交待确认」、静默躺了半小时）；
+             ② 它决定"读不到分P 列表"时该往哪边倒：任务已完成 → 按已落地；还没结束 → 按未确认。 */
+        const st0 =
+          resumeAid && typeof this.client.taskDetail === 'function'
+            ? await this.client.taskDetail(res.taskId).catch(() => undefined)
+            : undefined;
+        st0Status = typeof st0?.status === 'string' ? st0.status : undefined;
+        st0Error = typeof st0?.error === 'string' ? st0.error : undefined;
+        stateText =
+          st0Status === 'completed'
+            ? 'biliLive-tools 侧任务已完成'
+            : st0Status === undefined
+              ? '查不到 biliLive-tools 的任务状态（队列可能因它重启而丢失）'
+              : `biliLive-tools 侧任务尚未结束（状态 ${st0Status}）`;
+        /* 「限流拒绝」也会把任务终态变成 error（线上事故就是这一支），必须与「真失败」区分开：
+           能被限流说明提交没被受理 —— 但要先用探针确认真的没落地，才允许重交。 */
+        const st0Kind = classifySubmitLimit(st0Error);
+        /* ★ 配额级（2026-10-21）：**不重试**。但仍要先探一次"有没有偷偷落地"——B站 有过
+           「回了错误、分P 却写进去了」的形态，确认落地就按已落地收尾，否则交给外层按「待投」收尾。
+           （`probeAppendLanded` 本身一个字没改，这里只是多一个调用点。） */
+        if (st0Status === 'error' && st0Kind === 'quota') {
+          if (resumeAid) {
+            const probeQuota = await this.probeAppendLanded(resumeAid, titled.map((p) => p.title), log);
+            if (probeQuota === 'landed') {
+              alreadyLanded = true;
+              lastLimitedMsg = st0Error ?? '';
+              multipartLimitedRetries += 1;
+              break;
+            }
+          }
+          throw new Error(st0Error ?? '投稿过于频繁，请稍后再试');
+        }
+        if (st0Status === 'error' && st0Kind === 'short' && attempt < this.rateLimitMaxAttempts) {
+          lastLimitedMsg = st0Error ?? '';
+          multipartRateLimitAttempts.push({ attempt, at: nowIso(), type: 'upload-failed', message: lastLimitedMsg });
+          const probe = await this.probeAppendLanded(resumeAid, titled.map((p) => p.title), log);
+          if (probe === 'landed') {
+            alreadyLanded = true;
+            multipartLimitedRetries += 1;
+            break;
+          }
+          if (probe === 'unknown' || probe === 'partial') break; // 保守：落到下面的 FAILED 分支
+          multipartLimitedRetries += 1;
+          await this.waitForRateLimit(lastLimitedMsg, attempt, log);
+          continue;
+        }
+        break;
+      }
+      /* ⚠️ 顺序要紧：alreadyLanded 时可能**一次都没提交成功**（res 为 undefined），
+         所以先处理它，再守卫 res。 */
+      if (alreadyLanded) {
+        /* 上一次"被限流拒绝"的提交其实已经落到目标稿件里了（B站 回了错误、分P 却写进去了）。
+           这时**再投一次就是重复分P**，所以按"已落地"收尾：状态推进 + 批次记账都按成功走。 */
+        const note =
+          `多分P 提交被 B站 限流（${lastLimitedMsg.slice(0, 90)}），但重试前核对发现这 ${titled.length} 个分P ` +
+          `**已经在目标稿件的分P 列表里** —— 不再重投（否则分P 会重复），按已落地处理`;
+        log.warn(note);
+        warnings.push(note);
+        if (res?.taskId) {
+          recordBatchOutcome({
+            taskId: task.id,
+            uploadTaskId: res.taskId,
+            kind: resumeAid ? 'append' : 'create',
+            status: 'landed',
+            ...(resumeAid ? { aid: resumeAid } : {}),
+            ...(opts.resumeBvid ? { bvid: opts.resumeBvid } : {}),
+            landed: titled.map((p) => p.title),
+            note: '限流重试前的落地核对命中',
+          }, this.batchLog());
+        }
+        for (const p of titled) {
+          if (p.kind === 'clip' && p.clipIndex !== undefined) {
+            const landed = Boolean(resumeAid && opts.resumeBvid);
+            this.ledger.setClipStatus(task.id, p.clipIndex, landed ? 'PUBLISHED' : 'SUBMITTED', {
+              submitTime: submitTimeMs,
+              dtime,
+              ...(res?.taskId ? { uploadTaskId: res.taskId } : {}),
+              ...(landed && opts.resumeBvid ? { bvid: opts.resumeBvid, publishedAt: nowIso() } : {}),
+            });
+            let fpOfClip: string | undefined;
+            const c = this.ledger.getClip(task.id, p.clipIndex);
+            if (c) {
+              fpOfClip = c.fingerprint ?? clipFingerprint({ sourceVideoId: task.recordingId ?? task.id, start: c.start, end: c.end, title: c.title });
+              this.ledger.registerFingerprint(fpOfClip, { taskId: task.id, clipIndex: p.clipIndex });
+            }
+            this.ledger.logPublish({
+              taskId: task.id,
+              clipIndex: p.clipIndex,
+              action: 'submit',
+              title: p.title,
+              ...(res?.taskId ? { uploadTaskId: res.taskId } : {}),
+              ...(fpOfClip ? { fingerprint: fpOfClip } : {}),
+              dtime,
+            });
+          }
+        }
+        this.ledger.rememberPublishedTitle(mainTitle);
+        return {
+          ok: true,
+          ...(res?.taskId ? { uploadTaskId: res.taskId } : {}),
+          mainTitle,
+          parts: titled,
+          ...(dtime !== undefined ? { dtime } : {}),
+          warnings,
+          mode: resumeAid ? 'append' : 'create',
+        };
+      }
+
+      if (!res) throw new Error('内部错误：多分P 提交重试循环结束却没有提交结果');
 
       /* ★ 2026-10-11：把这一批**记下来**（投稿批次账，见 src/publish-batches.ts）。
          为什么要记：确认落地原来只能"逐片按标题模糊匹配"，出了事说不清
@@ -2539,7 +3646,7 @@ export class Publisher {
         ...(opts.resumeBvid ? { bvid: opts.resumeBvid } : {}),
         titles: titled.map((p) => p.title),
         clipIndices: clipPartsOfBatch.map((p) => p.clipIndex!),
-      });
+      }, this.batchLog());
 
       /* ★★ 续传必须**反查确认**：任务 completed 只代表 biliLive-tools 提交完了，
           不代表 B站 真的写进去了。实测事故（2026-09-23）：
@@ -2549,32 +3656,20 @@ export class Publisher {
           所以这里查一次分P 列表，确认待投标题真的出现了；不出现就如实报失败。 */
       let appendVerified: boolean | undefined;
       if (resumeAid) {
-        /* ★ 先**当场问一次** biliLive-tools 的状态（不等待：确认窗口本身已经够长了）。两个作用：
-             ① `error` ⇒ 这次追加**真失败**，立刻标 FAILED 返回，不必再花 90 秒等分P 出现
-                （旧代码不看这个字段：成功/失败/还在跑都写"任务已完成、B站 侧还没查到"，
-                 实测那条真失败的追加就是这么被写成「已提交待确认」、静默躺了半小时）；
-             ② 它决定"读不到分P 列表"时该往哪边倒：任务已完成 → 按已落地；还没结束 → 按未确认。 */
-        const st0 =
-          typeof this.client.taskDetail === 'function'
-            ? await this.client.taskDetail(res.taskId).catch(() => undefined)
-            : undefined;
-        const st0Status = typeof st0?.status === 'string' ? st0.status : undefined;
-        const stateText =
-          st0Status === 'completed'
-            ? 'biliLive-tools 侧任务已完成'
-            : st0Status === undefined
-              ? '查不到 biliLive-tools 的任务状态（队列可能因它重启而丢失）'
-              : `biliLive-tools 侧任务尚未结束（状态 ${st0Status}）`;
         if (st0Status === 'error') {
-          const why = (typeof st0?.error === 'string' ? st0.error : undefined) ?? '对方未提供错误信息';
+          const why = st0Error ?? '对方未提供错误信息';
+          const limitedNote =
+            multipartLimitedRetries > 0 && isUploadRateLimited(why)
+              ? `（限流重试 ${this.rateLimitMaxAttempts} 次仍失败）`
+              : '';
           log.error(
-            `续传**提交失败**：${stateText}，错误：${why} —— ` +
+            `续传**提交失败**：${stateText}，错误：${why}${limitedNote} —— ` +
               `${titled.length} 个切片已标记为 FAILED，修正原因后重跑投稿阶段即可重投`,
           );
           for (const p of titled) {
             if (p.kind === 'clip' && p.clipIndex !== undefined) {
               this.ledger.setClipStatus(task.id, p.clipIndex, 'FAILED', {
-                failReason: `续传提交失败（biliLive-tools 任务报错）：${why.slice(0, 120)}`,
+                failReason: `续传提交失败（biliLive-tools 任务报错）：${why.slice(0, 120)}${limitedNote}`,
               });
             }
           }
@@ -2586,9 +3681,9 @@ export class Publisher {
             ...(resumeAid ? { aid: resumeAid } : {}),
             ...(opts.resumeBvid ? { bvid: opts.resumeBvid } : {}),
             missing: titled.map((p) => p.title),
-            note: `${stateText}，错误：${why}`,
-          });
-          return { ok: false, error: `续传提交失败：${why}`, mainTitle, parts: titled, warnings, mode: 'append' };
+            note: `${stateText}，错误：${why}${limitedNote}`,
+          }, this.batchLog());
+          return { ok: false, error: `续传提交失败：${why}${limitedNote}`, mainTitle, parts: titled, warnings, mode: 'append' };
         }
         appendVerified = await this.confirmPartTitlesLanded(resumeAid, titled.map((p) => p.title), log, {
           unreadableFallback: st0Status === 'completed' ? 'landed' : 'unconfirmed',
@@ -2619,7 +3714,7 @@ export class Publisher {
             ...(opts.resumeBvid ? { bvid: opts.resumeBvid } : {}),
             missing: titled.map((p) => p.title),
             note: stateText,
-          });
+          }, this.batchLog());
           for (const p of titled) {
             if (p.kind === 'clip' && p.clipIndex !== undefined) {
               this.ledger.setClipStatus(task.id, p.clipIndex, 'SUBMITTED', {
@@ -2660,7 +3755,7 @@ export class Publisher {
           ...(resumeAid ? { aid: resumeAid } : {}),
           ...(opts.resumeBvid ? { bvid: opts.resumeBvid } : {}),
           landed: titled.map((p) => p.title),
-        });
+        }, this.batchLog());
       }
 
       log.info(
@@ -2719,10 +3814,51 @@ export class Publisher {
       };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      log.error(`多分P投稿失败：${msg}`, e);
+      /* ★ 配额级限流（2026-10-21）：整批一次请求都没被受理 ⇒ 每个切片按 **CANDIDATE（待投）** 收尾，
+         **不写 FAILED、不写错误报告**（理由与单切片路径的 `finishQuotaLimited` 完全一致：
+         配额限流不是"这片坏了"，写成失败会把用户往查代码/重投上带，而它只需要等 30 分钟）。 */
+      if (classifySubmitLimit(msg) === 'quota') {
+        const todaySubmitted = this.ledger.todayPublishedCount();
+        const reason =
+          `B站 投稿配额限流（今日已提交 ${todaySubmitted} 个），` +
+          `建议 ${UPLOAD_QUOTA_RETRY_AFTER_MIN} 分钟后重试｜原始错误：${msg.slice(0, 160)}`;
+        log.warn(
+          `多分P投稿命中**账号级投稿配额**限流，本轮不再重试：${msg.slice(0, 160)}` +
+            `（${titled.length} 个切片已留在待投，建议 ${UPLOAD_QUOTA_RETRY_AFTER_MIN} 分钟后重试）`,
+        );
+        warnings.push(reason);
+        for (const p of titled) {
+          if (p.kind === 'clip' && p.clipIndex !== undefined) {
+            /* 清掉提交侧字段（与 daemon 复位 CANDIDATE 时同一口径，QA 2026-10-21 指出）：
+               一次被配额拒的提交什么都没创建，留着 uploadTaskId/submitTime 会让
+               「待投」的片上挂着一次并不存在的提交，人工核对时又要多绕一圈。 */
+            this.ledger.setClipStatus(task.id, p.clipIndex, 'CANDIDATE', { failReason: reason }, {
+              unset: ['bvid', 'publishedAt', 'dtime', 'submitTime', 'uploadTaskId'] as Array<keyof ClipRecord>,
+            });
+          }
+        }
+        await this.alertQuotaLimited({ task, submitted: 0, remaining: titled.length, reason: msg });
+        /* ★ 必须带 quotaLimited：调用方（daemon）据此把它当"暂停"而不是"失败"，
+           否则本场状态回退 ANALYZED + 补发「投稿失败」error 告警（QA 实测的两个症状）。 */
+        return {
+          ok: false,
+          mainTitle,
+          parts: titled,
+          dtime,
+          error: reason,
+          warnings,
+          quotaLimited: { message: msg, todaySubmitted, retryAfterMin: UPLOAD_QUOTA_RETRY_AFTER_MIN },
+        };
+      }
+      /* 限流耗尽（最后一次仍是限流拒绝）⇒ failReason 必须写明重试次数，人工才知道该不该直接重投 */
+      const limitedNote =
+        multipartLimitedRetries > 0 && isUploadRateLimited(msg)
+          ? `（限流重试 ${this.rateLimitMaxAttempts} 次仍失败）`
+          : '';
+      log.error(`多分P投稿失败：${msg}${limitedNote}`, e);
       for (const p of titled) {
         if (p.kind === 'clip' && p.clipIndex !== undefined) {
-          this.ledger.setClipStatus(task.id, p.clipIndex, 'FAILED', { failReason: `多分P投稿失败：${msg}` });
+          this.ledger.setClipStatus(task.id, p.clipIndex, 'FAILED', { failReason: `多分P投稿失败：${msg}${limitedNote}` });
           /* 多分P是**整批一个请求**：一个片段失败等于整批都没投出去，
              所以每个切片各写一份报告（带各自的片段号与标题），而不是只写一条含糊的"整批失败"。
              这样界面上点开任何一条失败切片，看到的都是"它自己那一P 为什么没上去"。 */
@@ -2731,12 +3867,13 @@ export class Publisher {
             taskTitle: task.title,
             clipIndex: p.clipIndex,
             stage: 'PUBLISHED',
-            error: e,
+            error: new Error(`${msg}${limitedNote}`),
             type: e instanceof ApiError ? e.type : 'upload-failed',
+            ...(multipartRateLimitAttempts.length > 0 ? { retries: multipartRateLimitAttempts } : {}),
           });
         }
       }
-      return { ok: false, mainTitle, parts: titled, dtime, error: msg, warnings };
+      return { ok: false, mainTitle, parts: titled, dtime, error: `${msg}${limitedNote}`, warnings };
     }
   }
 
@@ -3083,7 +4220,7 @@ export class Publisher {
        逐片判定只能回答"某片在不在分P 列表里"；批次账能回答"**这次投稿**整体成没成、少了哪几个"。
        用刚读到的标题集合把每个未结批次判一遍，并把结论写回批次账（供界面对账与事后复盘）。 */
     const batchNotes: string[] = [];
-    for (const b of readOpenBatches(taskId)) {
+    for (const b of readOpenBatches(taskId, this.batchLog())) {
       const titles = b.bvid ? titleIndex.get(b.bvid) : undefined;
       const missing = titles ? b.titles.filter((t) => !titles.has(norm(t))) : b.titles.slice();
       const ageMin = Math.max(0, Math.round((Date.now() - Date.parse(b.at)) / 60_000));
@@ -3096,7 +4233,7 @@ export class Publisher {
           ...(b.aid ? { aid: b.aid } : {}),
           ...(b.bvid ? { bvid: b.bvid } : {}),
           landed: b.titles,
-        });
+        }, this.batchLog());
         batchNotes.push(`批次 ${b.uploadTaskId.slice(0, 8)}：${b.titles.length} 个分P 全部落地`);
       } else {
         batchNotes.push(

@@ -72,6 +72,17 @@ export const TASK_FILES = {
 /** 高频写盘的合并窗口（毫秒）：300ms 内的多次 update 合并成一次原子写 */
 const FLUSH_DEBOUNCE_MS = 300;
 
+/**
+ * 「只有 progress 变了」时的落盘降频窗口（毫秒）。
+ *
+ * 为什么单给它一条慢通道：转写期间进度每秒数次上报，而这些上报**会**给整份台账打脏标记 ——
+ * 300ms 一次全量 `JSON.stringify` + 原子写（所有任务 + 切片 + 指纹 + 墓碑），纯写放大（P3）。
+ * 同进程的 UI / CLI 都是从内存读进度，落盘只为"别的进程或重启后能看个大概"，
+ * 所以按这个窗口降频即可；状态/阶段/产物路径这些关键点走 setStatus/setStage，
+ * 本来就会立即落盘（并顺手把当时的进度写进去）。
+ */
+const PROGRESS_PERSIST_MS = 5000;
+
 /** 时间量化精度：0.1 秒（浮点抖动 1e-5 不应产生第二个指纹） */
 const TIME_QUANTUM = 10;
 
@@ -545,6 +556,10 @@ export class Ledger {
   private dirtyLedger = false;
   private readonly dirtyClipTasks = new Set<string>();
   private timer: NodeJS.Timeout | null = null;
+  /** 上次因「只有 progress 变化」而落盘的时刻（见 PROGRESS_PERSIST_MS） */
+  private lastProgressPersistAt = 0;
+  /** 有进度更新被降频挡下、还没落盘（退出时由 flush() 带上，见 flush 注释） */
+  private progressDirty = false;
 
   private titleIndex: Set<string> | null = null;
   private lastWriteErrorValue: string | undefined;
@@ -701,7 +716,8 @@ export class Ledger {
    * 退出钩子、节流到期、flush() 都走这里，保证不会把异常抛到进程退出流程里。
    */
   flush(): void {
-    if (!this.dirtyLedger && this.dirtyClipTasks.size === 0) return;
+    // progressDirty：被降频挡下的进度更新 —— 退出时也值得带上，让下次启动能看到"上次跑到哪"
+    if (!this.dirtyLedger && this.dirtyClipTasks.size === 0 && !this.progressDirty) return;
     try {
       this.persistStrict();
     } catch {
@@ -722,6 +738,7 @@ export class Ledger {
       this.data.updatedAt = nowIso();
       writeJsonAtomic(this.ledgerPath, this.data);
       this.dirtyLedger = false;
+      this.progressDirty = false;
       this.lastWriteErrorValue = undefined;
       const st = this.stat();
       if (st) {
@@ -920,7 +937,21 @@ export class Ledger {
         data: { from: before, to: patch.status },
       });
     }
-    this.markDirty();
+    /* 只有 progress 变化时按 PROGRESS_PERSIST_MS 降频落盘 —— 否则转写期间每 300ms
+       就把整份台账重写一遍（P3）。其它任何字段（含 unset）都照旧立即打脏标记。 */
+    const keys = Object.keys(patch);
+    const progressOnly = keys.length === 1 && keys[0] === 'progress' && (opts?.unset?.length ?? 0) === 0;
+    if (progressOnly) {
+      const now = Date.now();
+      if (now - this.lastProgressPersistAt >= PROGRESS_PERSIST_MS) {
+        this.lastProgressPersistAt = now;
+        this.markDirty();
+      } else {
+        this.progressDirty = true;
+      }
+    } else {
+      this.markDirty();
+    }
     return rec;
   }
 
@@ -1256,6 +1287,35 @@ export class Ledger {
    *     重跑时会**再投一次同样的内容**，产生重复稿件。墓碑继续拦着，并在 UI 上说明原因、
    *     提供人工解除入口。
    */
+  /**
+   * 清掉一批切片的**全部**幂等指纹（**不转墓碑**）。
+   *
+   * 专用于「稿件已不在 B站」的对账清除（2026-10-17 用户口径：「不管定时的，只要看不到就清除」）。
+   * 指纹必须随清除一起删：
+   *   · 留着 ⇒ 「重新切片与投稿」的幂等 1 会命中并把切片恢复成 PUBLISHED，清除就成了空操作；
+   *   · 按 deleteClip 的惯例转墓碑 ⇒ 重投同样被拦，还要人工解除 —— 都不符合「清除后可重投」。
+   * ⚠️ 调用方必须确认稿件确实不存在（对账的强证据判定：详情「不可见」+ 稿件列表取全仍无它），
+   *    否则清指纹 = 主动打开重复投稿的口子。
+   *
+   * @returns 实际删除的指纹条数
+   */
+  clearFingerprintsFor(entries: Array<{ taskId: string; clipIndex: number }>): number {
+    this.load();
+    if (!entries.length) return 0;
+    const keys = new Set(entries.map((e) => `${e.taskId}#${e.clipIndex}`));
+    let removed = 0;
+    for (const [fp, info] of Object.entries(this.data.fingerprints)) {
+      if (!keys.has(`${info.taskId}#${info.clipIndex}`)) continue;
+      delete this.data.fingerprints[fp];
+      removed++;
+    }
+    if (removed) {
+      this.markDirty(entries[0]!.taskId);
+      this.flush();
+    }
+    return removed;
+  }
+
   deleteClip(
     taskId: string,
     clipIndex: number,
@@ -1473,6 +1533,77 @@ export class Ledger {
   }
 
   /** 全部墓碑（UI 列表 / 人工核对用），按立碑时间倒序 */
+  /**
+   * 清除太老的墓碑（2026-10-15 用户要求「墓碑拉取时…清除 7 天前的」）。
+   *
+   * 为什么需要：墓碑**不会自动过期**（见 `FingerprintTombstone` 的注释），只靠人工逐条解除 ——
+   * 实测健康面板上堆到 161 条，其中大半是"旧稿件早就删了"的历史。留着它们只会让
+   * 「这段内容到底还能不能投」越来越难判断，也让面板永远是红的。
+   *
+   * 判据用 `retiredAt`（**立碑时间**，不是 `at` 原登记时间）—— 老台账里 `retiredAt` 缺失时
+   * 退回 `at`，两条都没有的条目**不动**（宁可留着，也不猜着删）。
+   * 删除同样留痕（`publish-log` 的 `tombstone-prune`），因为"为什么这段又能投了"事后要查得到。
+   */
+  pruneTombstones(opts: { olderThanDays?: number; dryRun?: boolean; note?: string } = {}): { pruned: number; fingerprints: string[] } {
+    this.load();
+    const days = Number.isFinite(opts.olderThanDays) && (opts.olderThanDays as number) > 0 ? (opts.olderThanDays as number) : 7;
+    const cutoff = Date.now() - days * 86400_000;
+    const store = this.data.tombstones ?? {};
+    const fingerprints: string[] = [];
+    for (const [fp, t] of Object.entries(store)) {
+      const when = Date.parse(String(t.retiredAt ?? t.at ?? ''));
+      if (!Number.isFinite(when) || when >= cutoff) continue; // 时间读不出来的不动
+      fingerprints.push(fp);
+    }
+    if (!opts.dryRun) {
+      for (const fp of fingerprints) {
+        const t = store[fp];
+        delete store[fp];
+        this.logPublish({
+          taskId: t?.taskId ?? '(已清理)',
+          clipIndex: typeof t?.clipIndex === 'number' ? t.clipIndex : -1,
+          action: 'tombstone-prune',
+          ...(t?.bvid ? { bvid: t.bvid } : {}),
+          ...(t?.title ? { title: t.title } : {}),
+          note: `墓碑超过 ${days} 天自动清除${opts.note ? `（${opts.note}）` : ''}`,
+        });
+      }
+      if (fingerprints.length > 0) {
+        this.data.tombstones = store;
+        this.markDirty();
+      }
+    }
+    return { pruned: fingerprints.length, fingerprints };
+  }
+
+  /**
+   * 记住一批"已经投出去过的标题"（2026-10-15 用户要求「墓碑拉取时获取的公开稿件自动添加最近 3 天的」）。
+   *
+   * 为什么加的是**标题**而不是指纹：指纹是"某一场、某个区间"的内容哈希，而核对时拿到的是
+   * **线上稿件**（只有标题与 bvid，没有区间）—— 拿不到区间就造不出能拦住重投的指纹。
+   * 而投稿前的标题去重用的就是 `publishedTitles`，所以把最近公开稿件的标题登记进来，
+   * 才是真正能防住"同一段内容被再投一次"的那道闸。
+   */
+  rememberPublishedTitles(titles: string[], opts: { cap?: number } = {}): { added: number; total: number } {
+    this.load();
+    const cap = Number.isFinite(opts.cap) && (opts.cap as number) > 0 ? (opts.cap as number) : 800;
+    const list = Array.isArray(this.data.publishedTitles) ? this.data.publishedTitles : [];
+    const seen = new Set(list);
+    let added = 0;
+    for (const raw of titles) {
+      const t = String(raw ?? '').trim();
+      if (!t || seen.has(t)) continue;
+      seen.add(t);
+      list.push(t);
+      added++;
+    }
+    /* 只保留最近的 cap 条（列表本身是追加顺序 ⇒ 从头截断即"最老的先丢"） */
+    const trimmed = list.length > cap ? list.slice(list.length - cap) : list;
+    this.data.publishedTitles = trimmed;
+    if (added > 0 || trimmed.length !== list.length) this.markDirty();
+    return { added, total: trimmed.length };
+  }
+
   listTombstones(): TombstoneEntry[] {
     this.load();
     const map = this.tombstoneMap();
@@ -1508,13 +1639,15 @@ export class Ledger {
   }
 
   /**
-   * **人工解除**墓碑 —— 允许同一区间重新投稿。
+   * 解除墓碑 —— 允许同一区间重新投稿。
    *
-   * 只在用户确认「B站 上那个稿件确实已经不存在了」之后才该调用。
+   * `via` 区分两条路径（2026-10-17 事故教训：自动核对解除时日志写的是「已**人工**解除」，
+   * 排查时被误导了半小时）：'manual' = 用户在 UI / MCP 里确认后解除（默认）；
+   * 'auto' = tombstone-reconcile 按判定规则自动解除。
    * 解除后会追加一条 `publish-log.jsonl` 流水留痕（action='tombstone-release'），
    * 这样「为什么当初又投了一遍」在事后永远查得到。
    */
-  releaseTombstone(fp: string, opts: { note?: string } = {}): { ok: boolean; released?: FingerprintTombstone; error?: string; clearedClips?: number } {
+  releaseTombstone(fp: string, opts: { note?: string; via?: 'manual' | 'auto' } = {}): { ok: boolean; released?: FingerprintTombstone; error?: string; clearedClips?: number } {
     this.load();
     const map = this.tombstoneMap();
     const t = map[fp];
@@ -1540,10 +1673,12 @@ export class Ledger {
       }
     }
     this.persistStrict();
-    this.logger.warn(`已人工解除墓碑（该录制区间现在可以重新投稿）：${t.title ?? '(无标题)'}`, {
+    const via = opts.via ?? 'manual';
+    const viaLabel = via === 'auto' ? '已自动解除墓碑（自动核对判定旧稿件已不存在，该录制区间现在可以重新投稿）' : '已人工解除墓碑（该录制区间现在可以重新投稿）';
+    this.logger.warn(`${viaLabel}：${t.title ?? '(无标题)'}`, {
       taskId: t.taskId,
       mod: 'ledger',
-      data: { fp, bvid: t.bvid, retiredAt: t.retiredAt, note: opts.note, clearedClips },
+      data: { fp, via, bvid: t.bvid, retiredAt: t.retiredAt, note: opts.note, clearedClips },
     });
     /* 留痕走 publish-log（与投稿流水同一份文件，事后按 taskId 串起来看很方便）。
        logPublish 的 action 是联合类型，这里显式扩一个值而不是复用 'confirm'
@@ -1558,6 +1693,46 @@ export class Ledger {
       ...(opts.note ? { note: opts.note } : {}),
     });
     return { ok: true, released: t, clearedClips };
+  }
+
+  /**
+   * **批量恢复**墓碑（回滚误解除用）。
+   *
+   * 背景（2026-10-17 事故）：分页判据被服务端截断击穿，18 条正当事的墓碑被自动核对误解除。
+   * 从备份快照/日志重建出来的墓碑记录用这里恢复：只补**不存在的**指纹（已在的不动），
+   * 每条留痕 `tombstone-restore`（「为什么这段又被拦了」事后要查得到）。
+   * 返回实际恢复的指纹列表。
+   */
+  restoreTombstones(entries: Record<string, FingerprintTombstone>, opts: { note?: string } = {}): { restored: string[]; skipped: string[] } {
+    this.load();
+    const map = this.tombstoneMap();
+    const restored: string[] = [];
+    const skipped: string[] = [];
+    for (const [fp, t] of Object.entries(entries)) {
+      if (map[fp]) {
+        skipped.push(fp);
+        continue;
+      }
+      map[fp] = t;
+      restored.push(fp);
+      this.logPublish({
+        taskId: t.taskId,
+        clipIndex: t.clipIndex,
+        action: 'tombstone-restore',
+        ...(t.title ? { title: t.title } : {}),
+        fingerprint: fp,
+        ...(t.bvid ? { bvid: t.bvid } : {}),
+        ...(opts.note ? { note: opts.note } : {}),
+      });
+    }
+    if (restored.length > 0) {
+      this.persistStrict();
+      this.logger.warn(`恢复墓碑 ${restored.length} 条${opts.note ? `（${opts.note}）` : ''}`, {
+        mod: 'ledger',
+        data: { restored: restored.length, skipped: skipped.length },
+      });
+    }
+    return { restored, skipped };
   }
 
   /**
@@ -1655,7 +1830,7 @@ export class Ledger {
   logPublish(entry: {
     taskId: string;
     clipIndex: number;
-    action: 'submit' | 'confirm' | 'fail' | 'tombstone-release';
+    action: 'submit' | 'confirm' | 'fail' | 'tombstone-release' | 'tombstone-prune' | 'tombstone-restore';
     at?: string;
     fingerprint?: string;
     uploadTaskId?: string;
@@ -1685,16 +1860,14 @@ export class Ledger {
   }
 
   readPublishLog(opts: { sinceMs?: number; limit?: number } = {}): Array<Record<string, unknown>> {
-    let rows = readJsonl<Record<string, unknown>>(this.publishLogPath);
     const sinceMs = opts.sinceMs;
-    if (typeof sinceMs === 'number' && Number.isFinite(sinceMs)) {
-      rows = rows.filter((r) => {
-        const at = typeof r['at'] === 'string' ? Date.parse(r['at']) : Number.NaN;
-        return Number.isFinite(at) && at >= sinceMs;
-      });
-    }
     const limit = opts.limit;
-    return typeof limit === 'number' && limit > 0 ? rows.slice(-limit) : rows;
+    /* sinceMs / limit 一路下推到读取层（尾部回读）—— 旧实现是"整文件读进内存再过滤再切片"，
+       而这份日志只增不减，健康面板每次刷新都要全量读一遍（P2）。 */
+    return readJsonl<Record<string, unknown>>(this.publishLogPath, {
+      ...(typeof sinceMs === 'number' && Number.isFinite(sinceMs) ? { sinceMs } : {}),
+      ...(typeof limit === 'number' && limit > 0 ? { limit } : {}),
+    });
   }
 
   /**
@@ -1734,10 +1907,12 @@ export class Ledger {
    */
   todayPublishedCount(now: Date = new Date()): number {
     const today = fmtDate(now);
+    // 传 sinceMs（今日零点）让读取层从尾部回读到昨天就停 —— 不必把整份投稿日志读进来（P2）
+    const dayStartMs = new Date(now).setHours(0, 0, 0, 0);
     type Row = { upload?: string; bvid?: string; dtime?: string };
     const buckets = new Map<string, { submits: Row[]; confirms: Row[] }>();
     const confirmedBvids = new Set<string>();
-    for (const row of this.readPublishLog({ limit: PUBLISHED_TITLES_LIMIT })) {
+    for (const row of this.readPublishLog({ sinceMs: dayStartMs, limit: PUBLISHED_TITLES_LIMIT })) {
       const action = String(row['action'] ?? '');
       if (action !== 'submit' && action !== 'confirm') continue;
       const at = typeof row['at'] === 'string' ? Date.parse(row['at']) : Number.NaN;

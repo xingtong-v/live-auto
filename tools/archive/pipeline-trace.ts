@@ -86,7 +86,7 @@ console.log(`  输出目录               : ${cfg.clip.outputDir}`);
 console.log(`\n\x1b[1m⑧ 投稿\x1b[0m`);
 console.log(`  模式                   : ${cfg.publish.autoPublish ? w('全自动（分析完直接排期发布）') : y('半自动（需人工确认）')}`);
 console.log(`  可见性                 : ${cfg.publish.isOnlySelf === 1 ? '仅自己可见' : w('公开')}`);
-console.log(`  首片余量 / 片间隔      : ${cfg.publish.submitGapSec}s / ${cfg.publish.clipGapSec}s（硬约束 #4：>7200）`);
+console.log(`  首片余量 / 片间隔      : ${cfg.publish.submitGapSec}s / ${cfg.publish.clipGapSec}s（硬约束 #4：≥1200）`);
 console.log(`  首片指定时间           : ${cfg.publish.firstPublishAt || '(自动算)'}`);
 console.log(`  每日上限               : ${cfg.publish.dailyLimit}`);
 console.log(`  多分P                  : ${cfg.publish.multiPart ? '开启' : '关闭'}`);

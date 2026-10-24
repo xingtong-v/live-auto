@@ -116,9 +116,25 @@ section('4. 接线静态核对（防止以后把批次账摘掉）');
   const src = fs.readFileSync(path.join(ROOT_DIR, 'src', 'publish.ts'), 'utf8');
   ok('提交成功后就记批次', /recordBatchSubmit\(\{[\s\S]{0,400}uploadTaskId: res\.taskId/.test(src));
   ok('落地确认通过 ⇒ 批次标 landed', /status: 'landed',[\s\S]{0,200}landed: titled\.map/.test(src));
-  ok('biliLive-tools 报错 ⇒ 批次标 failed（不是含糊成待确认）', /status: 'failed',[\s\S]{0,300}note: `\$\{stateText\}，错误：\$\{why\}`/.test(src));
+  /* `note` 末尾现在还可能带「（限流重试 N 次仍失败）」（2026-10-17 限流修复），
+     所以只匹配到 `${why}` 为止 —— 断言意图是"失败原因写全了"，不是"格式一字不差" */
+  ok('biliLive-tools 报错 ⇒ 批次标 failed（不是含糊成待确认）', /status: 'failed',[\s\S]{0,300}note: `\$\{stateText\}，错误：\$\{why\}/.test(src));
   ok('未确认 ⇒ 批次标 unconfirmed 并记下缺失标题', /status: 'unconfirmed',[\s\S]{0,300}missing: titled\.map/.test(src));
-  ok('反查里按批次对账（读未结批次 + 写结论）', /readOpenBatches\(taskId\)/.test(src) && /batchNotes\.push/.test(src));
+  /* 2026-10-21：`readOpenBatches` 现在还要带 logPath（见下面那条新断言），
+     所以这里只认「按 taskId 读未结批次」这个意图，不再卡死参数列表。 */
+  ok('反查里按批次对账（读未结批次 + 写结论）', /readOpenBatches\(taskId[,)]/.test(src) && /batchNotes\.push/.test(src));
+  /* ★ 2026-10-21 QA 实测的隔离漏洞：`recordBatchSubmit/Outcome`、`readOpenBatches` 不传 `logPath`
+     时会落到 `DATA_DIR/publish-log.jsonl`，也就是**生产日志** —— 内建测试跑一遍就往生产日志里写
+     `batch-submit`/`batch-landed` 行（实测多 2 行，taskId 还是测试的）。所以每个调用点都必须带上
+     `this.batchLog()`（它 = `ledger.publishLogPath`，跟着台账目录走）。
+     用"调用点数 == 带 logPath 数"来钉，以后新增调用点漏传就会红。 */
+  const callSites = [...src.matchAll(/recordBatch(?:Submit|Outcome)\(|readOpenBatches\(/g)].length;
+  const withLogPath = [...src.matchAll(/this\.batchLog\(\)/g)].length;
+  ok(
+    '★ 每个批次账调用点都传了台账目录下的 logPath（否则测试会写进生产 publish-log）',
+    callSites > 0 && withLogPath === callSites,
+    `调用点 ${callSites} 个，带 logPath ${withLogPath} 个`,
+  );
   ok('批次行不参与「本场已有 N 次投稿」提醒（那条只看 submit）', /filter\(\(r\) => r\['taskId'\] === task\.id && r\['action'\] === 'submit'\)/.test(src));
 }
 

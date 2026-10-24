@@ -450,16 +450,23 @@ ok('★ 有增强函数且幂等判断看本次渲染结果', /function enhanceC
   ok('★ 确认文案写明进回收站可恢复 + 空间要等回收站清理', /回收站（7 天内可恢复）/.test(batchConfirm) && /回收站清理/.test(batchConfirm));
   ok('失败项逐条展示（不许只报"部分失败"）', /批量删除：有失败项/.test(html) && /r\.failed\.map\(/.test(html));
 
-  /* 内联脚本必须能解析：写坏一个反引号就整页白屏，而且控制台只有一行语法错误 */
-  const m = /<script>([\s\S]*?)<\/script>\s*<\/body>/.exec(html) ?? /<script>([\s\S]*)<\/script>/.exec(html);
-  const script = m?.[1] ?? '';
-  ok('取到内联脚本', script.length > 5000, `${script.length} 字节`);
+  /* 内联脚本必须能解析：写坏一个反引号就整页白屏，而且控制台只有一行语法错误。
+     ★ 2026-10-17：页面现在有**两个** `<script>` 块 —— head 里"首屏渲染前定主题"的小脚本，
+     加上 body 末尾的主脚本。原来取的是"第一个 <script> 到最后一个 </script>\n</body>"这一整段，
+     于是把两个脚本之间的 HTML（</script><style>…<body>…）也喂给了 new Function，
+     报出假的 `Unexpected token '<'`。改成**逐个脚本块**编译：再加脚本块不会误报，真有语法错误照样抓到。 */
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((mm) => mm[1] ?? '');
+  const longest = Math.max(0, ...scripts.map((s) => s.length));
+  ok('取到内联脚本', scripts.length >= 1 && longest > 5000, `${scripts.length} 块 / 最长 ${longest} 字节`);
   let parseError: string | undefined;
-  try {
-    // 只编译不执行：语法错误会在这里抛出（页面白屏的根因）
-    new Function(script);
-  } catch (e) {
-    parseError = (e as Error).message;
+  for (const [i, body] of scripts.entries()) {
+    try {
+      // 只编译不执行：语法错误会在这里抛出（页面白屏的根因）
+      new Function(body);
+    } catch (e) {
+      parseError = `第 ${i + 1} 块（${body.length} 字节）：${(e as Error).message}`;
+      break;
+    }
   }
   ok('内联脚本语法正确', parseError === undefined, parseError);
 

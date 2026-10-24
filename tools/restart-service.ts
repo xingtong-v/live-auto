@@ -15,9 +15,14 @@
  *   所以现在默认会先查 `/api/monitor` 的 `queue.busy`：忙就**拒绝重启**并打印在跑什么，
  *   要用 `--force` 才跳过这道闸（确实需要打断时再显式说）。
  *
- * 用法：node --experimental-strip-types tools/restart-service.ts [--port 3000] [--timeout 90] [--force]
+ * 用法：node --experimental-strip-types tools/restart-service.ts [--port 3000] [--timeout 90] [--force] [--no-watch]
+ *
+ * 2026-10-24：默认重启的是**热更新监督进程**（src/hot-watch.ts），与 launcher.ps1 / ensure-service.ps1 一致。
+ * 若当前服务是监督进程拉起的，会把监督进程一起重启（只杀服务会让它立刻把旧代码再拉起来）。
+ * 排障时要"只有服务、没有监督层"用 `--no-watch`。
  */
 import { spawn, execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 
 const argv = process.argv.slice(2);
@@ -28,6 +33,8 @@ const argOf = (f: string, d: string): string => {
 const port = Number(argOf('--port', '3000'));
 const timeoutSec = Number(argOf('--timeout', '90'));
 const force = argv.includes('--force');
+/** 重启成"直启服务"而不是热更新监督进程（排障用；默认带热更新） */
+const noWatch = argv.includes('--no-watch');
 const ROOT = process.cwd();
 const line = (s = ''): void => console.log(s);
 
@@ -135,10 +142,49 @@ function findPidOnPort(p: number): number | undefined {
 }
 
 const oldPid = findPidOnPort(port);
-if (oldPid) {
-  line(`  旧进程 pid=${oldPid}，正在结束…`);
+
+/* ---- 1a) 热更新监督进程在场吗？----
+ *
+ * 2026-10-24 起，服务的默认启动方式是 `src/hot-watch.ts`（它持有 `src/cli.ts run` 子进程）。
+ * 这时**只杀服务**是错的：监督进程会把服务当成"崩了"，2 秒后再拉一个起来（用的还是旧代码），
+ * 而本脚本紧接着又拉一个 ⇒ 两个进程抢端口，第二个 EADDRINUSE 秒退 —— 正是 QA 报的那类
+ * "看起来重启了、其实热更新哑了"。
+ * 所以：先认出监督进程，**连它一起**（/T 杀整棵树）重启；状态文件不可信（心跳过期）就按老路走。
+ */
+const HOT_STATE_PATH = path.join(ROOT, 'data', 'hot-watch-state.json');
+interface HotStateFile {
+  enabled?: boolean;
+  supervisorPid?: number | null;
+  heartbeatAt?: string | null;
+}
+function readHotState(): HotStateFile | null {
   try {
-    execFileSync('taskkill', ['/PID', String(oldPid), '/F', '/T'], { stdio: 'ignore' });
+    return JSON.parse(fs.readFileSync(HOT_STATE_PATH, 'utf8')) as HotStateFile;
+  } catch {
+    return null;
+  }
+}
+/** 心跳 90s 内没更新 ⇒ 监督进程已不在（被强杀时它来不及写 enabled=false） */
+function supervisorPid(): number | null {
+  const s = readHotState();
+  if (!s || s.enabled !== true) return null;
+  if (s.heartbeatAt) {
+    const at = Date.parse(s.heartbeatAt);
+    if (Number.isFinite(at) && Date.now() - at > 90_000) return null;
+  }
+  const pid = Number(s.supervisorPid);
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
+}
+const supervisor = supervisorPid();
+const killTarget = supervisor ?? oldPid;
+if (supervisor) {
+  line(`  检测到热更新监督进程（pid=${supervisor}）—— 连它一起重启（只杀服务会让它把旧代码再拉起来）`);
+}
+
+if (killTarget) {
+  line(`  旧进程 pid=${killTarget}，正在结束…`);
+  try {
+    execFileSync('taskkill', ['/PID', String(killTarget), '/F', '/T'], { stdio: 'ignore' });
     line('  ✓ 已结束');
   } catch (e) {
     line(`  ⚠ 结束失败（可能已自行退出）：${(e as Error).message.slice(0, 80)}`);
@@ -173,13 +219,22 @@ if (oldPid) {
 
 /* ---- 2) 起新进程（detached，独立于本脚本存活） ---- */
 line('');
-line('  启动新进程：node src/cli.ts run（带内存余量与崩溃报告参数，与自启那一路一致）');
+/* 默认起**热更新监督进程**（2026-10-24）：否则"用这个脚本重启一次"就把热更新静默关掉了，
+   用户下次改代码会发现"又不生效了"，而且极难联想到是重启脚本干的（这正是最坏的形态）。 */
+const entryArgs = noWatch
+  ? [path.join(ROOT, 'src', 'cli.ts'), 'run', '--port', String(port)]
+  : [path.join(ROOT, 'src', 'hot-watch.ts'), '--port', String(port)];
+line(
+  noWatch
+    ? '  启动新进程：node src/cli.ts run（--no-watch：不带热更新）'
+    : '  启动新进程：node src/hot-watch.ts（带热更新；改代码自动重载）',
+);
 /* ⚠️ 这三个参数必须与 tools\ensure-service.ps1 / launcher.ps1 保持一致：
    否则"手动重启出来的服务"和"看门狗拉起来的服务"能力不同 ——
    2026-10-07 01:17:03 服务因 `JavaScript heap out of memory` 整个进程 abort，
    当时既没有更大的堆上限、也没有留下任何诊断报告，只能从 stderr 一行 FATAL 反推。 */
 const heapFlags = ['--max-old-space-size=8192', '--report-on-fatalerror', `--report-directory=${path.join(ROOT, 'data', 'logs')}`];
-const child = spawn(process.execPath, [...heapFlags, path.join(ROOT, 'src', 'cli.ts'), 'run'], {
+const child = spawn(process.execPath, [...heapFlags, ...entryArgs], {
   cwd: ROOT,
   detached: true,
   stdio: 'ignore',

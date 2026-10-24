@@ -14,7 +14,7 @@ const CFG_PINNED = [
   ['c_baseUrl', 'biliLive-tools 地址'],
   ['c_roomId', '直播间'],
   ['c_autoPublish', '自动发布'],
-  ['c_multiPart', '多分P'],
+  ['c_clipPublishMode', '切片投稿方式'],
   ['c_immediatePublish', '立即发布'],
   ['c_trashDays', '回收站保留天数'],
   ['c_dailyLimit', '每日投稿上限'],
@@ -190,6 +190,12 @@ async function openCfg() {
     ...(b.glossary || {}),
   };
   const tags = (c.publish.tidWhitelist ? Object.keys(c.publish.tidWhitelist) : []);
+  /* 排期口径按**实际生效值**渲染（口径由服务端 resolveClipPublishSchedule 给出，随 bootstrap 下发）。
+     设置面板里那句公式必须写真正会被用的数，否则用户会照着 config 里的原始值去理解排期。
+     ★ 2026-10-17 口径更正：单独投稿下「相邻切片间隔 / 随机抖动」**是生效的**
+     （间隔 300 秒保底、抖动受「必须小于间隔」夹取），所以公式里两个数都要按生效值写，
+     被抬/被夹时还要在下面说清原因 —— 这条文案由 `scheduleFormula()` 统一生成。 */
+  const effFormula = scheduleFormula(c.publish, clipModeOf(c.publish));
   $('#cfgBody').innerHTML = `
   <div class="group"><h3>连接</h3>
     <p class="gdesc">录制、压制、切割、上传、ASR 全部由 biliLive-tools 执行，这里只填它的地址与鉴权。</p>
@@ -207,13 +213,31 @@ async function openCfg() {
   <div class="group"><h3>直播间与录制</h3>
     <p class="gdesc">检查间隔越短，录制结束后越快被感知。轮询在任何情况下都保留 —— 它是可靠兜底。</p>
     <div class="fields">
-      <div class="field"><label>B站直播间房间号</label>
-        <div class="ctl">
-          <input class="inp" id="c_roomId" value="${esc(c.room.roomId)}">
+      <div class="field"><label>B站直播间房间号（可多个）</label>
+        <div class="roomlist" id="roomList">
+          <div class="roomrow">
+            <input class="inp" id="c_roomId" value="${esc(c.room.roomId)}" placeholder="主直播间，例如 23456789">
+            <span class="roomtag">主</span>
+            <button class="btn-sm" data-room-del title="移除这个直播间" style="visibility:hidden">移除</button>
+          </div>
+          ${(Array.isArray(c.room.roomIds) ? c.room.roomIds : [])
+            .filter((x) => String(x ?? '').trim())
+            .map(
+              (id) => `
+          <div class="roomrow">
+            <input class="inp" data-room-extra value="${esc(id)}" placeholder="附加直播间，例如 12345678">
+            <span class="roomtag"></span>
+            <button class="btn-sm" data-room-del title="移除这个直播间">移除</button>
+          </div>`,
+            )
+            .join('')}
+        </div>
+        <div class="ctl" style="margin-top:8px">
+          <button class="btn-sm" id="btnAddRoom" title="再加一个直播间：开播触发与补漏对账都会一起覆盖它">＋ 添加直播</button>
           <button class="btn-sm" id="btnFetchRooms" title="从 biliLive-tools 的录制配置（webhook.rooms）里读房间号，不用手打">从 biliLive-tools 读取</button>
         </div>
-        <div class="hintline" id="roomPickHint">点右边按钮可以直接列出 biliLive-tools 里配好的直播间（含备注），选中即填入上面的输入框 —— 仍要你点「保存」才会生效。</div>
-        <div class="hintline">这个房间号只用于<b>开播触发</b>（次要路径，按它去查 B站 的 recent-clips）。<b>录像导入走的是目录轮询</b>：它扫描 biliLive-tools 的录制根目录，<b>包含全部主播子目录</b> ⇒ 多个直播间的录像都会被处理，<b>不需要</b>在这里逐个填。触发那条路要覆盖多个房间，需要把房间号扩成列表（目前没做）。</div>
+        <div class="hintline" id="roomPickHint">点「从 biliLive-tools 读取」可以直接列出它配好的直播间（含备注），选中即填入<b>最后聚焦的那个输入框</b> —— 仍要你点「保存」才会生效。</div>
+        <div class="hintline">这些房间号只用于<b>开播触发</b>与<b>补漏对账</b>（按它们去查 B站 的 recent-clips / record-history）。<b>录像导入走的是目录轮询</b>：扫描 biliLive-tools 的录制根目录，<b>包含全部主播子目录</b> ⇒ 这里不填也能处理录像。第一行是主直播间，后面「添加直播」加的每个都会一起轮询。</div>
       </div>
       <div class="field"><label>platform（必须首字母大写）</label><input class="inp" id="c_platform" value="${esc(c.room.platform)}" readonly>
         <div class="hintline">写成 bilibili 会<b>静默返回空数组</b>，触发永不生效（陷阱 #1）</div></div>
@@ -394,12 +418,14 @@ async function openCfg() {
         </div>
         <div class="hintline" id="hintPlan"></div>
       </div>
-      <div class="field"><label>首片提交余量（秒，必须 &gt;7200）</label><input class="inp num" id="c_submitGapSec" value="${c.publish.submitGapSec}">
-        <div class="hintline ok" id="hintGap">公式：dtime = 提交时刻 + ${c.publish.submitGapSec} + (N-1)×${c.publish.clipGapSec} + random(0,${c.publish.jitterSec})</div>
+      <div class="field"><label>首片提交余量（秒，必须 ≥1200）</label><input class="inp num" id="c_submitGapSec" value="${c.publish.submitGapSec}">
+        <div class="hintline ${effFormula.warn ? 'warn' : 'ok'}" id="hintGap">${esc(effFormula.text)}</div>
         <div class="hintline">指定了「首片发布时间」后，这一项只作为<b>兜底下限</b>（指定时间更早时会被推迟到它）</div></div>
-      <div class="field"><label>相邻切片间隔（秒）</label><input class="inp num" id="c_clipGapSec" value="${c.publish.clipGapSec}">
-        <div class="hintline">B站硬限制是「相对<b>各稿件自身提交时刻</b> &gt;7200 秒」，相邻间隔不受额外限制；7500 仅为保守余量</div></div>
-      <div class="field"><label>随机抖动上限（秒）</label><input class="inp num" id="c_jitterSec" value="${c.publish.jitterSec}"></div>
+      <div class="field"><label>相邻切片间隔（秒，300 = 每片 5 分钟）</label><input class="inp num" id="c_clipGapSec" value="${c.publish.clipGapSec}">
+        <div class="hintline">这是我们自己的<b>错峰值、不是平台规则</b>：B站只要求每片的 dtime 晚于<b>它自己</b>的提交时刻 300 秒（投稿页口径「≥5 分钟」），与上一片无关，改大改小都合法（但低于 300 会被抬到 300 —— 那是平台底线）。</div>
+        <div class="hintline" id="hintClipGapUse">生效前提：① 关闭「立即发布」（立即发布不传 dtime，没有发布时间可排）；② 切片投稿方式选「单独投稿」（多分P 稿件只有一个发布时间，片子之间排不开）。</div></div>
+      <div class="field"><label>随机抖动上限（秒，0 = 严格等距）</label><input class="inp num" id="c_jitterSec" value="${c.publish.jitterSec}">
+        <div class="hintline">只影响<b>发布时间</b>的随机扰动（防「太像机器排的」，填 60–120 即可）；必须小于片间隔，超了会被自动压到「片间隔 − 30」。投稿<b>提交</b>的间隔抖动是下面的「minSubmitIntervalSec」，两者无关。</div></div>
       <div class="field"><label>每日投稿上限</label><input class="inp num" id="c_dailyLimit" value="${c.publish.dailyLimit}"></div>
       <div class="field"><label>仅自己可见（试跑期建议开启）</label><div class="inline-switch">
         <button class="switch sm ${c.publish.isOnlySelf === 1 ? 'on' : ''}" id="c_isOnlySelf"></button>
@@ -412,28 +438,32 @@ async function openCfg() {
         <button class="switch sm ${c.publish.immediatePublish ? 'on' : ''}" id="c_immediatePublish"></button>
         <span>${c.publish.immediatePublish ? '开启 —— 稿件过审后直接公开' : '关闭 —— 按公式定时发布'}</span></div>
         <div class="hintline" id="hintImmediate"></div></div>
-      <div class="field"><label>多分P投稿（完整版+纯享版+切片合成一个稿件）</label><div class="inline-switch">
-        <button class="switch sm ${c.publish.multiPart ? 'on' : ''}" id="c_multiPart"></button>
-        <span>${c.publish.multiPart ? '开启 —— 省额度，但各分P同一时刻发布' : '关闭 —— 每片一稿，可错峰但费额度'}</span></div>
-        <div class="hintline" id="hintMultiPart"></div></div>
+      <div class="field"><label>切片投稿方式</label>
+        <div class="chips" id="c_clipPublishMode">
+          <div class="chip ${clipModeOf(c.publish) === 'append' ? 'on' : ''}" data-mode="append">追加切片投稿</div>
+          <div class="chip ${clipModeOf(c.publish) === 'standalone' ? 'on' : ''}" data-mode="standalone">单独投稿</div>
+        </div>
+        <div class="hintline" id="hintClipMode">${esc(clipModeHint(clipModeOf(c.publish), c.publish))}</div></div>
       <div class="field"><label>完整版（弹幕版 + 纯享版）由谁投稿</label>
         <select class="inp" id="c_fullVideoBy">
           <option value="bililive-tools" ${c.publish.fullVideoBy !== 'assistant' ? 'selected' : ''}>biliLive-tools 投（默认）—— 它压制并投出完整版，本服务只把切片追加进同一个稿件</select>
           <option value="assistant" ${c.publish.fullVideoBy === 'assistant' ? 'selected' : ''}>切片助手投（例外）—— 本服务自己烧弹幕版 + remux 纯享版，新建 2+N 稿件</option>
         </select>
         <div class="hintline">规则：<b>除非你明确在这里（或该任务的 overrides.fullVideoBy）说明由切片助手投，否则完整版一律由 biliLive-tools 投</b>。
-          默认路径下，如果它还没投出来，本场会停在「已切片」<b>等待</b>（最多 ${c.publish.resumeWaitMin} 分钟，可在 config.json 调 publish.resumeWaitMin），
-          不会自己投完整版、也不会把切片投成独立稿件。</div></div>
+          「追加切片投稿」模式下，如果它还没投出来，本场会停在「已切片」<b>等待</b>（最多 ${c.publish.resumeWaitMin} 分钟，可在 config.json 调 publish.resumeWaitMin），
+          不会自己投完整版、也不会把切片投成独立稿件；选「单独投稿」时切片<b>不等它</b>，各自直接投（完整版照样归它投）。</div></div>
       <div class="field"><label>等待完整版稿件的上限（分钟）</label><input class="inp" id="c_resumeWaitMin" type="number" min="1" max="1440" value="${c.publish.resumeWaitMin}">
         <div class="hintline">biliLive-tools 的压制 + 上传是异步的（实测录制结束后 13–15 分钟才出弹幕版）。超时后本场仍停在「已切片」并告警，交人工确认。</div></div>
       <div class="field"><label>合集 ID（seasonId，留空则无法归入合集）</label><input class="inp" id="c_seasonId" value="${c.publish.seasonId || ''}" placeholder="需在 B站创作中心手动创建后填写">
         <div class="hintline">⚠️ 没有任何接口能创建合集；留空时切片照常投稿但<b>不会归入同一合集</b></div></div>
       <div class="field"><label>分区（默认）</label>
         <select class="inp" id="c_defaultCategory">${tags.map((t) => `<option ${c.publish.defaultCategory === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></div>
+      <div class="field full"><label>必带标签（逗号分隔，投稿时永远排在最前）</label><input class="inp" id="c_identityTags" value="${esc((c.publish.identityTags || []).join(', '))}">
+        <div class="hintline" id="hintIdentityTags"></div></div>
       <div class="field full"><label>默认标签（逗号分隔）</label><input class="inp" id="c_defaultTags" value="${esc(c.publish.defaultTags.join(', '))}">
         <div class="hintline" id="hintTags"></div></div>
       <div class="field full"><label>简介模板</label><textarea class="inp" id="c_descTemplate">${esc(c.publish.descTemplate)}</textarea>
-        <div class="hintline">可用变量：{{date}} {{liveTitle}} {{roomUrl}} {{startText}} {{endText}} {{desc}}（上限 250 字符，超出自动截断）</div></div>
+        <div class="hintline">可用变量：{{anchorName}} 主播昵称、{{anchorUid}} 主播UID（按切片对应的主播自动填）、{{date}} {{liveTitle}} {{roomUrl}} {{startText}} {{endText}} {{desc}}（上限 250 字符，超出自动截断）</div></div>
       <div class="field full"><label>简介末尾的 AI 声明</label><textarea class="inp" id="c_aiNotice" rows="2" placeholder="留空 = 不写声明">${esc(c.publish.aiNotice || '')}</textarea>
         <div class="hintline">切片是 LLM 选段 + AI 生成标题/字幕后自动投稿的，观众与平台都该看得见。
           <b>声明最后拼、不参与 250 字符截断</b>，所以正文再长也不会把它挤掉；单切片、多分P 稿件、我们上传的完整版都会带上。
@@ -506,8 +536,58 @@ async function openCfg() {
   $('#presetNote').textContent = LLM_PRESETS[c.llm.preset] ? LLM_PRESETS[c.llm.preset].note : '';
   updateEscalationHint();
   updateTagHint();
+  updateIdentityTagHint();
   renderDtimePlanPreview();
   bindCfg();
+  /* ★ 2026-10-16（UI 评审 IA-5）：这两件事必须放在 bindCfg() **之后**。
+     原因：bindCfg() 里的 enhanceCfgPanel() 会把每个 .group 重新包成
+     <details class="cfggroup">，并把原来的 <h3> 移走、用它的文字做 <summary>。
+     在这之前挂计数，计数会被当成标题文字一起吞掉（实测显示成"连接2 项"）。 */
+  annotateCfgGroups();
+  collapseLongHints();
+}
+
+/* 分组标题右侧挂「N 项」计数。理由：9 个分组默认全收起，用户找一项得逐个点开；
+   有了计数，至少能先判断"这里像不像有我要的东西"再决定展开哪个。
+   ⚠️ 挂到 <summary>（增强层重建出来的），不是原来的 <h3>。 */
+function annotateCfgGroups() {
+  $$('#cfgBody details.cfggroup').forEach((d) => {
+    const sum = d.querySelector('summary');
+    if (!sum || sum.querySelector('.gcount')) return;
+    const n = d.querySelectorAll('.field').length;
+    if (!n) return;
+    const chip = document.createElement('span');
+    chip.className = 'gcount';
+    chip.textContent = `${n} 项`;
+    sum.appendChild(chip);
+  });
+}
+
+/* 超长说明折两行 + 「展开」按钮。
+   为什么用 CSS line-clamp 而不是把文字切两段：说明里带 <b> / <span class="mono-sm">
+   这类标签，按字数切会把标签切断。line-clamp 只影响显示、不动 DOM，最安全。
+   ⚠️ 动态更新的那几个说明（用 id 取的）要跳过 —— 它们的内容会被整体重写。 */
+const HINT_KEEP_IDS = ['roomPickHint', 'partTitlePreview', 'cfgSearchNote', 'presetNote', 'tagHint'];
+function collapseLongHints() {
+  $$('#cfgBody .hintline').forEach((el) => {
+    if (el.dataset.hintDone) return;
+    if (el.id && HINT_KEEP_IDS.includes(el.id)) return;
+    if (el.querySelector('details')) return;
+    el.dataset.hintDone = '1';
+    if (el.textContent.trim().length < 110) return;   // 短的照旧
+    el.classList.add('hint-clamped');
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'hint-toggle';
+    btn.textContent = '展开';
+    btn.setAttribute('aria-expanded', 'false');
+    btn.onclick = (ev) => {
+      ev.preventDefault();
+      el.classList.remove('hint-clamped');
+      btn.remove();
+    };
+    el.after(btn);
+  });
 }
 
 /**
@@ -521,16 +601,18 @@ function renderDtimePlanPreview() {
   const b = state.bootstrap || {};
   const plan = b.dtimePlan || {};
   if (!v) {
-    el.className = 'hintline';
-    el.textContent = `自动排期：首片约 ${plan.firstText || '—'}，末片约 ${plan.lastText || '—'}（间隔 ${fmtSpan((b.config && b.config.publish.clipGapSec) || 7500)}）`;
+    el.className = plan.scheduled === false ? 'hintline warn' : 'hintline';
+    el.textContent = plan.scheduled === false
+      ? '当前是「立即发布」：投稿不带 dtime，稿件过审即公开 —— 首片/末片时间不适用（要错峰发布就关掉「立即发布」）'
+      : `自动排期：首片约 ${plan.firstText || '—'}，末片约 ${plan.lastText || '—'}（间隔 ${fmtSpan(plan.gapSec || (b.config && b.config.publish.clipGapSec) || 300)}）${plan.note ? ` · ${plan.note}` : ''}`;
     return;
   }
   const ms = Date.parse(v.replace(' ', 'T'));
   if (!Number.isFinite(ms)) { el.className = 'hintline warn'; el.textContent = '无法解析这个时间'; return; }
   const earliestMs = (plan.earliestAllowed || 0) * 1000;
-  if (ms / 1000 < Math.floor(Date.now() / 1000) + 7200) {
+  if (ms / 1000 < Math.floor(Date.now() / 1000) + 1200) {
     el.className = 'hintline warn';
-    el.textContent = `⚠ 这个时间距现在不足 7200 秒（B站要求 dtime 晚于提交时刻 7200 秒）—— 实际会推迟到 ${plan.earliestAllowedText || '最早合法时间'} 发布`;
+    el.textContent = `⚠ 这个时间距现在不足 1200 秒（本项目硬约束 #4 的余量下限；B站平台底线是 300 秒）—— 实际会推迟到 ${plan.earliestAllowedText || '最早合法时间'} 发布`;
   } else {
     el.className = 'hintline ok';
     el.textContent = `✓ 首片 ${fmtTime(ms)} 发布，其余按间隔顺延`;
@@ -555,7 +637,22 @@ function updateTagHint() {
   if (!el) return;
   const n = $('#c_defaultTags').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean).length;
   el.className = n > 10 ? 'hintline warn' : 'hintline';
-  el.textContent = n > 10 ? `已填 ${n} 个，超出 B站上限 10 个` : `已填 ${n} 个（上限 10 个，与 LLM 生成的标签合并后仍会去重与截断）`;
+  el.textContent = n > 10 ? `已填 ${n} 个，超出 B站上限 10 个` : `已填 ${n} 个（上限 10 个；投稿时排在「必带标签」与 LLM 按内容生成的标签之后，只用来补足剩余名额，不会挤掉它们）`;
+}
+/* 必带标签：这些词永远在最前、优先占位，所以它们的个数直接决定 LLM 内容词还剩几个位置 */
+function updateIdentityTagHint() {
+  const el = $('#hintIdentityTags');
+  if (!el) return;
+  const list = $('#c_identityTags').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+  const n = list.length;
+  const hasHolder = list.some((s) => /\{(主播|主播名|主播昵称|昵称)\}/.test(s));
+  el.className = n > 10 ? 'hintline warn' : 'hintline';
+  el.textContent =
+    (n > 10 ? `已填 ${n} 个，超出 B站上限 10 个；` : `已填 ${n} 个（上限 10 个）：`) +
+    `这些词永远排在切片标签最前面、优先占位，剩下的名额给 LLM 按内容生成的标签，重复的自动去重。` +
+    (hasHolder
+      ? '其中 {主播} 会在投稿时替换成本场主播名（例如 乙主播）；该场没识别出主播名时这一条整条跳过，任务里会写明。'
+      : '提示：想让每个稿件都带上主播名，加一个 {主播}（等同 {主播名} / {昵称}）。');
 }
 
 function bindCfg() {
@@ -599,6 +696,7 @@ function bindCfg() {
   $('#c_llmModel').oninput = updateEscalationHint;
   $('#c_llmSelectModel').oninput = updateEscalationHint;
   $('#c_defaultTags').oninput = updateTagHint;
+  if ($('#c_identityTags')) $('#c_identityTags').oninput = updateIdentityTagHint;
 
   // 首片发布时间：快捷按钮 + 实时预览
   const firstAt = $('#c_firstPublishAt');
@@ -631,8 +729,8 @@ function bindCfg() {
       d.setHours(kind === 'tomorrow8' ? 8 : 20, 0, 0, 0);
       ms = d.getTime();
     }
-    // 不能早于 B站下限（提交后 7200 秒）；更早的话实际也会被推迟，这里直接给合法值更省事
-    const floor = now + 7800_000;
+    // 不能早于本项目余量下限（提交后 1200 秒）；更早的话实际也会被推迟，这里直接给合法值更省事
+    const floor = now + 1200_000;
     if (ms < floor) ms = floor;
     firstAt.value = toLocalInput(ms);
     renderDtimePlanPreview();
@@ -648,14 +746,58 @@ function bindCfg() {
   /* 解码器精度开关：关 = 不发这个字段（fp32 默认）。文案跟着状态变，顺带把实测数字写在脸上 ——
      "省 1.1 GB 显存、推理慢 10%"是这个开关唯一的取舍，用户不需要去翻文档。 */
   tgl('#c_funasrBf16', (on, el) => el.nextElementSibling.textContent = on ? '开启（显存 −33%，推理 +10%）' : '关闭（fp32 默认，显存多占约 1.1 GB）');
-  /* 「从 biliLive-tools 读取房间号」（2026-10-13 用户要求：不要手打）。
-     只读取、只填输入框 —— 不自动保存（配置的写入仍由「保存」按钮走同一条路，行为可预期）。 */
+  /* 多直播间：第 1 行是主房间（**id 保持 `c_roomId`** ——「常用」快跳、配置覆盖检查、
+     读取按钮都按这个 id 找它，换 id 会连累三处），「＋ 添加直播」加的行在保存时收进 `room.roomIds`。
+     「从 biliLive-tools 读取」（2026-10-13 用户要求：不要手打）只填输入框、不自动保存 ——
+     配置写入仍由「保存」按钮走同一条路，行为可预期。 */
   {
+    const list = $('#roomList');
+    const rowsOf = () => (list ? Array.from(list.querySelectorAll('.roomrow')) : []);
+    /** 第一行不允许删（主直播间必填）；其余行显示「移除」。
+        主行用 visibility 而不是 display 隐藏：按钮仍然占位，几行输入框才对得齐（实测差 46px）。 */
+    const syncRows = () => {
+      rowsOf().forEach((row, i) => {
+        const tag = row.querySelector('.roomtag');
+        if (tag) tag.textContent = i === 0 ? '主' : '';
+        const del = row.querySelector('[data-room-del]');
+        if (del) del.style.visibility = i === 0 ? 'hidden' : '';
+      });
+    };
+    const bindDel = (row) => {
+      const del = row.querySelector('[data-room-del]');
+      if (del) del.onclick = () => { row.remove(); syncRows(); };
+    };
+    rowsOf().forEach(bindDel);
+    /* 记住最后聚焦的房间输入框：点「读取」按钮后焦点已经不在输入框上了，
+       所以必须在点击的那一刻就锁定目标，否则永远只会填到第一行。 */
+    let focusedInput = null;
+    if (list) {
+      list.addEventListener('focusin', (e) => {
+        const t = e.target;
+        if (t && t.tagName === 'INPUT') focusedInput = t;
+      });
+    }
+    const addRoomRow = (value) => {
+      if (!list) return null;
+      const row = document.createElement('div');
+      row.className = 'roomrow';
+      row.innerHTML = '<input class="inp" data-room-extra placeholder="附加直播间，例如 12345678"><span class="roomtag"></span><button class="btn-sm" data-room-del title="移除这个直播间">移除</button>';
+      const input = row.querySelector('input');
+      if (input) input.value = value || '';
+      list.appendChild(row);
+      bindDel(row);
+      syncRows();
+      return input;
+    };
+    const addBtn = $('#btnAddRoom');
+    if (addBtn) addBtn.onclick = () => { const el = addRoomRow(''); if (el) el.focus(); };
+    syncRows();
+
     const b = $('#btnFetchRooms');
     if (b) {
       b.onclick = async () => {
         const hint = $('#roomPickHint');
-        const box = $('#c_roomId');
+        const box = focusedInput && document.contains(focusedInput) ? focusedInput : $('#c_roomId');
         if (!hint || !box) return;
         hint.textContent = '读取中…';
         try {
@@ -742,11 +884,11 @@ function bindCfg() {
         ${cmd('cursor', 'Cursor（~/.cursor/mcp.json 里的片段）', r.commands.cursorJson)}
         ${cmd('curl', '动手验证（列出所有工具）', r.commands.curl)}
         <h4 style="margin-top:14px">安全边界</h4>
-        <ul style="font-size:12.5px;color:var(--text-2);padding-left:18px;line-height:1.7">
+        <ul style="font-size:var(--fs-s);color:var(--text-2);padding-left:18px;line-height:1.7">
           ${r.safety.map((s) => `<li>${esc(s)}</li>`).join('')}
         </ul>
         <h4 style="margin-top:14px">Agent 能做什么</h4>
-        <p style="font-size:12.5px;color:var(--text-2);line-height:1.7">
+        <p style="font-size:var(--fs-s);color:var(--text-2);line-height:1.7">
         可以直接对它说：「现在有什么任务在跑」「<span class="mono-sm">manual-xxx</span> 这场为什么没出片」「把这场从 ANALYZED 重跑」
         「我新录的那场怎么没导入」「取消删源录播」「这场跑一次投稿体检」。</p>`);
       $$('#infoBody [data-copy]').forEach((el) => (el.onclick = () => {
@@ -765,26 +907,35 @@ function bindCfg() {
   tgl('#c_autoPublish', (on, el) => el.nextElementSibling.textContent = on ? '全自动（分析完直接排期发布）' : '半自动（需确认后发布）');
   tgl('#c_immediatePublish', (on, el) => {
     el.nextElementSibling.textContent = on ? '开启 —— 稿件过审后直接公开' : '关闭 —— 按公式定时发布';
-    const hint = document.getElementById('hintImmediate');
-    if (hint) {
-      hint.className = on ? 'hintline warn' : 'hintline';
-      hint.textContent = on
-        ? '⚠️ 投稿不带 dtime，稿件过审即公开。这会绕过任务书硬约束 #4（dtime > 提交后 7200 秒）—— 该约束是防风控的自律措施，不是 B站规则。试跑期建议关闭。'
-        : 'B站只在「传了 dtime」时才要求它 ≥ 提交后 2 小时；本模式满足硬约束 #4。';
-    }
+    paintScheduleHints(clipModeFromForm());
   });
-  { const h = document.getElementById('hintImmediate'); if (h) h.textContent = 'B站只在「传了 dtime」时才要求它 ≥ 提交后 2 小时；本模式满足硬约束 #4。'; }
-  tgl('#c_multiPart', (on, el) => {
-    el.nextElementSibling.textContent = on ? '开启 —— 省额度，但各分P同一时刻发布' : '关闭 —— 每片一稿，可错峰但费额度';
-    const hint = document.getElementById('hintMultiPart');
-    if (hint) {
-      hint.className = 'hintline';
-      hint.textContent = on
-        ? '结构为 2+N 个分P（完整版/纯享版/各切片），一次投稿只占 1 个每日额度；代价是多P稿件只有一个 dtime，相邻错峰间隔不再生效。'
-        : '每个切片单独投一个稿件，可按 clipGapSec 错峰，但每片占 1 个每日额度。';
-    }
-  });
-  { const h = document.getElementById('hintMultiPart'); if (h) h.textContent = (state.bootstrap.config.publish.multiPart ? '结构为 2+N 个分P（完整版/纯享版/各切片），一次投稿只占 1 个每日额度；代价是多P稿件只有一个 dtime，相邻错峰间隔不再生效。' : '每个切片单独投一个稿件，可按 clipGapSec 错峰，但每片占 1 个每日额度。'); }
+  /* 切片投稿方式：两选一（追加切片投稿 / 单独投稿）。
+     chip 是多选语义，这里手动互斥 —— 点一个必须关掉另一个，否则界面上会出现"两个都亮"，
+     而保存时只能取一个（那种界面就是在骗人）。 */
+  {
+    const chips = $$('#c_clipPublishMode .chip');
+    const paint = (mode) => {
+      chips.forEach((el) => el.classList.toggle('on', el.dataset.mode === mode));
+      const h = document.getElementById('hintClipMode');
+      if (h) {
+        h.className = 'hintline';
+        h.textContent = clipModeHint(mode, state.bootstrap.config.publish);
+      }
+      /* multiPart 是这个开关的实现口径，界面上把它如实显示出来：
+         用户手改过 config.json 时两个值可能打架，先看见比保存后才发现好。 */
+      const mp = state.bootstrap.config.publish.multiPart;
+      if (h && ((mode === 'append') !== (mp === true))) {
+        h.className = 'hintline warn';
+        h.textContent += `（注意：config.json 里 publish.multiPart=${mp}，与这个选择不一致 —— 保存后二者会被同步成一致）`;
+      }
+      /* ★ 排期三处提示跟着**当前选中**的模式重画（还没保存也立刻反映）：
+         单独投稿是「固定定时投稿 + 设置里的间隔/抖动」，唯一真正不参与的旋钮是
+         publish.immediatePublish。 */
+      paintScheduleHints(mode);
+    };
+    chips.forEach((el) => (el.onclick = () => paint(el.dataset.mode === 'standalone' ? 'standalone' : 'append')));
+    paint(clipModeOf(state.bootstrap.config.publish));
+  }
   tgl('#c_deleteRaw', (on, el) => el.nextElementSibling.textContent = on ? '开启（省空间）' : '关闭');
   tgl('#c_keepOnFail', (on, el) => el.nextElementSibling.textContent = on ? '开启（便于重跑）' : '关闭');
   $$('#c_channels .chip').forEach((ch) => ch.onclick = () => ch.classList.toggle('on'));
@@ -793,14 +944,36 @@ function bindCfg() {
   gap.oninput = () => {
     const v = Number(gap.value);
     const el = $('#hintGap');
-    if (!(v > 7200)) {
+    if (!(v >= 1200)) {
       el.className = 'hintline warn';
-      el.textContent = `B站要求定时发布必须晚于该稿件提交时刻 7200 秒，${v} 秒会导致投稿被拒（陷阱 #12）`;
+      el.textContent = `本项目硬约束 #4 要求定时发布距该稿件提交时刻 ≥ 1200 秒，${v} 秒会被拦下（B站平台底线是 300 秒，多出来的是防风控的自律余量）`;
     } else {
       el.className = 'hintline ok';
-      el.textContent = `✓ 合规（> 7200 秒）`;
+      el.textContent = `✓ 合规（≥ 1200 秒）`;
     }
   };
+  /* 「相邻切片间隔 / 随机抖动」一改就立刻重算公式 —— 用户最需要当场看到的是
+     「我填的 100 会不会被抬到 300」「我填的 900 会不会被压」，而不是保存后才发现。
+     口径仍只由 `scheduleFormula()` 一份实现给出（与服务端同一套规则）。 */
+  const repaintFormulaFromForm = () => {
+    const pub = { ...((state.bootstrap && state.bootstrap.config && state.bootstrap.config.publish) || {}) };
+    for (const [sel, key] of [['#c_submitGapSec', 'submitGapSec'], ['#c_clipGapSec', 'clipGapSec'], ['#c_jitterSec', 'jitterSec']]) {
+      const el = $(sel);
+      if (!el) continue;
+      const v = Number(el.value);
+      if (Number.isFinite(v)) pub[key] = v;
+    }
+    const f = scheduleFormula(pub, clipModeFromForm());
+    const el = $('#hintGap');
+    if (el) {
+      el.className = f.warn ? 'hintline warn' : 'hintline ok';
+      el.textContent = f.text;
+    }
+  };
+  for (const sel of ['#c_clipGapSec', '#c_jitterSec']) {
+    const el = $(sel);
+    if (el) el.oninput = repaintFormulaFromForm;
+  }
 }
 
 /**
@@ -864,11 +1037,18 @@ async function saveCfg(force) {
   btn.disabled = true; btn.textContent = '保存中…';
   const val = (id) => { const el = $(id); return el ? el.value : ''; };
   const num = (id) => Number(val(id));
+  /* 多直播间：第一行是主房间（写回 room.roomId），其余按顺序写进 room.roomIds。
+     这里先去重、去空、并剔除与主房间重复的 —— 校验层还会拦一次，但没必要把脏数据写进配置。 */
+  const primaryRoom = val('#c_roomId').trim();
+  const extraRooms = [...new Set($$('#roomList input[data-room-extra]').map((el) => String(el.value || '').trim()).filter(Boolean))].filter(
+    (id) => id !== primaryRoom,
+  );
   const on = (id) => $(id).classList.contains('on');
   const patch = {
     bililive: { baseUrl: val('#c_baseUrl'), ...(val('#c_passKey') ? { passKey: val('#c_passKey') } : {}) },
     room: {
-      roomId: val('#c_roomId'),
+      roomId: primaryRoom,
+      roomIds: extraRooms,
       pollIntervalSec: num('#c_pollIntervalSec'),
       offlineConfirmSec: num('#c_offlineConfirmSec'),
       reconcileIntervalMin: num('#c_reconcileIntervalMin'),
@@ -932,12 +1112,17 @@ async function saveCfg(force) {
       isOnlySelf: on('#c_isOnlySelf') ? 1 : 0,
       autoPublish: on('#c_autoPublish'),
       immediatePublish: on('#c_immediatePublish'),
-      multiPart: on('#c_multiPart'),
+      clipPublishMode: clipModeFromForm(),
+      /* multiPart 是「切片投稿方式」的实现口径（append ⇔ true），保存时**由它派生**：
+         两个键必须一起写，否则会出现"界面上选了单独投稿、配置里 multiPart 还是 true"那种
+         自相矛盾（服务端会按 clipPublishMode 走，但人手翻 config.json 时看不出谁说了算）。 */
+      multiPart: clipModeFromForm() === 'append',
       fullVideoBy: val('#c_fullVideoBy') === 'assistant' ? 'assistant' : 'bililive-tools',
       resumeWaitMin: Math.max(1, Number(val('#c_resumeWaitMin')) || 90),
       seasonId: Number(val('#c_seasonId')) || 0,
       defaultCategory: val('#c_defaultCategory'),
       defaultTags: val('#c_defaultTags').split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+      identityTags: val('#c_identityTags').split(/[,，]/).map((s) => s.trim()).filter(Boolean),
       descTemplate: val('#c_descTemplate'),
       aiNotice: val('#c_aiNotice').trim(),
       coverSource: val('#c_coverSource'),
@@ -1040,6 +1225,143 @@ async function saveCfg(force) {
     }
   }
   btn.disabled = false; btn.textContent = '保存配置';
+}
+
+/**
+ * 读「切片投稿方式」这一组 chip 的当前选择（两选一，默认「追加切片投稿」）。
+ *
+ * 为什么单独成函数：渲染初值、点击切换、saveCfg 存盘三处都要用同一个口径 ——
+ * 各写一遍迟早会漂移（那种漂移的表现是"界面上选的是单独投稿、存下去是追加"，最难查）。
+ */
+function clipModeFromForm() {
+  const on = $$('#c_clipPublishMode .chip').find((el) => el.classList.contains('on'));
+  return on && on.dataset.mode === 'standalone' ? 'standalone' : 'append';
+}
+
+/**
+ * 相邻切片间隔的**平台底线**（秒）：B站 要求每片的 dtime 晚于**它自己**的提交时刻 300 秒。
+ *
+ * 与服务端 `STANDALONE_CLIP_GAP_SEC`（`src/config.ts`）是同一个数。这里重复一个常量是
+ * **故意的**：设置面板要在用户还没保存、只是切换「切片投稿方式」时就把生效值算出来给用户看，
+ * 而那时还没有服务端算好的口径可读。两边算法必须一致（间隔 = max(300, 用户值)、
+ * 抖动 = min(用户值, max(0, 间隔 - 30))），`tools/verify-clip-gap-ui.ts` 会拿生产函数对账。
+ */
+const CLIP_GAP_FLOOR_SEC = 300;
+
+/**
+ * 「公式」那一行的**唯一**生成处（首次渲染与切换模式/开关后刷新共用）。
+ *
+ * 为什么必须这么写：这句话是用户核对 dtime 的唯一凭据。曾经的错误形态有两种 ——
+ *   ① 单独投稿下写死 `random(0,0)`、`×300`，而用户明明在设置里填了 500/120（本次要修的）；
+ *   ② 抖动被夹取时静默显示成"没夹"，用户以为生效了，实际每片间隔比预期小。
+ * 所以这里两个数一律按**生效值**写，并且凡是被抬/被夹就在后面括号里说清原因。
+ *
+ * @returns `{ text, warn }` —— `warn` 为 true 时调用方把这一行染成警示色（有值没完全生效）。
+ */
+function scheduleFormula(publish, mode) {
+  const p = publish || {};
+  const standalone = mode === 'standalone';
+  const submitGap = Number(p.submitGapSec) || 1200;
+  /* 用户填的数（负数/NaN 一律当没填）：这一步只做"取值"，不做任何业务夹取 */
+  const wantGapRaw = Math.floor(Number(p.clipGapSec));
+  const wantGap = Number.isFinite(wantGapRaw) && wantGapRaw > 0 ? wantGapRaw : CLIP_GAP_FLOOR_SEC;
+  const wantJitterRaw = Math.floor(Number(p.jitterSec));
+  const wantJitter = Number.isFinite(wantJitterRaw) && wantJitterRaw > 0 ? wantJitterRaw : 0;
+  /* 生效值：与服务端 resolveClipPublishSchedule + effectiveJitterSec 完全同一套规则 */
+  const gap = standalone ? Math.max(CLIP_GAP_FLOOR_SEC, wantGap) : wantGap;
+  const cap = Math.min(wantJitter, Math.max(0, gap - 30));
+
+  const reasons = [];
+  if (standalone && wantGap < CLIP_GAP_FLOOR_SEC) {
+    reasons.push(`你填的间隔 ${wantGap} 秒低于 B站 平台底线 ${CLIP_GAP_FLOOR_SEC} 秒，实际按 ${gap} 秒排`);
+  }
+  if (wantJitter > cap) {
+    reasons.push(`你填的抖动 ${wantJitter} 秒已自动压到 ${cap} 秒（抖动必须小于片间隔，否则排期倒挂）`);
+  }
+
+  let text = `公式：dtime = 提交时刻 + ${submitGap} + (N-1)×${gap} + random(0,${cap})`;
+  if (standalone) text += '　（单独投稿：固定定时投稿，片间隔与抖动都按上面这两项生效）';
+  if (reasons.length) text += `　（${reasons.join('；')}）`;
+  return { text, warn: reasons.length > 0 };
+}
+
+/**
+ * 按**当前选中的模式**刷新与排期有关的三处提示（还没保存也立刻反映）。
+ *
+ * ★ 2026-10-17 口径更正（用户要求「这里改成对定时投稿也生效」）：
+ *   单独投稿下「相邻切片间隔 / 随机抖动」**对切片生效**，只有两条硬边界 ——
+ *   ① 间隔不得低于平台底线 300 秒；② 抖动必须小于间隔（防排期倒挂）。
+ *   唯一仍不参与的是「立即发布」（固定定时投稿，不传 dtime 就没有"按间隔发"）。
+ *   所以这里不再说"那两项不生效"，而是把**生效值**与**被抬/被夹的原因**一起写出来：
+ *   这类"改了配置没完全生效"比完全不生效更容易让人抓狂。
+ */
+function paintScheduleHints(mode) {
+  const publish = (state.bootstrap && state.bootstrap.config && state.bootstrap.config.publish) || {};
+  const standalone = mode === 'standalone';
+  const f = scheduleFormula(publish, mode);
+
+  /* ① 公式：写**生效值**，被抬/被夹要说明原因 */
+  const g = document.getElementById('hintGap');
+  if (g) {
+    g.className = f.warn ? 'hintline warn' : 'hintline ok';
+    g.textContent = f.text;
+  }
+
+  /* ② 「相邻切片间隔」下方的生效说明 */
+  const u = document.getElementById('hintClipGapUse');
+  if (u) {
+    u.className = 'hintline';
+    u.textContent = standalone
+      ? '当前是「单独投稿」：切片固定走定时投稿，片间隔就用上面这个数 —— 低于 300 秒会被抬到 300（B站 要求每片 dtime 晚于它自己的提交时刻 300 秒）；下面的「随机抖动」也生效，上限会被压到「片间隔 − 30」以内以保证不倒挂。'
+      : '生效前提：① 关闭「立即发布」（立即发布不传 dtime，没有发布时间可排）；② 切片投稿方式选「单独投稿」（多分P 稿件只有一个发布时间，片子之间排不开）。';
+  }
+
+  /* ③ 「立即发布」下方的说明：单独投稿下它对切片失效（但对完整版仍有效） */
+  const imm = document.getElementById('hintImmediate');
+  if (imm) {
+    const sw = $('#c_immediatePublish');
+    const isOn = Boolean(sw && sw.classList.contains('on'));
+    if (standalone) {
+      imm.className = 'hintline warn';
+      imm.textContent =
+        '当前是「单独投稿」：切片固定定时投稿（片间隔见上方「相邻切片间隔」，最低 300 秒），这个开关对切片不生效' +
+        '—— 但由本服务投完整版时仍按它走（开启则过审即公开）。';
+    } else {
+      imm.className = isOn ? 'hintline warn' : 'hintline';
+      imm.textContent = isOn
+        ? '⚠️ 投稿不带 dtime，稿件过审即公开。这会绕过本项目硬约束 #4（dtime ≥ 提交后 1200 秒）—— 该约束是防风控的自律措施，不是 B站规则。试跑期建议关闭。'
+        : 'B站只在「传了 dtime」时才要求它 ≥ 提交后 2 小时；本模式满足硬约束 #4。';
+    }
+  }
+}
+
+/**
+ * 「切片投稿方式」的说明文案（纯文本：渲染时过 esc()、切换时用 textContent，都不解析标签）。
+ *
+ * 必须写清楚差别 —— 光看「追加 / 单独」两个词猜不出实际后果：
+ * 等不等完整版稿件、占几个每日额度、还能不能错峰。
+ */
+function clipModeHint(mode, publish) {
+  const wait = Number(publish && publish.resumeWaitMin) || 90;
+  const wantGap = Number(publish && publish.clipGapSec) || 300;
+  if (mode === 'standalone') {
+    /* ★ 2026-10-17：间隔/抖动在这里**是生效的**（间隔 300 保底、抖动 < 间隔），
+       文案必须跟着改 —— 否则用户会因为这句「不参与切片排期」而不敢动那两个控件。 */
+    const gap = Math.max(CLIP_GAP_FLOOR_SEC, wantGap);
+    const jitter = Math.min(Math.max(0, Number(publish && publish.jitterSec) || 0), Math.max(0, gap - 30));
+    return (
+      `单独投稿：每个切片各自投一个稿件（标题/封面/标签各自独立），固定走定时投稿、每片相隔 ${gap} 秒` +
+      `（${gap % 60 === 0 ? `${gap / 60} 分钟` : `${Math.floor(gap / 60)} 分 ${gap % 60} 秒`}）` +
+      `${jitter > 0 ? `、每片再加 0~${jitter} 秒随机抖动` : '等距'}发布（间隔低于 300 秒会被抬到 300，抖动大于等于间隔会被压到「间隔 − 30」）。` +
+      `也不用等 biliLive-tools 的完整版稿件（「立即发布」在该模式下对切片不参与 —— 固定定时投稿才有发布时间可排）。` +
+      `代价是每片占 1 个每日额度。保存后对后续步骤生效（已投出的稿件不动）。`
+    );
+  }
+  return (
+    `追加切片投稿：切片作为「同一个稿件」的分P 追加进去（完整版归 biliLive-tools 时进它那个稿件，` +
+    `归本服务时与完整版/纯享版合成 2+N 稿件）。一次投稿只占 1 个每日额度；代价是整个稿件只有一个发布时间` +
+    `（相邻切片错峰不生效），且要等完整版稿件投出来（最多 ${wait} 分钟）。保存后对后续步骤生效。`
+  );
 }
 
 function closeCfg() { $('#cfgMask').classList.remove('show'); }

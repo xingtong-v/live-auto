@@ -21,6 +21,7 @@ function bindDetail() {
   if (retryFromBtn) retryFromBtn.onclick = () => {
     openInfo('从某阶段重跑', `
       <p style="font-size:13px;color:var(--text-2)">转写结果与切片产物都会复用，重跑不会重复产生 ASR 费用。</p>
+      <p style="font-size:13px;color:var(--text-2)"><b>重新切片与投稿</b>：先把切片状态重置，再逐片同步 —— 已投过的片通过指纹/反查自动核对回来（不会重复投稿），只有 B站 上确实没有的片才会补投（产物在直接投、缺产物先重切）。</p>
       <div class="fields" style="grid-template-columns:1fr">
         <div class="field"><label>从哪个阶段开始</label>
           <div class="chips" id="retryStages">
@@ -190,6 +191,32 @@ function bindDetail() {
       await copyText(lines.join('\n'), ` ${lines.length} 条稿件链接（可粘到创作中心核对）`);
     } catch (e) { toast('获取稿件链接失败：' + e.message, 5000); }
   };
+
+  /* ★ 2026-10-16（UI 评审 IA-1）：工具条「更多 ▾」菜单的开合。
+     菜单里的按钮仍由下面各自的 $('[data-act=…]') 绑事件 —— 这里只管显隐。 */
+  const opsBtn = $('#opsMoreBtn');
+  const opsMenu = $('#opsMenu');
+  if (opsBtn && opsMenu) {
+    opsBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      const open = opsMenu.hidden;
+      opsMenu.hidden = !open;
+      opsBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    };
+    /* 点外面 / 按 Esc 收起。用捕获阶段，避免被别处的 stopPropagation 拦掉。 */
+    document.addEventListener('click', () => {
+      if (!opsMenu.hidden) { opsMenu.hidden = true; opsBtn.setAttribute('aria-expanded', 'false'); }
+    }, true);
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && !opsMenu.hidden) {
+        opsMenu.hidden = true; opsBtn.setAttribute('aria-expanded', 'false'); opsBtn.focus();
+      }
+    });
+    /* 菜单里点完任何一项就收起，省得用户还要再点一次外面 */
+    opsMenu.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+      opsMenu.hidden = true; opsBtn.setAttribute('aria-expanded', 'false');
+    }));
+  }
 
   const delBtn = $('[data-act="delete-task"]');
   if (delBtn) delBtn.onclick = async () => {
@@ -421,7 +448,7 @@ function bindDetail() {
         ? `<p>已为该任务生成项目文件：<code>${esc(llc)}</code></p>
            <p>在 biliLive-tools 的「切片」页面用「打开项目」选择它（位于任务目录）：</p>
            <pre class="raw">${esc(d.source.fullVideoPath || (d.source.segments[0] && d.source.segments[0].name) || '')}</pre>
-           <p style="color:var(--text-3);font-size:12.5px">任务目录：data/tasks/${esc(d.id)}/</p>`
+           <p style="color:var(--text-3);font-size:var(--fs-s)">任务目录：data/tasks/${esc(d.id)}/</p>`
         : '<p>尚未生成 .llc 项目文件（分析完成后会生成；若失败请看日志）。</p>');
     };
     /* 单片投稿：与下面批量按钮走**同一个** approve 接口，只是 indices 只有一个。
@@ -523,7 +550,12 @@ function bindDetail() {
     try {
       const r = await api(`/api/task/${encodeURIComponent(state.activeId)}/approve`, { method: 'POST', body: { indices } });
       const mode = state.bootstrap.mode.isOnlySelf ? '（仅自己可见）' : '';
-      toast(`已提交 ${r.count ?? indices.length} 个切片${mode}，按 ${fmtSpan(state.bootstrap.config.publish.clipGapSec)}间隔加入排期`, 5000);
+      const sched = publishSchedule();
+      toast(
+        `已提交 ${r.count ?? indices.length} 个切片${mode}，` +
+          (sched.scheduled ? `按 ${fmtSpan(sched.gapSec)}间隔加入排期` : '**立即发布**（不排期，过审即公开）'),
+        5000,
+      );
       setTimeout(() => refreshAll(true), 1500);
     } catch (e) {
       const problems = e.payload && e.payload.problems;

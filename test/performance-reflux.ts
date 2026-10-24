@@ -267,6 +267,9 @@ section('② 真 Publisher：续传成功 ⇒ 切片记 PUBLISHED（否则回流
            桩也要给 —— 不给的话这条记录会被判成"缺字段"，下次回流又拉一遍（见 ledger 的补齐规则）。 */
         return { View: { bvid: 'BV1RESUME001', videos: parts.length, pages: parts, pubdate: PUBDATE } };
       },
+      /* 投稿入口的 ensureAnchorUid 会问一次主播信息（简介模板 {{anchorUid}} 用）；
+         桩返回空 = 查不到，按设计照常投稿（可选字段绝不挡投稿）。 */
+      anchorInfoByRoom: async () => ({}),
     };
     return new Publisher({ client: client as never, config: cfg, ledger, logger: silentLog as never });
   };
@@ -345,16 +348,23 @@ ledger.setClips('perf-t3-old', [mkClip(0, { status: 'PUBLISHED', bvid: 'BV1PERFO
    这里刻意按真实形状返回，只要有人再读错层级，本套件立刻红。 */
 let detailCalls = 0;
 const MP_STAT = { view: 12345, like: 678, coin: 90, favorite: 123, danmaku: 45, reply: 6, share: 7 };
+const MP_LIST = [
+  { bvid: 'BV1PERFMP001', title: '多分P场 稿件', ctime: Math.floor(Date.now() / 1000), state: 0, state_desc: '开放浏览' },
+  { bvid: 'BV1PERFSG001', title: '单P场 稿件', ctime: Math.floor(Date.now() / 1000), state: 0, state_desc: '开放浏览' },
+  { bvid: 'BV1PERFTOP01', title: '顶层stat场 稿件', ctime: Math.floor(Date.now() / 1000), state: 0, state_desc: '开放浏览' },
+  /* 实测：-4 = 已锁定，公开接口取不到统计，但它并没有被删 */
+  { bvid: 'BV1PERFLOCK1', title: '锁定场 稿件', ctime: Math.floor(Date.now() / 1000), state: -4, state_desc: '已锁定' },
+  /* 只在稿件列表里、本地台账没有任务（完整版由 biliLive-tools 自己投的稿件） */
+  { bvid: 'BV1PERFLIST1', title: '完整版稿件（本地无任务）', ctime: Math.floor(Date.now() / 1000), state: 0, state_desc: '开放浏览' },
+];
 (orch as unknown as { client: unknown }).client = {
-  biliArchives: async () => [
-    { bvid: 'BV1PERFMP001', title: '多分P场 稿件', ctime: Math.floor(Date.now() / 1000), state: 0, state_desc: '开放浏览' },
-    { bvid: 'BV1PERFSG001', title: '单P场 稿件', ctime: Math.floor(Date.now() / 1000), state: 0, state_desc: '开放浏览' },
-    { bvid: 'BV1PERFTOP01', title: '顶层stat场 稿件', ctime: Math.floor(Date.now() / 1000), state: 0, state_desc: '开放浏览' },
-    /* 实测：-4 = 已锁定，公开接口取不到统计，但它并没有被删 */
-    { bvid: 'BV1PERFLOCK1', title: '锁定场 稿件', ctime: Math.floor(Date.now() / 1000), state: -4, state_desc: '已锁定' },
-    /* 只在稿件列表里、本地台账没有任务（完整版由 biliLive-tools 自己投的稿件） */
-    { bvid: 'BV1PERFLIST1', title: '完整版稿件（本地无任务）', ctime: Math.floor(Date.now() / 1000), state: 0, state_desc: '开放浏览' },
-  ],
+  biliArchives: async () => MP_LIST,
+  /* ★ 2026-10-17 分页事故修复后，refreshPerformance 改走 biliArchivesPage（按 count 翻页取全）——
+     桩必须给出 page.count 元信息，否则 fetchAllArchivePages 判不了"取全"，列表来源整段失效。 */
+  biliArchivesPage: async ({ page }: { page?: number } = {}) => ({
+    items: (page ?? 1) === 1 ? MP_LIST : [],
+    page: { count: MP_LIST.length, ps: MP_LIST.length, page: page ?? 1 },
+  }),
   biliArchiveDetail: async (bvid: string) => {
     detailCalls++;
     if (bvid === 'BV1PERFLOCK1' || bvid === 'BV1PERFGONE1') {
@@ -371,6 +381,8 @@ const MP_STAT = { view: 12345, like: 678, coin: 90, favorite: 123, danmaku: 45, 
     const pubRaw = bvid === omitPubdateBvid ? undefined : PUBDATE;
     return { View: { bvid, videos: bvid === 'BV1PERFMP001' ? 6 : 2, title, stat, ...(pubRaw ? { pubdate: pubRaw } : {}) } };
   },
+  /* 投稿入口的 ensureAnchorUid 会问一次主播信息；桩返回空 = 查不到，照常投稿 */
+  anchorInfoByRoom: async () => ({}),
 };
 
 const ui = new UiServer({ orchestrator: orch, port: 0, openBrowser: false });
@@ -511,6 +523,71 @@ const get = async (p: string): Promise<Record<string, unknown>> => {
   eq('删任务后同一天不重复拉：候选仍为 0', r3['checked'], 0);
 }
 
+/* ========================================================================== */
+section('④ 稿件库超过 120 个时不再按播放截断（2026-10-24 用户报「为什么只能获取 2 个」）');
+/* 真实故障：`performanceView()` 末行是 `[...scored, ...未拉取].slice(0, 100)`，而 scored 是
+   **按播放降序**的 —— 当天新投的 8 个切片里播放低的 5 个（14/7/18/13/19）整行被切掉，
+   前端按发布时间排序也变不出来；头部「N 个在库稿件」又用返回行数算，271 被显示成 100。
+   这里在**同一本台账/同一个服务**上灌到 135 个稿件（其中 5 个是播放极低的新稿件），
+   断言：① 全部都在返回里；② archiveTotal/liveTotal 是真实口径（不是 100）；
+   ③ 没有静默截断（truncated=false）；④ 有数据的行仍按播放降序（排序契约不变）。 */
+{
+  const BULK = 130;
+  const bulkBvids: string[] = [];
+  for (let i = 0; i < BULK; i++) {
+    const bvid = `BV1BULK${String(i).padStart(5, '0')}`;
+    bulkBvids.push(bvid);
+    const taskId = `perf-bulk-${i}`;
+    ledger.createTask(mkTask(taskId, { title: `批量稿件 ${i}`, publishedAt: now }));
+    ledger.setClips(taskId, [
+      mkClip(0, { status: 'PUBLISHED', bvid, submitTime: nowMs, publishedAt: now, score: 8, title: `批量切片 ${i}` }),
+    ]);
+    /* 播放从 10000 一路降到 9871：**按播放截断 100 条时，后半段这些行会整行消失** */
+    ledger.recordPerformance({ bvid, date: today, view: 10000 - i, title: `批量稿件 ${i}`, score: 8, pubdate: PUBDATE });
+  }
+  /* 今天新投、播放还很低（1~5）的 5 个稿件：旧实现里它们必然排在 100 名之外 */
+  const freshLow: Array<{ bvid: string; view: number }> = [1, 2, 3, 4, 5].map((view, i) => ({
+    bvid: `BV1NEWLOW00${i + 1}`,
+    view,
+  }));
+  for (const [i, f] of freshLow.entries()) {
+    const taskId = `perf-newlow-${i}`;
+    ledger.createTask(mkTask(taskId, { title: `今天新投 ${i}`, publishedAt: now }));
+    ledger.setClips(taskId, [
+      mkClip(0, { status: 'PUBLISHED', bvid: f.bvid, submitTime: nowMs, publishedAt: now, score: 9, title: `今天新投切片 ${i}` }),
+    ]);
+    ledger.recordPerformance({ bvid: f.bvid, date: today, view: f.view, title: `今天新投 ${i}`, score: 9, pubdate: PUBDATE });
+  }
+
+  const big = await get('/api/performance');
+  const bigRows = big['rows'] as Array<Record<string, unknown>>;
+  /* 之前几段留下的 6 个稿件（任务已删、靠 performance.jsonl 历史兜住）+ 130 个批量 + 5 个新投 */
+  const expectedTotal = 6 + BULK + freshLow.length;
+  eq('★ archiveTotal 是真实在库口径（不是截断后的 100）', big['archiveTotal'], expectedTotal);
+  eq('★ 返回行数 = 真实在库数（不再 slice(0, 100)）', bigRows.length, expectedTotal);
+  eq('liveTotal 与「返回行里非 gone 的行数」一致（全量口径下自然一致）', big['liveTotal'], bigRows.filter((r) => r['gone'] !== true).length);
+  eq('truncated=false：135 行远未触及安全上限，没有静默丢行', big['truncated'], false);
+  ok('★ 断言规模确实触发了旧 bug（>120 个稿件）', expectedTotal > 120, String(expectedTotal));
+
+  const returnedBvids = new Set(bigRows.map((r) => String(r['bvid'])));
+  const missingBulk = bulkBvids.filter((b) => !returnedBvids.has(b));
+  ok('★ 130 个批量稿件一个不少（旧实现只有播放最高的 100 个）', missingBulk.length === 0, missingBulk.slice(0, 5).join(','));
+  const missingFresh = freshLow.filter((f) => !returnedBvids.has(f.bvid)).map((f) => f.bvid);
+  ok('★ 播放只有 1~5 的**新**稿件也在返回里（旧实现被整行切掉，这就是用户看到的「只能获取 2 个」）', missingFresh.length === 0, missingFresh.join(','));
+  for (const f of freshLow) {
+    const row = bigRows.find((r) => r['bvid'] === f.bvid);
+    eq(`新稿件 ${f.bvid} 的播放数据完整`, row?.['view'], f.view);
+    ok(`新稿件 ${f.bvid} 带发布时间（前端按发布时间排序要看它）`, typeof row?.['publishedAt'] === 'string', JSON.stringify(row));
+  }
+  /* 排序契约不变：有播放数据的行仍按播放降序（截断策略改了，返回顺序没改） */
+  const views = bigRows.filter((r) => typeof r['view'] === 'number').map((r) => Number(r['view']));
+  ok('有数据的行仍按播放降序（前端自己还要按用户选的字段重排）', views.every((v, i) => i === 0 || views[i - 1]! >= v), JSON.stringify(views.slice(0, 5)));
+  ok('没拉到数据的行依旧排在最后（不会盖住有数据的）', (() => {
+    const firstNoView = bigRows.findIndex((r) => typeof r['view'] !== 'number');
+    return firstNoView < 0 || bigRows.slice(firstNoView).every((r) => typeof r['view'] !== 'number');
+  })());
+}
+
 /* ★ 2026-10-07 用户要求「已删除的文件 不进行显示」：B站 上已不存在的稿件默认不出现在表现列表里。
    为什么在无浏览器的自测里也断言一次：这条规则是**纯前端**的（服务端照旧返回那些行，
    好让 MCP 等消费者仍拿得到），而真浏览器脚本要开 Edge、改页面时最容易漏掉它。 */
@@ -519,8 +596,12 @@ const get = async (p: string): Promise<Record<string, unknown>> => {
   ok('★ 表现页按 gone 过滤：默认不显示「稿件已不存在」的行', /const live = p\.rows\.filter\(\(r\) => !r\.gone\)/.test(ui));
   ok('默认是隐藏，不是默认展开', /let perfShowGone = false;/.test(ui));
   ok(
-    '表格渲染的是过滤后的行（不再直接用 p.rows）',
-    /\$\{shown\.map\(\(r\) =>/.test(ui) && !/\$\{p\.rows\.map\(/.test(ui),
+    /* 2026-10-17「默认只显示 20 条」之后，表格经 rowsToShow（= shown 或其前 20 条）渲染，
+       截断发生在**过滤之后**：渲染的仍然是 gone 过滤后的行，不是 p.rows。 */
+    '表格渲染的是过滤后的行（不再直接用 p.rows；20 条截断在过滤之后）',
+    /const rowsToShow = perfShowAll \? shown : shown\.slice\(0, PERF_PAGE\)/.test(ui) &&
+      /return rowsToShow\.map\(\(r\) =>/.test(ui) &&
+      !/\$\{p\.rows\.map\(/.test(ui),
   );
   ok('给出「已隐藏 N 个」的计数，不静默吞掉', /已隐藏 \$\{goneRows\.length\} 个/.test(ui));
   ok('展开时计数文案跟着变（不写「已隐藏」却把行摆出来）', /含 \$\{goneRows\.length\} 个已删除/.test(ui));

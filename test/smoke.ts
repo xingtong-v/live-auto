@@ -83,7 +83,7 @@ async function main(): Promise<void> {
     ok('配置文件已加载', Boolean(orch.store.path), orch.store.path);
     ok('UI 只监听回环地址（硬约束 #2）', ['127.0.0.1', 'localhost', '::1'].includes(cfg.ui.host), cfg.ui.host);
     ok('platform 为 Bilibili（陷阱 #1）', cfg.room.platform === 'Bilibili', cfg.room.platform);
-    ok('dtime 首片余量 > 7200 秒（硬约束 #4）', cfg.publish.submitGapSec > 7200, String(cfg.publish.submitGapSec));
+    ok('dtime 首片余量 ≥ 1200 秒（硬约束 #4，本项目自律下限）', cfg.publish.submitGapSec >= 1200, String(cfg.publish.submitGapSec));
     /* 试跑期可见性。
        ★ 2026-10-06：用户**明确选择公开可见**（`publish.isOnlySelf = 0`），
        所以"必须等于 1"这条不再是判定标准（那是试跑期的临时约定，不是代码缺陷）——

@@ -1,6 +1,16 @@
 /* ============================================================================
  * 数据加载
  * ========================================================================== */
+/* ★ 2026-10-16（UI 评审 A-1）：开关的状态必须同时反映到 class 和 aria-checked。
+   之前只切 .on，读屏念出来永远是"开关"，不报开还是关。 */
+function syncSwitch(sel, on) {
+  const el = typeof sel === 'string' ? $(sel) : sel;
+  if (!el) return null;
+  el.classList.toggle('on', !!on);
+  el.setAttribute('aria-checked', on ? 'true' : 'false');
+  return el;
+}
+
 /* 顶栏的「字幕」开关（默认关，随时能切）。
    为什么单独给它一个按钮、而不是只留在设置里：字幕曾经被**整体关掉**，原因是云端 ASR 的
    句级时间窗不可靠 —— 实测「15 个字的句子占了 0→30.9 秒」，烧出来与声音整体错位。
@@ -12,8 +22,7 @@ function renderSubtitleSwitch() {
   const on = !!(cfg.clip && cfg.clip.burnSubtitles);
   const provider = String((cfg.asr && cfg.asr.provider) || '');
   const local = provider === 'local-funasr' || provider === 'whisper-cpp';
-  const sw = $('#subSwitch');
-  if (sw) sw.classList.toggle('on', on);
+  syncSwitch('#subSwitch', on);
   const box = $('#subMode');
   if (box) {
     box.classList.toggle('ok', on && local);
@@ -23,11 +32,55 @@ function renderSubtitleSwitch() {
   if (t) t.textContent = !on ? '字幕：关' : (local ? '字幕：开 · 本地 ASR' : '字幕：开 · 云端 ASR 可能错位');
 }
 
+/* 顶栏的「全自动 · 免确认发布」开关。
+   ★ 2026-10-16（UI 评审 3.1）：这个开关开启时**单独走琥珀色**，不再和普通开关共用品牌粉。
+   为什么：它是全站唯一"点一下就会自动对外发文、且不再问你"的设置，
+   之前和"字幕开关"长得一模一样 —— 高风险设置必须有区别于普通开关的视觉语言。
+   另外给它加了第一次开启的显式确认（见 45- 的 onclick）。 */
+function renderModeSwitch(autoPublish) {
+  const sw = syncSwitch('#modeSwitch', autoPublish);
+  const box = $('#modeBox');
+  if (box) {
+    box.classList.toggle('risk', !!autoPublish);
+    sw && sw.classList.toggle('risk', !!autoPublish);
+  }
+  $('#modeText').textContent = autoPublish ? '全自动 · 免确认发布' : '半自动 · 需确认后发布';
+}
+
+/**
+ * 构建徽章（2026-10-25）：把"进程跑的代码指纹"和"磁盘上的代码指纹"的差异直接摆到顶栏。
+ *
+ * 为什么值得占一个位置：配额限流那次修复已经落盘、测试全绿，但服务没重启，
+ * 用户点重投依旧被旧逻辑撞死，只能靠人翻进程启动时间才能发现。
+ * 现在只要徽章转红写着「需重启」，一眼就知道"修复还没生效"。
+ */
+function renderBuildTag(build) {
+  const el = document.getElementById('buildTag');
+  if (!el) return;
+  const ver = (state.bootstrap && state.bootstrap.version) || '';
+  const id = (build && build.id) || '--------';
+  const stale = !!(build && build.stale);
+  el.classList.toggle('stale', stale);
+  el.textContent = stale ? '⚠ 代码已更新 · 需重启' : `v${ver} · ${id}`;
+  const lines = [
+    stale
+      ? `磁盘代码已更新（${build.diskId || '?'}），但当前进程仍在跑 ${id}`
+      : `已是最新代码（${id}）`,
+    stale ? '重启服务后新修复才会生效' : '与磁盘上的 src/ 与 web/src/ 完全一致',
+  ];
+  if (build && build.at) {
+    const d = new Date(build.at);
+    lines.push(`代码最后修改：${d.toLocaleString('zh-CN')}`);
+  }
+  if (build && build.note) lines.push(build.note);
+  el.title = lines.join('\n');
+}
+
 async function loadBootstrap() {
   state.bootstrap = await api('/api/bootstrap');
   const b = state.bootstrap;
-  $('#modeSwitch').classList.toggle('on', b.mode.autoPublish);
-  $('#modeText').textContent = b.mode.autoPublish ? '全自动 · 免确认发布' : '半自动 · 需确认后发布';
+  renderBuildTag(b.build);
+  renderModeSwitch(b.mode.autoPublish);
   renderSubtitleSwitch();
   /* 房间号只有一个（它只用于"开播触发"这条次要路径），而**导入走目录轮询**、
      覆盖录制根目录下的全部主播 ⇒ 把覆盖数一并显示，免得看起来像"只处理一个直播间"
@@ -66,6 +119,9 @@ async function loadSchedule() {
   /* 自动导入的状态也一起取：用户看不到"它在等什么"时，会以为轮询没生效，
      然后自己去手动导入（于是任务标成「手动导入」，更困惑）。 */
   try { state.watch = await api('/api/watch'); } catch { state.watch = null; }
+  /* 账号受限闸门（2026-10-22）：24h 内 2 次配额拒绝 ⇒ 暂停投稿。
+     不取它的话，用户点「重跑发布阶段」会没反应又不知道为什么。 */
+  try { state.quotaGuard = await api('/api/publish/quota-guard'); } catch { state.quotaGuard = null; }
   renderSchedule();
 }
 

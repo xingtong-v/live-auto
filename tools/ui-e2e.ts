@@ -28,7 +28,7 @@ const HEADED = process.argv.includes('--headed');
 const BASE = 'http://127.0.0.1:3000';
 const PORT = 9333;
 const SHOT_DIR = path.join(ROOT_DIR, 'data', 'ui-shots');
-const UI_BUILD_EXPECTED = 'ui-2026-10-13-llmdtype-switch';
+const UI_BUILD_EXPECTED = 'ui-2026-10-16-standalone-5min';
 
 let pass = 0;
 let fail = 0;
@@ -1007,7 +1007,7 @@ async function main(): Promise<void> {
       })()`);
       await sleep(1000);
       const badTip = await cdp.evalJs<string>(`String((document.getElementById('dtimeTip') || {}).textContent || '')`);
-      ok('不合规的时间被拒绝并说明原因（硬约束 #4）', /7200|硬约束/.test(badTip), badTip.slice(0, 120));
+      ok('不合规的时间被拒绝并说明原因（硬约束 #4）', /1200|硬约束/.test(badTip), badTip.slice(0, 120));
 
       /* ---- 9b. 合法时间（明天 08:00）应当保存进排期；再清空回到自动排期 ---- */
       await cdp.evalJs(`(() => {

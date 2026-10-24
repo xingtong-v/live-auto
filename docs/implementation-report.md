@@ -294,7 +294,8 @@
 | 表现数据回流对**已删除**的稿件每天重试 3 次 | 用户删稿后台账仍留着旧 bvid，每次都拿到 HTTP 500「稿件不可见」，刷屏且白费请求 | 新增 `ClipRecord.archiveGoneAt`：确认消失后不再请求。判定必须**两段式**（错误文案「啥都木有」在审核/转码中也会出现，故还要确认该 bvid 已不在稿件列表里） |
 | `confirm` 日志不带 `uploadTaskId` | 额度统计只能靠启发式配对，多分P 反查用**主标题**、命中的稿件不落在任何分P 桶，配对必然错位 | `confirm` 补记 `uploadTaskId` / `dtime`，配对有显式依据 |
 | 多分P 稿件的 bvid 无法用切片标题反查 | `confirmPublished` 按各切片标题匹配，而多分P 稿件只有一个主标题，6 个切片永远 `pending` | 多分P 收尾按**主标题**记录 bvid（同一 bvid 落到全部切片） |
-| **`defaultTags` 被无条件追加到每个切片** | 实测 9/9 个候选的标签完全一致（`直播切片`+`名场面`），观众侧 SEO 零区分度；且每个切片必刷 2 条「标签被移除（重复）」噪音警告（LLM 本就会学着写这两个词，于是必然重复）。追加发生在 `analyze.ts` 落库与 `publish.ts` 投稿**两处**，只改一处不生效 | 两处都改为**不追加**：标签只信 LLM 按内容生成的 + 用户在界面手动加的（`extraTags` 保留追加语义，因为那是人工显式意图）。`defaultTags` 重新定位为**兜底**（LLM 一个可用标签都没给出时才用），并把兜底警告写清原因 |
+| **`defaultTags` 被无条件追加到每个切片** | 实测 9/9 个候选的标签完全一致（`直播切片`+`名场面`），观众侧 SEO 零区分度；且每个切片必刷 2 条「标签被移除（重复）」噪音警告（LLM 本就会学着写这两个词，于是必然重复）。追加发生在 `analyze.ts` 落库与 `publish.ts` 投稿**两处**，只改一处不生效 | 两处都改为**不追加**：标签只信 LLM 按内容生成的 + 用户在界面手动加的（`extraTags` 保留追加语义，因为那是人工显式意图）。`defaultTags` 重新定位为**兜底**（LLM 一个可用标签都没给出时才用），并把兜底警告写清原因。**2026-10-17 再修正**：用户拿着设置面板那句「与 LLM 生成的标签合并后仍会去重与截断」反馈「投稿的切片标签没有带上」——「只兜底」等于用户配的词永远不会出现在切片稿件上，代码与面板提示两边对不上。改为**补位**（`analyze.ts` 的 `fillDefaultTags`）：内容词（LLM 生成 + 本场追加 `extraTags` + 界面手改）排在前面，配置里的默认词按顺序补足到 10 个上限，所以内容词不会被挤掉、也不会回到「所有切片标签一模一样」；候选里的重复/敏感/纯数字**静默丢弃**（避免当初那种每片一条的「（重复）」噪音）。`analyze.ts` 落库与 `publish.ts` 投稿两处都调（后者是为了**存量任务**：clips.json 是改动前落库的，重新投稿也得带上），面板提示文字同步改成「补位」口径。**2026-10-17 第三次修正（用户规格）**：用户随后明确「必有的标签 虚拟主播、2D、3D、VTuber、vup，还有一个占位符根据主播不同、标签为主播的 ID（例如 乙主播），其他的为 LLM 生成的，还要有去重」⇒ 新增配置 `publish.identityTags`（必带标签，默认就是用户点名的 6 项）与 `resolveIdentityTags()` / `mergeIdentityTags()`（`src/analyze.ts`）：① 必带标签永远在最前、**占位优先**（`{主播}` / `{主播名}` / `{主播昵称}` / `{昵称}` → 本场主播名，该场没识别出主播名时这一条**整条跳过**并进任务警告，绝不把 `{主播}` 原文投出去）；② 内容词（LLM 按内容生成 + `extraTags` 手改）补满剩余名额、与①去重（大小写不敏感）；③ `defaultTags` 退到最后一层，只在①②没用满 10 个时补位；④ 超上限时被挤掉的是内容词，且**每个任务只汇总一条**警告（逐片刷屏正是当初回退标签方案的原因）。选片 prompt 同步加「标签口径」段，告诉 LLM 身份标签由系统带上、不要再写（否则它的 tags 有一半会被去重丢掉、白占名额）。`publish.ts` 的 `buildBiliupConfig` 用 `task.streamer` 再套一遍同样的规则（**存量 clips.json**、手改标签、append/多P 稿件都走这道关口）。设置面板新增「必带标签」输入框（`#c_identityTags`，实时提示占位符写法与剩余名额）；`test/clip-tags.ts` 扩到 46 条断言，覆盖占位符替换/别名/无主播名跳过/大小写去重/优先占位/超限丢弃/投稿载荷。**遗留两条**：我们自己的完整版上传（`uploadFullVideo`）仍是 `defaultTags + 完整录播`，没套必带标签（用户当前 `fullVideoBy=bililive-tools`，该路径不生效）；单个标签沿用既有 12 字上限，主播名超过 12 字会被截断 |
+| **`publish.tidWhitelist` 的 tid 与 B站 官方分区表对不上（用户问「投稿分区现在是怎么搞的」时逐条核对发现）** | 拿官方分区表（B站 投稿页的分区接口，20 个一级 / 120 个二级）反查白名单，几乎每条都有问题：`虚拟主播/虚拟主播: 145` 在**现役表里根本不存在**（默认分区一直指向一个不存在的分区）、`游戏/手机游戏` 写 181（181 是影视）、`游戏/桌游棋牌` 写 172（172 是手机游戏）、`音乐/音乐现场` 写 130（130 是音乐综合）、`舞蹈/宅舞` 写 129（129 是舞蹈主分区）、`生活/手工` 写 174（官方表里没有，应为 161）、`娱乐/粉丝创作: 71` 名字和值都错（官方叫「娱乐粉丝创作」= 242）；还有 `生活`、`综合`、`游戏/单机游戏/其他`、`动画/剪辑` 压根不是分区名。因为 `mapCategoryToTid` 名字对不上就**静默回退**到 `defaultCategory`，这些错值不报错、只让分区悄悄跑偏 | 逐条改成官方值（19 条），`defaultCategory` 改为 `娱乐/娱乐粉丝创作: 242` —— 实测同类切片频道就用它（山间翻滚、七海切片），乙主播/阿梓切片则用 `动画/综合: 27`。**光改 `config.json` 不够**：`defaults()` 拿 `config.example.json` 当 base（`deepMerge(builtinDefaults(), raw)`），示例文件里删掉的分区会从默认层**漏回**运行时配置 —— 第一次热加载后白名单反而是 25 条（旧的 `虚拟主播/虚拟主播: 145` 又回来了），同步示例后仍剩 21 条（进程内 `builtinDefaults()` 是启动时那份），**重启**才落到 19 条。以后删/改白名单要三处一起动：`config.json` + `config.example.json` + `src/config.ts` 的 `builtinDefaults()`。另一条独立发现：这批切片在 B站 侧的 `tid` **全是 21（生活/日常）**，而载荷里各片下发的是 145/201/21/138 等不同值 ⇒ 更像工具侧（biliup）没把 `tid` 发出去，改白名单**不保证** B站 侧跟着变 |
 | **切片结尾切在半句话/半句歌词上（用户反馈：「唱歌时歌词刚唱完切片就结束了」）** | 选片 LLM **看不到转写原文**，只拿到「各时间窗要点」，所以 start/end 只能是近似值 —— 实测两组真实数据的 end 全部落在 1.5 秒网格上（`xxx.5`），切在说话中间的比例为 **5/9 与 7/8**。旧实现唯一的收尾处理是 `bufferSec`（前后各留 1.5s），它不看转写 | 新增 `resolveClipEnd`：在合法时长区间内把结尾对齐到**真正的停顿**。实测（新提示词 + 对齐）两组数据均降到 **0/9 与 0/10**，且候选零丢失、零硬裁。见下方「两次被数据推翻的错误假设」 |
 
 | **删除切片产物会连带删掉整个任务（用户反馈）** | 界面上只勾「切片产物」（文案明确写着"默认只删切片产物（最占地方且随时可重切）"），结果**整条任务从列表里消失** —— 转写、弹幕信号、总结、投稿记录全没了。根因：`deleteTask` 在把文件移入回收站之后**无条件**调用 `ledger.deleteTask(taskId)`（回收站路径与永久删除路径各一处）；UI 也无条件 `state.activeId = null`，即使记录还在也看着像"任务没了"。切了还能重切，任务记录没了就什么都没了 | 两处都改为**只有勾选「任务目录」才算整体删除**（`deleteTaskDir === true` 才移除记录）。UI 两处删除入口同步：只删文件时保留当前选中项与任务列表，并把提示改成"已删除所选文件（任务记录保留，可随时重切）"；删除预览文案也补上这条语义。新增 `test/delete-semantics.ts`（11 条断言）锁住该边界 |
@@ -4485,9 +4486,9 @@ tools/local-asr/worker-equivalence.ts 做第三方复核（脚本留仓库，可
 
 wp2u 那场最清楚（2 片）：
 
--  0:31:27 提交第 1 个切片任务；
--  0:32:09 第 1 片产出完成 + **同一时刻**提交第 2 个切片任务（两事件相距 42 s = 恰好一片的处理时间）；
--  0:32:51 第 2 片产出完成。
+- 0:31:27 提交第 1 个切片任务；
+- 0:32:09 第 1 片产出完成 + **同一时刻**提交第 2 个切片任务（两事件相距 42 s = 恰好一片的处理时间）；
+- 0:32:51 第 2 片产出完成。
 
 ⇒ **我方是"提交一个 → 等它完成 → 再提交下一个"**，把本可以并行的 ffmpeg 工作串起来了。
 这也解释了"片数越多、每片平均耗时越长"的现象（12 片 42.8 s/片 vs 1 片 18 s/片）。
@@ -5832,7 +5833,7 @@ biliLive-tools 面板显示：59 分钟录播的弹幕版压制，速度 **0.487
 
 ### 90.1 用户要的功能
 
-顶部栏显示"房间 22886883"，但那是手填的。用户要求：**直接从 biliLive-tools 的直播录制配置里取房间号**。
+顶部栏显示"房间 12345678"，但那是手填的。用户要求：**直接从 biliLive-tools 的直播录制配置里取房间号**。
 
 | 位置 | 内容 |
 |---|---|
@@ -5892,7 +5893,7 @@ const target = body.querySelector(`#c_${leaf}`) ? `c_${leaf}` : '';   // leaf = 
 
 ## 91. C 方案：把"轮询覆盖了几个直播间"说清楚（2026-10-13）
 
-用户看到顶栏"房间 22886883"并问："只能单个直播间吗，我想两个都显示"。
+用户看到顶栏"房间 12345678"并问："只能单个直播间吗，我想两个都显示"。
 
 **先查清了事实**（代码层面）：
 
@@ -5933,7 +5934,7 @@ const target = body.querySelector(`#c_${leaf}`) ? `c_${leaf}` : '';   // leaf = 
 返回结构（`payload.data[]`，每个录制器）：
 
 ```
-channelId: "22886883"   remarks: "星瞳_Official"   state: "idle"
+channelId: "12345678"   remarks: "乙主播"   state: "idle"
 liveInfo: { living: false, owner, title, liveStartTime, recordStartTime }
 extra:    { lastRecordTime: 1791902494036 }
 ```
@@ -5950,7 +5951,7 @@ extra:    { lastRecordTime: 1791902494036 }
 ### 92.3 更正一条我先前说错的结论
 
 我在 §90 说过"我们配置的房间号与 biliLive-tools 里的房间号**都不是同一个数字**（可能短号/长号）"——**这是错的**。
-`/recorder/list` 的 `channelId` 正是 **22886883**，与我们配置**完全一致**；
+`/recorder/list` 的 `channelId` 正是 **12345678**，与我们配置**完全一致**；
 `webhook.rooms` 的键（另两个数字）是**另一套 id**（webhook/主播维度），不是录制器的频道号。抱歉。
 
 ### 92.4 验收
@@ -6211,3 +6212,358 @@ typecheck 干净；全量链通过。
 > 这一场（`6rh9`）的转写结果**不会**自动变好 —— 它已经带着 30 分钟的字幕走完了分析与切片。
 > 想补全只能对它重跑转写（缓存里只有前 30 分钟的条目）。这正是"数据丢失"与"显示不准"的区别：
 > 后者可以下次修好，前者要人工重跑。
+
+## 99. 热补丁：「切片投稿方式」二选一（追加切片投稿 / 单独投稿）（2026-10-16）
+
+用户原话：「热补丁 切片投稿 增加一个开关选项 分别是 追加切片投稿 和 单独投稿」。
+
+这个仓库在"开关"上翻过两次车，形状一样 —— **界面上能点、链路里没人读**：
+
+| 事故 | 后果 |
+|---|---|
+| `publish.multiPart` 配了却从没在自动流程里被读取 | 一场 8 个切片被投成 **8 个独立稿件**，占 8 个额度，事后要人工去 B站 一个个删 |
+| `llm_dtype` 传在 `generate()` 里（而 funasr 只在构造模型时读它） | 界面显示"已开 bf16"，实际一直按 fp32 跑 |
+
+所以这次不是"加个布尔值"，而是**先把判据收口，再用门禁钉住它**。
+
+### 99.1 两个口径：用户口径与实现口径
+
+| 层 | 键 | 取值 |
+|---|---|---|
+| 用户口径（界面开关） | `publish.clipPublishMode` | `append` = 追加切片投稿 · `standalone` = 单独投稿 |
+| 实现口径（机制） | `publish.multiPart` | `true` ⇔ `append` |
+
+`resolveClipPublishMode()` 是**全仓唯一**的判定点：显式设了 `clipPublishMode` 就以它为准；
+**没设**（加入这个键之前的老配置）就按 `multiPart` 反推 —— 老配置行为逐字不变。
+
+### 99.2 分流点（真机路径，不是注释）
+
+| 配置 | 走哪条路 | 行为 |
+|---|---|---|
+| `append`（显式，或 `multiPart=true`） | `publishMultiPartStage()` | 先切片（`skipUpload`）→ 找续传目标 → 追加分P；找不到就**等**（最多 `resumeWaitMin` 分钟） |
+| `standalone` | `publishClips()`（不带 `skipUpload`） | 每片一稿，**不等** biliLive-tools 的完整版稿件、不追加进任何已有稿件 |
+| 没设 `clipPublishMode` + `multiPart=false` + 完整版归 biliLive-tools | **拦住**（`contract` 错误，一个稿件都不投） | 防错保护一字未减：那是配置错位，不是意图 |
+
+"显式"与"错位"必须分得开，所以另有一个 `isClipPublishModeExplicit()`：
+少了它，用户点了「单独投稿」会被旧的硬约束拦住 —— 那就是"开关点了没反应"。
+
+### 99.3 实现过程中被测试揪出来的三处
+
+| # | 现象 | 真因 | 处置 |
+|---|---|---|---|
+| 1 | 给 `clipPublishMode` 配默认值 `'append'` 后，"老配置（没设这个键）"这条路**永远走不到** | 配置是 `defaults ⊕ config.json` 深合并，默认值会把缺失的键补齐 ⇒「用户没动过」与「用户选了追加」再也分不出来，旧拦截失效 | **刻意不给默认值**（`src/config.ts` 里写明原因）；界面读不到时用 `clipModeOf()` 反推显示，一保存就写成显式值 |
+| 2 | 路由测试里"单独投稿"分支永远拿不到多分P 的断言 | 替身 `publishClips` 一律把切片置 `SUBMITTED` ⇒ 多分P 阶段认为"都投过了"而提前返回 | 替身按 `skipUpload` 区分：`true` ⇒ `CUT`（只切），否则 `SUBMITTED`（真投） |
+| 3 | 浏览器验证脚本挂死几分钟、没有任何输出 | 设置面板「全部展开」（81 个字段）后 `Page.captureScreenshot` **永不返回**；不带超时的 CDP `send()` 让整个脚本吊死 | 只展开目标分组 + 用共享件 `tools/ui-shared.ts` 的 `Cdp`（它自带 30 秒超时）；截图失败只提示、不判失败 |
+| 4 | "切回追加切片投稿"那一步**静默点空**（配置停在 standalone） | 设置面板的分组是 `<details>` 默认收起：收起时元素仍在 DOM（`querySelector` 找得到、`waitFor` 也过），但 **rect 是 0×0** ⇒ 真实鼠标点击必然落空。第一次打开时我手动展开过所以成功了，重开面板后又收起 | 点之前一律先展开所在分组（`revealClipMode()`），并**断言落点**（`clickReal` 的返回值）——落空不再静默通过 |
+| 5 | 把默认值写进 `config.example.json` 之后，"缺省 ⇒ 按 multiPart 反推"这条路**又被堵死**（本套件的两条"老配置"用例当场变红） | **`config.example.json` 就是运行时默认值的来源**：`defaults()` = 内置字面量 ⊕ 示例文件（示例优先），所以往示例里写一个值，等于给所有缺这个键的配置都补上了它 | 示例里**只留 `$comment_` 说明、不写值**（注释键在 `loadConfig` 里递归剥离，不进运行时配置）。#1 与 #5 是同一个坑的两个入口：一个在代码默认值里，一个在示例文件里 |
+
+顺带发现一处**会被这次改动放大**的老问题：既然示例文件是默认值来源，而它写着
+`multiPart: false`、又没有 `fullVideoBy`（默认 `bililive-tools`），那么"照抄示例得到的新配置"
+本来就会被 `validateConfig` 判一条硬错（要求把 multiPart 打开或明确选单独投稿）。
+这不是本次引入的（加开关之前那条规则一字不差），故未擅自改示例的取值，只补了说明注释。
+
+顺手收口一处同类隐患：`publish.ts` 的**切片并发**（`cutK`）原本直接读 `multiPart`，
+而它真正的语义是"这个循环只切片、还是含上传" —— 两键矛盾时会被误判成"只切片"从而
+**并发上传**（绕过 `minSubmitIntervalSec` 的风控抖动）。现在同样走 `resolveClipPublishMode()`。
+
+另外修了一处无关但挡路的小毛病：`docs/implementation-report.md` 的 §65.2 里误入 3 个
+NUL 字节（`- \0 0:31:27 提交第 1 个切片任务；`），整个文件因此被工具链当成**二进制**、拒改。
+已清掉这 3 个字节（其余一字未动）。
+
+### 99.4 验收
+
+| 项 | 结果 | 说明 |
+|---|---|---|
+| `npm run clip-publish-mode-test` | **24 / 0** | 四种配置组合走**真实 `publishStage`**：单独投稿 ⇒ `publishClips`（无 `skipUpload`）、`publishAsMultiPart` 0 次、无 `publishWait`；追加 ⇒ 多分P；老配置错位 ⇒ 拦住且**一个稿件都没投**；外加口径表与校验四态 |
+| `npm run clip-publish-mode-ui` | **25 / 0** | 真浏览器（Edge headless + CDP，用共享件 `tools/ui-shared.ts`）：点开关 → 互斥 → 保存 → `clipPublishMode=standalone` **且** `multiPart=false` 一起落盘 → 无硬约束错误 → 重开读回仍是它 → 切回 append 两键一起回。跑在**独立临时实例**上（端口 3180 + 临时 config.json），线上服务与线上配置一字未动 |
+| `npm run config-coverage-test` | **22 / 0** | 新增第 6 节：控件在 / 两个选项在 / `saveCfg` 存它且 `multiPart` 由它派生 / config.json 有键 / **daemon 必须调 `resolveClipPublishMode`**（防"开关没人读"复发） |
+| `npm run multipart-routing-test` | **61 / 0** | 老路径回归未变 |
+| `npm run cut-pipeline-test` | **19 / 0** | 修了一处**被这次改动暴露**的老写法：用例只改 `multiPart` 而把线上配置里的 `clipPublishMode` 一起带进来，配置自相矛盾（现在两个键一起写） |
+| `typecheck` · `check:ui` · `encoding-test` · `ui-modules-test` · `config-test` · `docs-check` · `ui-shared-usage-test` | 全绿 | 界面产物由 22 个模块重建；新脚本按仓库约定改用共享件 `ui-shared.ts`（`ui-shared-usage-test` 第 1 节就是守这条的） |
+
+截图留证：`data/verify-shots/clip-publish-mode-{open,standalone,reread}-*.png`（共享件的截图目录），
+另有早期一版落在 `data/ui-shots/`。
+`config.example.json` 里**只补了 `$comment_clipPublishMode` 说明、没有写值**（原因见 99.3 的第 5 条：
+示例文件就是运行时默认值的来源，写值会把"用户没动过这个开关"这个状态抹掉）。
+
+> 注：界面构建标记（`UI_BUILD`）由**并行工作的另一个会话**在同一时间改成了 `ui-2026-10-16-clip-gap-5min`
+> 并重建了产物；本节的浏览器用例因此不再写死标记值，改成断言「页面里的标记 == `public/ui.html` 里的标记」
+> —— 那才是它真正要守的东西（页面用的一定是当前产物）。
+
+> ⚠️ **生效条件（如实说明）**：配置是热加载的，但**正在运行的那个进程是加这个开关之前的代码** ——
+> 它不认识 `clipPublishMode`（会继续只看 `multiPart`）。所以这个开关要**重启一次服务**才真正生效；
+> 重启前界面能点、能存，但链路仍按旧判据走。默认行为刻意保持"追加"，所以重启前后不改变任何既有行为。
+
+## 100. 排期改为「每片 5 分钟」：两个前提 + 两处必须一起修的隐患（2026-10-16）
+
+用户口径：「我的定时发布后续定为每个切片间隔 5 分钟发布」；追问后确认要**独立投稿 + 定时发布**，
+抖动 60 秒（实际间隔落在 5~6 分钟）。
+
+### 100.1 改这一个键不会有任何反应（差点变成"改完没反应"）
+
+`clipGapSec` 是唯一控制片间隔的键，但它**不是充分条件**。当时线上是：
+
+| 键 | 当时取值 | 对片间隔的影响 |
+|---|---|---|
+| `immediatePublish` | `true` | **立即发布压根不传 `dtime`**（B站 只在传了 dtime 时才校验 7200 秒）⇒ 没有发布时间可排 |
+| `multiPart` / `clipPublishMode` | `true` / `append` | 多分P 稿件**只有一个 `dtime`** ⇒ 所有分P 同时上线，片子之间排不开 |
+
+所以只把 `clipGapSec` 从 7500 改成 300，**线上行为不会发生任何变化**。要生效必须三条同时成立：
+
+1. `publish.immediatePublish = false` —— 走定时发布，payload 里才有 `dtime`；
+2. `publish.clipPublishMode = 'standalone'` + `publish.multiPart = false` —— 每片各自一个稿件；
+3. `publish.clipGapSec = 300`（+ `jitterSec` 小于它）。
+
+> 第 2 条就是 §99 那个「切片投稿方式」开关：**逐片错峰的能力只有"单独投稿"才有**。
+> 界面提示已按此改写（设置 → 发布 → 相邻切片间隔 / 随机抖动上限）。
+
+### 100.2 改动同时暴露了两个真隐患（间隔一变小就会现形）
+
+| # | 隐患 | 为什么原来没暴露 | 处置 |
+|---|---|---|---|
+| 1 | **排期倒挂**：抖动是**每片独立随机**的，第 N 片的 dtime = 基准 + (N-1)×间隔 + random(0, 抖动上限)。抖动 ≥ 间隔时，第 N 片的最大值会越过第 N+1 片的最小值 ⇒ 第 2 片比第 1 片先公开 | 老间隔 7500 远大于抖动 1800，倒挂的窗口不存在 | 新增 `effectiveJitterSec(jitterSec, clipGapSec)`，把抖动夹到 `clipGapSec - 30` 以内；`computeDtime` 一律走它。间隔 7500 + 抖动 1800 的老配置**逐字不变**（向后兼容） |
+| 2 | **慢上传把靠后的片挤进拒稿区**：硬约束 #4 是按「该稿件**自己的**提交时刻」算的，而排期用的是**批次开始时刻**（整批共用一个基准，N 片之间才等距）。上传一慢，靠后的片就可能「它自己的 dtime − 它自己的提交时刻 ≤ 7200」⇒ B站 直接拒稿，而报错完全看不出是排期问题 | 老流程 `immediatePublish=true` 根本不传 dtime，这条路径从没跑过 | 新增 `clampDtimeForSubmit(dtime, submitTimeMs)`：提交那一刻复核，不够就抬到「现在 + 7800」并写进 warnings + 日志。**逐片提交**（`publishClips`）与**多P 一次提交**（`publishAsMultiPart`，上传大文件耗时更久）都接上了 |
+
+顺带修掉一条**假告警**：`validateConfig` 原来写「`clipGapSec < 7200` ⇒ 偏小；B站要求是相对各稿件提交时刻 >7200，
+取 7500 属保守余量」—— 把**我们自己的**保守取值说成了平台规则，用户按 5 分钟排期时会被它反复干扰。
+现在只守真正的不变量：间隔 < 60 秒告警（≈同时发布）；抖动 ≥ 间隔告警（会倒挂，并说明已自动压小）。
+接口上 `submitGapSec` / `clipGapSec` / `jitterSec` 三个字段补了完整注释（含「生效前提」）。
+
+### 100.3 我上一轮说过的一句错话（更正）
+
+上一轮我回答「7200 秒是不是 B站 限制」时说过「间隔被平台硬约束卡住、不能低于 7200」——**这是错的**。
+`src/publish.ts` 里早就写明：那是「相对**各稿件自身提交时刻**」的约束，与上一个切片无关，
+所以 `clipGapSec` 是纯粹的自律取值。这轮把它从"看起来像平台规则"的告警与文案里彻底摘掉了。
+
+### 100.4 验收
+
+| 项 | 结果 | 说明 |
+|---|---|---|
+| `npm run dtime-schedule-test`（新增） | **34 / 0** | 5 分钟等距（第 10 片 = 首片 + 2700 秒）；10 片逐片按 `minSubmitIntervalSec=120` 递推复核「距自己的提交时刻 > 7200」最差余量仍够；抖动夹子（300+1800 ⇒ 270）+ **500 次随机抽样逆序 0 次**；提交前复核（余量 1800 ⇒ 修正到 +7800，正好 7200 判不合规、7201 放行）；`describeDtimePlan` 首末片与"被推迟"文案；配置门禁四态；代码默认值/示例文件口径 |
+| `npm run check:ui` · `ui-modules-test` · `typecheck` · `encoding-test` · `docs-check` | 全绿 | 界面由 22 个模块重建（`UI_BUILD = ui-2026-10-16-clip-gap-5min`），产物与模块一致 |
+| `npm run clip-gap-ui`（新增） | **15 / 0** | 真浏览器（Edge headless + CDP，共享件 `tools/ui-shared.ts`）**只读**跑在线上服务上（不点保存、不动配置）：页面标记 == 产物标记；设置面板里标签/提示含「5 分钟」「不是平台规则」「两个生效前提」，且**不再出现旧口径 7500**；公式行里现算的抖动必须是**有效抖动**（NaN / 负数 / 偷偷改数都会被这条抓住）；排期预览的间隔文案与页面自己的 `fmtSpan()` 一致（第一版自己另写了一份格式化 ⇒ "2.1 小时 vs 125 分钟"假失败，已改为调页面自己的函数）；无未捕获异常 |
+| `/api/config` 落盘 + 热加载 | ✅ | `publish` 段：`clipPublishMode=standalone`、`multiPart=false`、`immediatePublish=false`、`clipGapSec=300`、`jitterSec=60`；**先落配置又退回**（见下），等队列空了重启后再落一次并复验 |
+
+> ⚠️ **落地时序（这次踩到的坑，如实记一笔）**：新配置刚通过 `/api/config` 热加载进去，
+> 就发现队列里还有**一场在切片、一场在转写**——而**跑着的进程是旧代码**，它不认识 `clipPublishMode`，
+> 见到 `multiPart=false` 会在投稿阶段抛「配置错位」（正是 §99 里那条防错保护）。
+> 也就是说：那一场会在投稿那一步**失败**。于是立刻把配置**退回原值**护住它（`revert`），
+> 改成「等队列空闲 → 重启（加载新代码）→ 再落新配置 → 复验」的顺序执行
+> （`tools/_wait-idle-then-apply.ts`，后台跑、断点续等，最多等 240 分钟）。
+> **教训**：配置热加载快了，但**代码要重启**——两者不同步时，"新配置 + 旧代码"是有害组合，
+> 尤其当新配置会改变某个分支的判据时。
+
+### 100.5 代价（用户已确认接受，这里记一笔）
+
+- 每片占 **1 个每日额度**（`dailyLimit` 目前是 `0 = 不限额`，闸门只剩 `clip.autoSelectTopN`）；
+- 切片**不再追加进完整版那个稿件**，每片是独立稿件（标题/封面/标签各自独立）；
+- 稿件在提交约 **2 小时 10 分**后开始逐片公开（首片 `submitGapSec=7800`，之后每 5~6 分钟一片）。
+  ⚠️ 这一句里的「5~6 分钟」已被 §101 取代 —— 单独投稿现在**严格每 5 分钟**（抖动固定 0）。
+
+---
+
+## 101. 单独投稿 = 定时投稿 + 每片严格 5 分钟：把规则钉进判据，而不是留在配置里（2026-10-16）
+
+用户口径（原话）：「**选择单独投稿后 切片会默认以定时投稿的方式 每个投稿5分钟的间隔 进行投稿**」。
+
+### 101.1 为什么不能只靠配置：三个键在单独投稿下**本该**不参与
+
+§100 把线上配置调成了「单独投稿 + 定时发布 + `clipGapSec=300`」，但那只说明**这一次**配置
+恰好是对的 —— 规则本身没落到代码里。而这三个键的处境很不对称：
+
+| 键 | 在**追加切片投稿**下 | 在**单独投稿**下 |
+|---|---|---|
+| `clipGapSec` | **完全不起作用**（多分P 只有一个 dtime） | §100 起要它生效 |
+| `jitterSec` | 同上 | 抖动会让「每 5 分钟」变成「5~6 分钟」 |
+| `immediatePublish` | 生效（不传 dtime） | 一旦生效就**没有发布时间可排**，「每 5 分钟」无从谈起 |
+
+也就是说：**同一些键在两个模式下的含义是相反的**。线上就躺着一个现成的例子 ——
+`clipGapSec` 曾被为追加模式调到 **7500**（125 分钟）。它当时毫无作用（沉睡），
+哪天一切到「单独投稿」就会突然生效，把 8 个切片摊成 **16 小时**的排期。
+这种「改了没反应 / 没改却突然生效」正是本仓库出过两次的事故形态
+（`multiPart` 配了没人读、`llm_dtype` 传错位置），所以规则必须收口成**一个判据**。
+
+### 101.2 改法：`resolveClipPublishSchedule()` 作为唯一判据
+
+`src/config.ts` 新增（纯函数，daemon / publish / server / 界面提示 / 测试都调它）：
+
+| 模式 | `scheduled`（定时投稿） | `gapSec` | `jitterSec` |
+|---|---|---|---|
+| `standalone`（单独投稿） | **强制 `true`** | **`STANDALONE_CLIP_GAP_SEC = 300`** | **`0`**（严格等距；有抖动就不是 5 分钟） |
+| `append`（追加切片投稿） | 沿用 `immediatePublish` | 沿用 `clipGapSec` | 沿用 `jitterSec`（仍过 `effectiveJitterSec` 夹子） |
+
+配套三件事，缺一件就会退化成"配置对了但链路没读"：
+
+1. `src/publish.ts` 的单切片投稿路径改走这个判据（**不再自己读 `cfg.publish.immediatePublish`**），
+   并在每批开头打一条 `本批切片投稿排期：…`；配置里那些**当前不生效**的键由
+   `describeScheduleOverride()` 逐个点名（`config 里的 jitterSec=60 在单独投稿下不参与切片排期…`）；
+2. `validateConfig` 逐键告警（`publish.immediatePublish` / `publish.clipGapSec` / `publish.jitterSec`），
+   所以线上那条 `jitterSec=60` 现在会**在设置面板里被明确标出来**——是提示，不是错误；
+3. `/api/bootstrap` 下发 `publishSchedule`（生效口径 + 被忽略的键），界面四处「错峰 X」
+   （本场详情 / 右栏发布排期 / 设置弹窗 / 排期预览）改读它，不再各自读 `config.publish.clipGapSec`；
+   设置面板里公式行也改成**生效值**，并在模式 chip 一点之下立刻重画（未保存也如实反映）。
+
+刻意**没有**做的一件事：给单独投稿加一个"间隔"配置键。用户口径就是 5 分钟，
+多一个键就多一个"改了没反应"的入口；真要改，改 `STANDALONE_CLIP_GAP_SEC` 一处即可。
+
+### 101.3 验收
+
+| 项 | 结果 | 状态 |
+|---|---|---|
+| `npm run standalone-schedule-test`（新增 [test/standalone-schedule.ts](test/standalone-schedule.ts)） | **11 / 0** —— 真 `Publisher.cutAndUploadClip` + 真 `buildBiliupConfig`，只换传输层：**实际发出去的 payload** 5 片全带 `dtime`、相邻**正好差 300 秒**、首片距提交 >7200 秒、台账记的 dtime 与 payload 逐条一致 | 已验 |
+| 同上 · 反证两例 | 追加 + `immediatePublish=true` ⇒ payload **不带 dtime**；追加 + 定时 ⇒ 间隔仍是 config 的 **7500 秒**（不套用 300） | 已验 |
+| `npm run dtime-schedule-test` | 34 → **55 / 0**（本会话加第 7 节：口径表、`describeScheduleOverride` 三种情形、三条逐键告警、`describeDtimePlan` 按生效口径算跨度；并行会话随后又加了第 8 节 ⇒ 当前 **66 / 0**） | 已验 |
+| `npm run clip-publish-mode-ui`（真浏览器 + 独立实例） | 25 → **33 / 0**：临时配置刻意摆成"追加模式的旋钮"（`immediatePublish=true` / `clipGapSec=7500` / `jitterSec=1800`），切到单独投稿后公式行变 `(N-1)×300 + random(0,0)`、间隔提示与立即发布提示都改写，服务端 `publishSchedule={standalone,true,300,0}` 并点名三个被忽略的键；切回追加后**全部回到 config 口径** | 已验 |
+| `npm run standalone-schedule-ui`（新增 [tools/verify-standalone-schedule-ui.ts](tools/verify-standalone-schedule-ui.ts)） | **8 / 0** —— **线上服务只读**真浏览器：右栏「发布排期」显示 **错峰 5 分钟**、本场详情动作栏显示 **定时发布间隔 5 分钟**（这两处过去直接读 `config.publish.clipGapSec`），且**没有**拿 config 的旧值渲染；无未捕获异常 | 已验 |
+| `config-coverage-test` | 21 → **29 / 0**（新增第 7 节：常量在、切片路径真的调判据、**单切片路径不再直接读立即发布**、bootstrap 下发、界面用它渲染、提示文案、真 payload 测试已接入 verify 清单） | 已验 |
+| `clip-publish-mode` · `multipart-routing` · `cut-pipeline` · `config-test` · `ui-shared-usage` | 24 / 61 / 19 / 34 / 13，全 0 失败 | 已验 |
+| `typecheck` · `check:ui` · `ui-modules-test` · `encoding-test` · `docs-check` | 全绿（界面由 22 个模块重建，`UI_BUILD = ui-2026-10-16-standalone-5min`，`tools/ui-e2e.ts` 同步） | 已验 |
+| `npm run verify:changed` | **31 步 0 失败**（45 s） | 已验 |
+| 线上生效 | 服务 17:19（UTC）重启后已加载新代码：`GET /api/bootstrap` 返回 `publishSchedule={"mode":"standalone","scheduled":true,"gapSec":300,"jitterSec":0}`，`dtimePlan` 同步为 300 秒跨度 | 已验 |
+
+### 101.4 顺带修掉的两处"以为隔离、其实共享"（都不是文案问题）
+
+| # | 问题 | 影响 | 处置 |
+|---|---|---|---|
+| 1 | `tools/verify-clip-publish-mode.ts`（§99 的浏览器用例）**读的是线上台账**：`Orchestrator` 写的是 `this.ledger = opts.ledger ?? defaultLedger`，而 `defaultLedger` 是模块级、指向线上 `data/ledger.json`；`dataDirOverride` 只重定向日志与错误报告 | 这个"独立实例"的截图里出现线上那 22 个待发布条目 —— 它只是恰好没点任何写台账的按钮而已。这类"以为隔离、其实共享"的替身最危险：哪天多点一个按钮，就会写进线上台账 | 显式传临时 `Ledger`（[test/clip-publish-mode.ts](test/clip-publish-mode.ts) 一直是这么做的），隔离变成真的；复跑 **33 / 0** |
+| 2 | [test/todos.ts](test/todos.ts) 的"环境条目"豁免清单少了 `pending-delete-due` | 该用例读真实 `data/` 里的待删清单：线上有 8 个文件 1 小时内到期（5.3 GB），于是它稳定报"多出 1 条"，而这条既不是夹具产生的、也不是用例要验的性质。**与本次改动无关**（先确认它来自 `pending-delete-due`，再动的手） | 加进 `ENV_KEYS` 并注明实测依据；`todos-test` 28 → **30 / 0**，`verify:changed` 恢复全绿 |
+
+> **并行会话（如实记一笔）**：本轮改动落地期间，另一个会话也在同一仓库推进同一件事
+> （把线上配置切到单独投稿，并写下了 §100 / §102）。它把 `tools/verify-clip-gap-ui.ts` 的期望值
+> 改成调 `resolveClipPublishSchedule()`（原先自己手搓公式 ⇒ 单独投稿下假失败），两边的口径因此是**同一个**。
+> 本节只记我这边的改动与验收，不覆盖它的记录。
+
+
+---
+
+## 102. 「每片 5 分钟」落地闭环 + 复核工具自身的两个坑（2026-10-16）
+
+### 102.1 闭环走完了（§100.4 那条"先重启再落配置"的警告到此结清）
+
+§100.4 结尾留了一条未完成事项：配置**先落又退回**（怕"新配置 + 旧代码"把在跑的那场弄失败），
+要等队列空闲 → 重启 → 再落一次。这一轮由后台任务按这个顺序走完了，实测时间线：
+
+| 阶段 | 实测 |
+|---|---|
+| 等空闲 | 那一场从 ANALYZING 走到 CLIPPING，01:15:52 队列长度 0 ⇒ 才动手 |
+| 重启 | 旧进程 pid=36916 退场，新进程 pid=7960，`http://127.0.0.1:3000` 就绪（dryRun=false / autoPublish=true / bililive v3.22.1） |
+| 落配置 | `POST /api/config` → 200 `hotReloaded=true`；现值 `clipPublishMode=standalone` / `multiPart=false` / `immediatePublish=false` / `clipGapSec=300` / `jitterSec=60` |
+| 复验 | `GET /api/bootstrap`：启动自检 **错误 0 条、警告 0 条**；`dtimePlan={scheduled:true, gapSec:300}`；8 片时间线**严格 300 秒等距**（首片 = 提交 +7800 秒 ≈ 130 分钟，末片 +165 分钟）；`(30−1)×300 = 8700` 秒 = 服务端首末片跨度 |
+| 在跑场次 | 8 场全部 `PUBLISHED`（含退回窗口里投出的 `auto-20261015141657` 与 `auto-20261015145758`）——**没有一场因为切换而失败** |
+
+**真实路径的间隔公式**（这一点值得用户知道，否则会以为排期算错了）：排期是按**批次开始时刻**算的，
+但投稿是**逐片**发生的（每片切完 + 上传完才提交），所以线上相邻两片的实际间隔是
+
+```
+相邻间隔 = 两片「提交时刻」之差 + 300 秒   ⇒ 恒 ≥ 5 分钟
+```
+
+模拟不同上传耗时：30 秒 ⇒ 330 秒、90 秒 ⇒ 390 秒、180 秒 ⇒ 480 秒、600 秒 ⇒ 900 秒。
+所以看到 **5 分钟多一点是正常的**（那是上传耗时，不是抖动）；单独投稿下抖动被钉成 0
+（§101），界面公式行也已经是 `+ random(0,0)`。
+
+### 102.2 复核工具自身的两个坑（都是"工具错，不是产品错"，如实记）
+
+| # | 坑 | 症状 | 处置 |
+|---|---|---|---|
+| 1 | **手搓公式当期望值** | 临时校验脚本自己写 `now + submitGap + (n-1)×300 + random(0,60)`，算出「间隔 270~342 秒，期望 300~360」并报 1 项失败。真相：单独投稿下抖动**恒为 0**（§101），报的是假失败；而且它把"抖动只往后推"当成了"相邻间隔 ∈ [gap, gap+cap]"，实际每片独立 ⇒ [gap−cap, gap+cap] | 期望值一律问生产代码（`resolveClipPublishSchedule` / `computeDtime`）。新增只读工具 [tools/verify-dtime-plan.ts](tools/verify-dtime-plan.ts)（两种模式都成立：预期值由判据推出，切回追加模式照样能跑）；[test/dtime-schedule.ts](test/dtime-schedule.ts) 新增第 8 节把这个错误钉进断言 —— 含**反例**：沿用 config 的 `jitterSec=60` 时最坏相邻间隔只有 **241 秒**、最宽 **359 秒**（`floor(rng()×60)` 取不到 60），那才是"不是每 5 分钟" |
+| 2 | **假设单一模式** | [tools/verify-clip-gap-ui.ts](tools/verify-clip-gap-ui.ts) 断言"提示写明两个生效前提（立即发布/单独投稿）"且"界面抖动 == config 抖动"，切到单独投稿后 **2 项假失败**（界面显示 `random(0,0)` 其实是对的） | 期望值改为来自生产代码、断言按模式分叉；并补一条**跨口径自洽**断言：服务端预览首末片跨度必须 == `(clip.maxCandidates − 1) × 生效间隔` —— 专治"文案说 5 分钟、时间却按 7500 秒排"这种**会骗人的预览**（§100 修过一次同类问题） |
+| 3 | **`process.exit()` + `fetch` ⇒ Node 在 Windows fail-fast** | 脚本打印完"✅ 全部通过"后崩：`Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)`（`src\win\async.c:94`），退出码 **0xC0000409** —— 全绿的脚本看起来像崩了。原因是退出时 undici 的异步句柄仍在关闭中 | 本仓库测试早已统一用 `process.exitCode`，工具里还有少量 `process.exit()` 漏网。本轮把新工具与 `verify-clip-gap-ui.ts` 改成 `process.exitCode`；顺带给它的 catch 补上 `ok('用例执行未抛异常', false, …)` —— 否则抛异常时 `fail` 计数仍是 0，`report()` 会以**退出码 0**"通过"（这条比崩溃更危险） |
+
+### 102.3 验收（本轮实测数字）
+
+| 项 | 结果 |
+|---|---|
+| `npm run dtime-schedule-test` | **66 / 0**（第 8 节新增：口径来自判据、四种上传耗时下间隔 ≥300 且各片距自身提交 >7200、抖动反例 241/359 秒） |
+| `node tools/verify-clip-gap-ui.ts`（真 Edge + CDP，只读跑线上） | **17 / 0**（页面公式行实测 `dtime = 提交时刻 + 7800 + (N-1)×300 + random(0,0)`；预览跨度 8700 秒自洽；无未捕获异常） |
+| `node tools/verify-dtime-plan.ts`（新增，只读） | **22 / 0**（配置/生效口径/预览一致性/8 片时间线/逐片提交真实路径/队列现状） |
+| `npm run standalone-schedule-test`（并行会话的 payload 级测试） | **11 / 0** —— 实际发出去的 payload 相邻正好差 300 秒，与本节结论互证 |
+| `typecheck` · `check:ui` · `docs-check` | 全绿（`typecheck` 中途红过一次，是并行会话 `test/standalone-schedule.ts` 的 `TaskRecord` 导入还在飞行中，几分钟后自行转绿；与本轮改动无关） |
+| 清理 | 三个一次性脚本（`tools/_apply-clip-gap.ts` / `tools/_wait-idle-then-apply.ts` / `tools/_check-standalone-plan.ts`）已删除，`tools/_*.ts` 残留 0 个；可复用的那部分升格为永久工具 `tools/verify-dtime-plan.ts` |
+
+> **并行会话（再记一笔）**：§100 / §101 与本节覆盖同一件事，`tools/verify-clip-gap-ui.ts` 是
+> 两边都在改的文件（两边都把它从"手搓公式"改成"问生产代码"，口径因此一致）。本节只记
+> 本轮由我完成的**落地闭环**与上述工具/测试侧的修正；线上当前跑的那份 `verify-clip-gap-ui.ts`
+> 实测 17 / 0。
+
+## 103. 代码热更新：改完代码不用再手动关窗口重启（2026-10-24）
+
+用户原话：「能不能加一个热更新功能 每次更新和修bug后 都要手动关闭重新启动 能不能热更新 不需要关闭」。
+起因是一次真实踩坑：`src/**/*.ts` 改好了、页面却没变化 —— 进程里跑的还是旧代码。
+
+### 103.1 为什么必须是**外部监督进程**，不是"服务自己监听自己"
+
+`.ts` 只有在**新进程**里才会重新解析（Node 的类型擦除发生在启动时，已加载的模块不会重新解析）。
+在服务进程内清 import 缓存，等于同时活着两套 orchestrator/定时器/子进程句柄，必然抢端口、抢台账。
+所以形态是：`node src/hot-watch.ts --port 3000` 持有 `node src/cli.ts run --port 3000` 子进程。
+
+另一个好处是**故障隔离**：监督进程只依赖 [src/util.ts](src/util.ts)，不 import 任何业务模块；
+所以业务代码被改到语法/类型不通时，它照样活着，能把"类型检查失败"如实写进
+`data/hot-watch-state.json` 与 `data/logs/hot-watch.log` —— 而不是自己也起不来、什么线索都不留。
+
+### 103.2 三道闸（顺序固定：先检查 → 再判忙 → 最后重启）
+
+| # | 闸 | 为什么不能换顺序 / 不能省 |
+|---|---|---|
+| 1 | **类型检查门**：`npm run typecheck` 不通过就**不重启**，旧进程继续服务 | 重启一份编不过的代码，等于把"代码没生效"换成"服务起不来"，比原问题更糟。若把它放在判忙之后，忙时排队会掩盖掉"根本编不过"，用户会以为"等空闲就生效" |
+| 2 | **忙时排队**：台账里有 `PENDING/TRANSCRIBING/ANALYZING/CLIPPING/PUBLISHING`，或切片级 `CUTTING/SUBMITTING` ⇒ 只记"等待空闲"，空闲后自动重载 | 重启会打断切片；断在 `SUBMITTING`（已提交但没拿到 taskId）最贵 —— 历史上已因此手工续跑过两次 |
+| 3 | **优雅重启 + 就绪判定**：IPC `{type:'shutdown'}` → `orch.stop()+ui.stop()` → 5s → SIGTERM → 20s → 强杀；新进程要**真的应答 `/api/bootstrap`** 才算完成 | Windows 上 SIGTERM 是硬杀（`TerminateProcess`），台账来不及刷盘；而 `spawn` 成功不等于起来了（绑端口/读配置/自检要 1~3 秒），提前记"重载完成"就是面板谎报 |
+
+配套：
+- **连续保存只排一次**：`fs.watch(recursive)` + 1.2s 去抖 + `Set` 去重 + 串行队列（以最后一次文件列表为准）。
+- **崩溃自愈**：非本次重载引起的异常退出按 2s→5s→10s→30s 退避拉起。
+- **前端只构建不重启**：`web/src/**` 改动跑 `npm run build:ui`（产物是静态 `public/ui.html`），失败只记 `lastUiBuildError`。
+- **状态可见**：健康面板末尾一格「热更新」（是否开启 / 最近一次重载时间与原因 / 是否等待空闲 / 最近错误）。
+  状态文件原子写；另有 15s 心跳 —— 监督进程被强杀时来不及写 `enabled=false`，只看 enabled 会让面板骗人。
+
+### 103.3 QA 复现的一个真 bug：崩溃自愈 × 热重载并发 ⇒ 重复拉起 ⇒ 热更新永久哑火
+
+现象（QA 两遍复现）：子进程在"某次重载的类型检查窗口内"崩掉后，待执行的崩溃退避定时器在
+`reloadNow` 已经拉起新进程**之后**才到期，于是再拉一个 ⇒ 第二个 EADDRINUSE 秒退并把 `this.child`
+覆盖 ⇒ 健康那个变孤儿（占着端口，既停不掉也热更新不到）；此后每次保存都"重载成功"
+（`reloads` 虚增、`lastReloadAt` 更新）但新代码永不生效。
+
+修法（三处一起加，缺一条都不够）：
+
+| 位置 | 修法 |
+|---|---|
+| `spawnChild()` | ① `spawnInFlight` 互斥（同一时刻只允许一次 spawn，后来的复用同一 Promise）；② 已有存活子进程 ⇒ 不重复拉起（记日志、返回现有 pid） |
+| `reloadNow()` 开头 | `clearTimer('crash')` + `crashBackoffMs = 0`：本次重载接管，作废待执行的崩溃重启；并置 `reloadActive` 覆盖整段（停旧→起新→等就绪） |
+| `scheduleCrashRestart()` / exit 处理器 | `reloadActive` 期间的退出不排崩溃重启（失败收尾由 `reloadNow` 负责，否则两套重启抢端口） |
+| `reloadNow()` 尾部 | 等 `waitReady()`（真发 `GET /api/bootstrap`）；没就绪就**不写** `lastReloadAt`/`reloads`，日志记"重载失败"，交回崩溃退避 |
+
+### 103.4 入口一致性（否则"有时生效、有时不生效"最难查）
+
+| 入口 | 改前 | 改后 |
+|---|---|---|
+| `launcher.ps1`（桌面快捷方式/`run.cmd`） | 直启服务 | 默认起监督进程；`-NoWatch` 回退；收尾先记孙进程 pid、杀监督后再补刀（`Stop-Process -Force` 跑不到 exit 钩子） |
+| `start.ps1`（README 里让人跑的那个） | 直启服务 | 常驻运行走监督进程；`-NoWatch` 回退；`-SelfCheck`/`-Once`/`-Probe` 仍直连（一次性命令套监督层没意义） |
+| `tools/ensure-service.ps1`（计划任务看门狗） | 直启服务 | 起监督进程，保证"计划任务拉起的服务"与"启动器拉起的服务"行为一致 |
+| `tools/restart-service.ts` | 直启服务 | 默认起监督进程，`--no-watch` 回退；**能认出监督进程在场**（读状态 + 心跳），在场就 `/T` 连它一起重启 —— 只杀服务会让它 2 秒后把旧代码再拉起来 |
+
+README 里"`start.bat` / `start.ps1` 等价入口"的说法已改正（两者默认都带热更新），并补了三道闸与切换步骤。
+
+另外两处按 QA 建议收的口子：
+- `data/logs/hot-watch.log` 不再重复落子进程 stdout（服务自己有 `live_auto-*.jsonl`），且超过 20MB 切 `.1`；
+- "重载完成"改成两段日志：`服务已拉起（pid=X），等待就绪…` → 就绪后才 `重载完成（…就绪耗时 Xms…）`。
+
+### 103.5 验收（本轮实测数字）
+
+| 项 | 结果 |
+|---|---|
+| `npm run hot-watch-test`（新增，hermetic：临时目录 + 假服务真监听端口） | **118 / 0**（含竞态回归：检查窗口内 `kill -9` ⇒ 只拉起 1 个进程、`reloads` 不虚增、`state.pid` 指向活着那个；起不来的新进程不记"重载完成"；忙时 6 轮轮询只跑 1 次 tsc） |
+| `npm run hot-watch-qa-test`（QA 独立套件） | **115 / 0** |
+| `npm run boot-requeue-test` / `config-coverage-test` / `service-watchdog-test` / `ui-modules-test` | 28 / 29 / 67 / 15，全 PASS |
+| `npm run e2e` | **153 / 0** |
+| `npm run typecheck` · `npm run check:ui` · `npm run docs-check` | 全绿（本节即 §103，`docs-section next` 的结果） |
+| 竞态用例是否真能抓 bug | 把三处修法**临时回退**后跑同一用例 ⇒ 红（`starts.log` 多出第二个 pid，与 QA 描述一致）；恢复后绿 |
+
+### 103.6 交付前按 QA 建议再加固的三处（同日，非阻断）
+
+| # | 风险 | 处置 |
+|---|---|---|
+| 1 | `drainReload()` / `drainUiBuild()` 是 fire-and-forget（`void ...`），链里任意一处抛出都会变成 unhandledRejection ⇒ **监督进程整个退出**，而它的 exit 钩子会顺手杀掉服务 —— 与"监督进程永远在"的承诺相反 | `attachCrashGuards(watcher)` 挂 `process.on('uncaughtException' / 'unhandledRejection')`：**记录日志（含栈）后继续运行**，错误写进 `hot-watch.log` 与状态文件新增的 `lastInternalError`；若异常发生在重载段（`reloadActive`）则额外记一条"重载可能处于中间态"并**复位 `reloadActive`**，交由崩溃自愈/下一次保存兜底。下一次文件变化仍会重试 |
+| 2 | 就绪探测只看"有人应答 200"：若端口被**别的进程**（上次遗留的孤儿服务）占着，新子进程 bind 失败但仍存活（`cli.ts` 里 Web UI 启动失败只记日志、继续跑），探测会拿到孤儿的 200 ⇒ 误判就绪 ⇒ 新代码永不生效而面板显示成功 | `GET /api/bootstrap` 响应加 `pid`（`src/server.ts`，本地只读、无敏感性、不动既有字段）；`waitReady()` 直接解析该字段比对 `child.pid`（不再额外打一次接口）：不一致即判"端口被其它进程占用、本次重载失败"，日志写明 `端口 <port> 的应答者不是本次拉起的子进程（应答者 pid=A，期望 B）`。老版本服务没有该字段时才回退问一次 `/api/health`，仍取不到则按"无法核对 ⇒ 通过"，保证升级期不误判 |
+| 3 | README 只写了"必须应答 `/api/bootstrap`"，漏了实现里的例外，排障时容易困惑 | 补两句：端口被占 ⇒ 判失败；进程活着但 6s 内始终不应答（`--no-ui` / `ui.enabled=false`）⇒ 按"没有 Web UI"算就绪并记日志 |
+
+加固后的验收：`hot-watch-test` **130 / 0**（新增 12 条：`parseHealthPid` 6 条边界、"端口应答者 == 状态里的 pid" 1 条、全局兜底 5 条 —— 直接 `void Promise.reject(new Error('boom'))` 触发 unhandledRejection 后断言监督进程仍存活、子进程 pid 不变且确实还活着、异常写进 `lastInternalError`），`hot-watch-qa-test` 155 / 0，`e2e` 153 / 0，`typecheck`/`check:ui`/`docs-check` 绿。

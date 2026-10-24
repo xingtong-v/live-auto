@@ -230,6 +230,10 @@ export function killLocalAsrRun(taskId: string): boolean {
   const pid = run.child.pid;
   try {
     if (process.platform === 'win32' && pid) {
+      /* 这里刻意用**同步**的 execFileSync（P7 评估结论）：
+         调用方是"退出前收尸"（必须同步完成，异步会来不及）、看门狗与「修复卡住」接口（都是
+         低频的收尸动作，单次 taskkill 约 10–50ms）。换成异步会引入"清理还没做完进程就退了"
+         的竞态，收益不值这个风险。 */
       execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
     } else {
       run.child.kill('SIGKILL');
@@ -269,6 +273,16 @@ export const LOCAL_ASR_STALL_MS = 20 * 60_000;
 
 /** 同窗口单飞表：key → 正在跑的那一次 */
 const inFlightLocal = new Map<string, Promise<LocalAsrResult>>();
+
+/** 文件属性缓存条目上限（纯加速器，超限整体清空，见 statOf，P5） */
+const ASR_STAT_CACHE_MAX = 2000;
+
+/**
+ * ASR 缓存**内存索引**的条目上限（LRU）。
+ * 实测单条约 125KB（最大 345KB）、目录 17MB / 135 条；上限 300 条按最大条目算约 100MB 上限、
+ * 按实测均值约 37MB —— 需要时把上限调大即可，调小只会让命中多走一次读盘，不影响正确性。
+ */
+const ASR_INDEX_MAX = 300;
 
 /**
  * 同一个窗口只跑一次：已有同 key 的转写在跑时，直接复用它的 Promise。
@@ -688,7 +702,13 @@ export function asrCacheKey(parts: {
 export class AsrCache {
   private dir: string;
   private logger: Logger;
-  /** 会话内索引，避免每次都读盘 */
+  /**
+   * 会话内索引（**LRU**，容量上限 ASR_INDEX_MAX），避免每次都读盘。
+   *
+   * 为什么要有上限：条目里带完整分段文本，单条可达数百 KB（实测 17MB / 135 条），
+   * 而它只增不删会随转写历史一路涨 —— 主进程与每个 ASR worker 进程各存一份。
+   * `get()` 本来就有"内存没有就读盘"的回落，所以淘汰任何一条都只损失一次读盘，语义不变。
+   */
   private index = new Map<string, AsrCacheEntry>();
 
   constructor(dir: string = ASR_CACHE_DIR, logger: Logger = globalLog) {
@@ -702,13 +722,24 @@ export class AsrCache {
     return path.join(this.dir, `${key}.json`);
   }
 
+  /** 放进索引并挪到队尾；超限时丢队首（最久未用） */
+  private remember(key: string, entry: AsrCacheEntry): void {
+    this.index.delete(key);
+    this.index.set(key, entry);
+    while (this.index.size > ASR_INDEX_MAX) {
+      const oldest = this.index.keys().next();
+      if (oldest.done) break;
+      this.index.delete(oldest.value);
+    }
+  }
+
   private loadIndex(): void {
     try {
       for (const f of fs.readdirSync(this.dir)) {
         if (!f.endsWith('.json')) continue;
         try {
           const entry = readJson<AsrCacheEntry>(path.join(this.dir, f));
-          if (entry?.key) this.index.set(entry.key, entry);
+          if (entry?.key) this.remember(entry.key, entry);
         } catch {
           /* 单条坏缓存不影响其它 */
         }
@@ -720,12 +751,17 @@ export class AsrCache {
 
   get(key: string): AsrCacheEntry | undefined {
     const mem = this.index.get(key);
-    if (mem) return mem;
+    if (mem) {
+      // LRU：命中后挪到队尾（Map 保持插入顺序）
+      this.index.delete(key);
+      this.index.set(key, mem);
+      return mem;
+    }
     const f = this.fileOf(key);
     if (!exists(f)) return undefined;
     try {
       const entry = readJson<AsrCacheEntry>(f);
-      this.index.set(key, entry);
+      this.remember(key, entry);
       return entry;
     } catch {
       return undefined;
@@ -733,7 +769,7 @@ export class AsrCache {
   }
 
   set(entry: AsrCacheEntry): void {
-    this.index.set(entry.key, entry);
+    this.remember(entry.key, entry);
     try {
       writeJsonAtomic(this.fileOf(entry.key), entry);
     } catch (e) {
@@ -742,11 +778,30 @@ export class AsrCache {
     }
   }
 
-  /** 已有缓存的段数（用于 dry-run 预检「能跑几段、要花几段」） */
+  /**
+   * 已有缓存的段数（用于 dry-run 预检「能跑几段、要花几段」）。
+   *
+   * ⚠️ 必须扫目录统计，不能读内存索引：索引有容量上限（会被淘汰，见 remember），
+   * 拿它当账本会让预检把"已缓存"的段算成"要付费"。
+   */
   stats(): { count: number; audioSeconds: number } {
+    let count = 0;
     let audioSeconds = 0;
-    for (const e of this.index.values()) audioSeconds += e.audioSeconds ?? 0;
-    return { count: this.index.size, audioSeconds };
+    try {
+      for (const f of fs.readdirSync(this.dir)) {
+        if (!f.endsWith('.json')) continue;
+        try {
+          const e = readJson<AsrCacheEntry>(path.join(this.dir, f));
+          count += 1;
+          audioSeconds += e?.audioSeconds ?? 0;
+        } catch {
+          /* 坏条目跳过 */
+        }
+      }
+    } catch {
+      /* 目录不存在等 */
+    }
+    return { count, audioSeconds };
   }
 
   /** 缓存目录占用（数量与字节） */
@@ -855,29 +910,53 @@ export interface SilenceSegment {
  * 记录每段有声片段的偏移量，否则转写时间戳会整体错位。
  * 因此本函数只负责**找出静音**，映射由 `buildSpeechPlan` 负责。
  */
-export function detectSilence(
+/**
+ * 用 ffmpeg 的 `silencedetect` 找出长静音段。
+ *
+ * ⚠️ 实现要点（原文）：剪静音后必须维护「音频时间 → 视频时间」的映射表，
+ * 记录每段有声片段的偏移量，否则转写时间戳会整体错位。
+ * 因此本函数只负责**找出静音**，映射由 `buildSpeechPlan` 负责。
+ *
+ * ⚠️ 两个曾经埋着的坑（2026-10-16 修，当前**无调用方**，属备用工具）：
+ *   1. 原来用 `execFileSync`：一次 ffmpeg 全片解码可以跑几分钟，**会把事件循环整个冻住**
+ *      （HTTP 服务、看门狗、进度上报全停）。现在改成异步 `execFile`。
+ *   2. 原来 `stdio` 把 stdout 设成 ignore 又去 parse 它的返回值 —— 成功时拿到的是 `null`，
+ *      等于"永远找不到静音"；而 silencedetect 的结果其实写在 **stderr**。现在按 stderr 解析。
+ */
+export async function detectSilence(
   file: string,
   opts: { ffmpegPath: string; noiseDb: number; minSilenceSec: number; timeoutMs?: number },
-): { silences: SilenceSegment[]; duration: number; error?: string } {
+): Promise<{ silences: SilenceSegment[]; duration: number; error?: string }> {
+  const args = [
+    '-hide_banner',
+    '-nostdin',
+    '-i', file,
+    '-af', `silencedetect=noise=${opts.noiseDb}dB:d=${opts.minSilenceSec}`,
+    '-f', 'null',
+    process.platform === 'win32' ? 'NUL' : '/dev/null',
+  ];
   try {
-    const args = [
-      '-hide_banner',
-      '-nostdin',
-      '-i', file,
-      '-af', `silencedetect=noise=${opts.noiseDb}dB:d=${opts.minSilenceSec}`,
-      '-f', 'null',
-      process.platform === 'win32' ? 'NUL' : '/dev/null',
-    ];
-    // silencedetect 把结果写到 stderr
-    const out = execFileSync(opts.ffmpegPath, args, {
-      encoding: 'utf8',
-      timeout: opts.timeoutMs ?? 600000,
-      maxBuffer: 32 * 1024 * 1024,
-      stdio: ['ignore', 'ignore', 'pipe'],
+    // silencedetect 把结果写到 stderr（stdout 上没有分析结果）
+    const stderr = await new Promise<string>((resolve, reject) => {
+      execFile(
+        opts.ffmpegPath,
+        args,
+        { encoding: 'utf8', timeout: opts.timeoutMs ?? 600000, maxBuffer: 32 * 1024 * 1024 },
+        (err, _stdout, errOut) => {
+          if (err) {
+            // 非零退出时 stderr 里通常仍有完整分析结果（ffmpeg 没有音频流等情况）——
+            // 带上它退出，由下面的 catch 决定"是真失败还是只是退出码非零"
+            const e = err as Error & { stderr?: string };
+            e.stderr = String(errOut ?? '');
+            reject(e);
+            return;
+          }
+          resolve(String(errOut ?? ''));
+        },
+      );
     });
-    return parseSilenceOutput(String(out));
+    return parseSilenceOutput(stderr);
   } catch (e) {
-    // execFileSync 非零退出时 stderr 在 error.stderr 里；ffmpeg 没有音频流等情况也会走到这里
     const err = e as { stderr?: Buffer | string; message?: string };
     const stderr = err.stderr ? String(err.stderr) : '';
     const parsed = stderr ? parseSilenceOutput(stderr) : { silences: [], duration: 0 };
@@ -1108,6 +1187,9 @@ export class Transcriber {
   private statOf(file: string): { size: number; updatedAt: number } {
     const hit = this.statCache.get(file);
     if (hit) return hit;
+    /* 以文件路径为键、只增不删，跑得越久攒得越多（P5）。它纯粹是"少 stat 几次"的加速器，
+       清空没有正确性代价（下次重新 stat 即可），所以在超限时整体清空。 */
+    if (this.statCache.size > ASR_STAT_CACHE_MAX) this.statCache.clear();
     let v: { size: number; updatedAt: number };
     try {
       const st = fs.statSync(file);

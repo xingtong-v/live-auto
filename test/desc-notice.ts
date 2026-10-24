@@ -77,7 +77,7 @@ function build(over: Partial<ClipRecord> = {}, cfgOver: Partial<AppConfig['publi
     task,
     cfg: { ...cfg, publish: { ...cfg.publish, ...cfgOver } },
     uid: 12345,
-    dtime: Math.floor(Date.now() / 1000) + 7800,
+    dtime: Math.floor(Date.now() / 1000) + 1200,
     uploadPresetId: 'default',
     ...(overrideDesc !== undefined ? { overrideDesc } : {}),
   });

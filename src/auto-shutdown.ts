@@ -28,8 +28,21 @@ export interface ShutdownConditions {
   queueLength: number;
   /** 本进程正在跑的本地转写数（ASR 子进程） */
   activeTranscriptions: number;
-  /** 「可能正在录制」的场次数（watcher：possiblyRecording 或还有分段在写） */
+  /**
+   * 「可能正在录制」的场次数（**多源归并后**的场次数，同一场只算 1 次）。
+   *
+   * 三个源互不覆盖（见 `src/recording-signals.ts` 的头注释）：
+   *   · watcher 的 mp4 轮询候选项（`possiblyRecording` / `pendingParts`）；
+   *   · 录制目录里**体积还在长的原始分段**（`.ts`，本次修复补上的那条）；
+   *   · biliLive-tools 录制器自报 `state === 'recording'`。
+   */
   recordingSessions: number;
+  /**
+   * 上面那个数字**是怎么来的**（只讲来源，例如「原始分段在写：…-PART007.ts」）。
+   * 只用于把原因写清楚：用户看到"不关"必须能立刻知道是哪一场在录，否则只会以为功能坏了。
+   * 刻意**不带场次数** —— reason 里已经写了「有 N 场可能正在录制（…）」，再带一遍就成了重复。
+   */
+  recordingDetail?: string;
   /** biliLive-tools 队列里在跑的任务数（压制/上传/下载） */
   llcQueueLength: number;
   /** 当前时刻 */
@@ -88,7 +101,12 @@ export function decideShutdown(
 ): ShutdownDecision {
   if (!c.enabled) return { shutdown: false, reason: '自动关机开关未打开' };
   if (c.recordingSessions > 0) {
-    return { shutdown: false, reason: `有 ${c.recordingSessions} 场可能正在录制 —— 关机可能写坏分段，绝不关` };
+    /* 原因里带上来由（`recordingDetail`）：只写"有 1 场在录"用户没法核对是哪一场，
+       而这一条正是"号码对不上就丢数据"的那条，必须让人一眼能查。 */
+    return {
+      shutdown: false,
+      reason: `有 ${c.recordingSessions} 场可能正在录制${c.recordingDetail ? `（${c.recordingDetail}）` : ''} —— 关机可能写坏分段，绝不关`,
+    };
   }
   if (c.busy || c.queueLength > 0) {
     return { shutdown: false, reason: `流水线还在忙（${c.busy ? '有任务在跑' : ''}${c.busy && c.queueLength ? '，' : ''}${c.queueLength ? `队列 ${c.queueLength} 个` : ''}）` };

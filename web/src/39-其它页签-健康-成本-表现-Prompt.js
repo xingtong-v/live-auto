@@ -3,10 +3,18 @@
  * ========================================================================== */
 function switchView(v) {
   state.view = v;
-  $$('#tabs .tab').forEach((t) => t.classList.toggle('on', t.dataset.view === v));
+  /* ★ 2026-10-16（UI 评审 A-1）：class 与 aria-selected 必须同步。
+     只听视觉的 :class 的话，读屏用户切了页签也不知道自己在哪一页。 */
+  $$('#tabs .tab').forEach((t) => {
+    const on = t.dataset.view === v;
+    t.classList.toggle('on', on);
+    t.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
   const isTasks = v === 'tasks';
   $('#viewTasks').style.display = isTasks ? '' : 'none';
   $('#viewOther').style.display = isTasks ? 'none' : '';
+  /* 排期抽屉只在窄屏是抽屉；宽屏是常驻栏，这里顺手关掉残留的 open 状态 */
+  if (!isTasks) closeScheduleDrawer();
   /* 监控页签自己带定时器：切走就停（没人看的时候不必每 5 秒问一次服务端） */
   if (v === 'monitor') {
     startMonitor();
@@ -46,7 +54,23 @@ async function renderOther(v) {
         box.innerHTML =
           '<div class="hintline" style="margin:0 0 10px">下面是独立页面（自己的刷新节奏，不受本页影响）。' +
           '也可以直接在浏览器里打开：<a href="/api/shutdown/page" target="_blank" class="mono-sm">/api/shutdown/page</a></div>' +
-          '<iframe id="sdFrame" src="/api/shutdown/page" style="width:100%;height:620px;border:0;background:#f6f7f9;border-radius:8px"></iframe>';
+          /* 高度不再写死：内页量完自己的高度会 postMessage 过来，这里跟着设。
+             写死 620px 时内容实测 792px —— 底部"时段/冷静期/倒计时/保存"整行被切掉。 */
+          '<iframe id="sdFrame" src="/api/shutdown/page" title="跑完自动关机（独立页面）"' +
+          ' style="width:100%;height:560px;border:0;background:transparent;border-radius:8px"></iframe>';
+        /* 只收同源、且带固定标识的消息，避免被别处 postMessage 改高度 */
+        if (!globalThis.__sdFrameMsgBound) {
+          globalThis.__sdFrameMsgBound = true;
+          globalThis.addEventListener('message', (e) => {
+            if (e.origin !== location.origin) return;
+            const d = e.data;
+            if (!d || d.source !== 'shutdown-page' || d.type !== 'height') return;
+            const f = document.querySelector('#sdFrame');
+            if (!f) return;
+            const h = Math.max(320, Math.min(Number(d.h) || 0, 2400));
+            if (Math.abs(parseFloat(f.style.height) - h) > 2) f.style.height = h + 'px';
+          });
+        }
       }
       return;
     }
@@ -61,7 +85,7 @@ async function renderOther(v) {
 }
 
 async function renderHealth(box) {
-  const { health, errors } = await api('/api/health');
+  const { health, errors, hot } = await api('/api/health');
   /* 墓碑清单单独取（失败不阻塞健康面板的其它部分 —— 它只是个附加视图） */
   let tombstones = [];
   try { tombstones = (await api('/api/tombstones')).tombstones || []; } catch (e) { tombstones = []; }
@@ -96,6 +120,22 @@ async function renderHealth(box) {
           .join('')}</div>`
       : `<p class="hintline" style="color:var(--green)">✅ ${esc(todos.note || '现在没有需要你处理的事。')}</p>`}
     </div>`;
+  /* ---- 代码热更新状态（2026-10-24 用户需求：「改完代码不用手动关掉重启」）----
+     只有服务由监督进程 `src/hot-watch.ts` 拉起时 `/api/health` 才带 `hot`；直启服务时是 null。
+     这里按"用户最需要知道的一句话"排序：出错（改动没生效）> 等待空闲（改动静默排队）> 正常。
+     为什么不用弹窗报警：类型检查失败时服务**照旧在跑旧代码**，属于"提醒一下就好"，不该打断操作。 */
+  const hotKpi = (() => {
+    if (!hot) return kpi('热更新', '未启用', '用 launcher.ps1 启动即开启（-NoWatch 可关闭）');
+    /* alive 由服务端按心跳判定（监督进程被强杀时来不及写 enabled=false） */
+    if (!hot.alive) return kpi('热更新', '已关闭', '监督进程已退出，改动不会自动生效；重开 launcher 即可恢复', 'warn');
+    if (hot.lastTypecheckError) return kpi('热更新', '已开启 · 类型检查未通过', '没有重启，服务仍跑旧代码；错误见 data/logs/hot-watch.log', 'warn');
+    if (hot.lastUiBuildError) return kpi('热更新', '已开启 · 前端构建失败', '服务未受影响，但刷新仍是旧界面', 'warn');
+    if (hot.pendingSince) return kpi('热更新', '已开启 · 等待空闲', `有任务在跑，空闲后自动重载（自 ${fmtTime(Date.parse(hot.pendingSince))} 起排队）`, 'warn');
+    const last = hot.lastReloadAt
+      ? `最近一次：${fmtTime(Date.parse(hot.lastReloadAt))} · ${String(hot.lastReloadReason || '').slice(0, 48)}`
+      : '等待第一次改动';
+    return kpi('热更新', '已开启', last, 'ok');
+  })();
   html += `<div class="kpis">
     ${kpi('biliLive-tools', health.bililive.ok ? '已连接' : '未连接', health.bililive.message, health.bililive.ok ? (health.bililive.drift ? 'warn' : 'ok') : 'bad')}
     ${kpi('版本', esc(health.bililive.version || '?'), `核实版本 ${health.bililive.expected}${health.bililive.drift ? '（差异较大，接口可能已变动）' : ''}`, health.bililive.drift ? 'warn' : '')}
@@ -106,6 +146,7 @@ async function renderHealth(box) {
     ${kpi('墓碑', String(health.tombstones || 0), (health.tombstones || 0) > 0 ? '已投稿内容被保护性拦下' : '无（没删过已投稿的任务）', (health.tombstones || 0) > 0 ? 'warn' : 'ok')}
     ${kpi('队列', health.queue.busy ? '处理中' : '空闲', `排队 ${health.queue.length}${health.queue.paused ? ' · 磁盘守卫已暂停' : ''}`, health.queue.paused ? 'bad' : '')}
     ${kpi('运行时长', (health.uptimeSec / 3600).toFixed(1) + ' h', `服务版本 ${health.version}`, '')}
+    ${hotKpi}
   </div>`;
 
   html += `<div class="card"><h2>模式与配置</h2><div class="kv">
@@ -139,7 +180,7 @@ async function renderHealth(box) {
  */
 function tombstoneDetails(tombstones) {
   return `<details>
-    <summary style="cursor:pointer;font-size:12.5px;color:var(--text-2)">逐条明细（${tombstones.length} 条，可单条解除）</summary>
+    <summary style="cursor:pointer;font-size:var(--fs-s);color:var(--text-2)">逐条明细（${tombstones.length} 条，可单条解除）</summary>
     <table class="tbl" style="margin-top:8px"><thead><tr><th>立碑时间</th><th>原任务</th><th>切片</th><th>标题</th><th>旧稿件</th><th>原因</th><th></th></tr></thead><tbody>
     ${tombstones.map((t) => `<tr>
       <td class="mono-sm">${esc(String(t.retiredAt || '').slice(0, 19).replace('T', ' '))}</td>
@@ -156,14 +197,14 @@ function tombstoneDetails(tombstones) {
 
   html += `<div class="card"><h2>墓碑（已删除任务的、曾经投出去过的指纹）</h2>
     ${tombstones.length === 0
-      ? `<div style="font-size:12.5px;color:var(--text-3);line-height:1.7">
+      ? `<div style="font-size:var(--fs-s);color:var(--text-3);line-height:1.7">
            没有墓碑。墓碑只在一种情况下产生：<b>你删掉了一个已经投稿到 B站 的任务</b>。
            那一刻本地的幂等指纹不能跟着丢 —— 否则同一份素材被重新导入、重新分析出同一区间后，
            会在 B站 上投出第二个内容完全相同的稿件（B站 没有删除稿件的开放接口）。
            所以那类指纹会退役成墓碑继续拦着，并出现在这里。它<b>不影响</b>没投出去过的切片：
            删掉不满意的候选后重跑，照常可以投。
          </div>`
-      : `<div style="font-size:12.5px;color:#5b5070;margin-bottom:9px;line-height:1.7">
+      : `<div style="font-size:var(--fs-s);color:#5b5070;margin-bottom:9px;line-height:1.7">
            共 <b>${tombstones.length}</b> 条在生效。它们代表「这段内容以前投过 B站，而当时的任务已被删除」，
            重新投稿时会被自动跳过（切片卡片上会显示「🪦 墓碑拦截」）。
            <b>每天会自动核对一遍：旧稿件查不到的（含已锁定读不到的）自动解除</b>，
